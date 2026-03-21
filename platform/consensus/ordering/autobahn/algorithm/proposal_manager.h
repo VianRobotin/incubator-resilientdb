@@ -1,7 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <condition_variable>
 #include <list>
+#include <set>
+#include <vector>
 
 #include "platform/consensus/ordering/autobahn/algorithm/proposal_graph.h"
 #include "platform/consensus/ordering/autobahn/proto/proposal.pb.h"
@@ -15,8 +18,8 @@ class ProposalManager {
  public:
   ProposalManager(int32_t id, int total_num, int f, SignatureVerifier* verifier);
 
-  void MakeBlock(
-      std::vector<std::unique_ptr<Transaction>>& txn);
+  // --- Block management (unchanged) ---
+  void MakeBlock(std::vector<std::unique_ptr<Transaction>>& txn);
   void AddBlock(std::unique_ptr<Block> block);
   void AddLocalBlock(std::unique_ptr<Block> block);
   const Block* GetLocalBlock(int64_t block_id);
@@ -28,6 +31,7 @@ class ProposalManager {
   SignInfo SignBlock(const Block& block);
   bool VerifyBlock(const Block& block);
 
+  // --- View/slot management (unchanged) ---
   bool ReadyView(int slot);
   int GetCurrentView();
   void IncreaseView();
@@ -39,6 +43,59 @@ class ProposalManager {
   std::unique_ptr<Proposal> GetProposalData(int slot);
   void AddProposalData(std::unique_ptr<Proposal> p);
 
+  // ===========================================================
+  // Fair Ordering: Ordering Linearizability (Algorithm 1, Sec V)
+  // ===========================================================
+
+  // Algorithm 1, OnReceiveCar (lines 3-14): TEE timestamps transactions.
+  // Returns signed timestamps for all newly-attested transactions.
+  // Simulates TEE: monotonic clock, seen-set H, one attestation per txn.
+  std::vector<SignedTimestamp> TimestampTransactions(const Block& block);
+
+  // Algorithm 1, OnReceiveTimestamp (lines 16-19): Store a verified timestamp.
+  void AddTimestamp(const SignedTimestamp& ts);
+
+  // Algorithm 1, AfterCollectionDeadline (lines 21-24): Compute local
+  // ordering key K_r(t) = (f+1)-th smallest collected timestamp for t.
+  // Called after Δ has elapsed since receiving the transaction.
+  // Returns the computed ordering key, or -1 if not enough timestamps.
+  int64_t ComputeLocalOrderingKey(const std::string& txn_hash);
+
+  // Compute ordering keys for all transactions that have enough timestamps.
+  // Returns a map of txn_hash -> K_r(t).
+  std::map<std::string, int64_t> ComputeAllOrderingKeys();
+
+  // Get transactions in the execution window (τ_prev, τ_current].
+  // Returns transactions sorted by ordering key (ascending), with
+  // deterministic tie-breaking by txn hash.
+  std::vector<std::pair<std::string, int64_t>> GetTransactionsInWindow(
+      int64_t tau_prev, int64_t tau_current);
+
+  // --- Execution Threshold (Section V-B) ---
+
+  // Update the last-seen vector for a replica from a committed block.
+  void UpdateLastSeenFromBlock(int replica_id, int64_t latest_timestamp);
+
+  // Get this replica's last-seen vector L = <L_1, ..., L_n>.
+  std::vector<int64_t> GetLastSeenVector() const;
+
+  // Compute the execution threshold τ = (f+1)-th smallest of M_1, ..., M_n
+  // where M_i is the max last-seen timestamp reported by replica i.
+  int64_t ComputeExecutionThreshold() const;
+
+  // Get/set the previous execution threshold (τ_prev).
+  int64_t GetPrevThreshold() const { return prev_threshold_; }
+  void SetPrevThreshold(int64_t tau) { prev_threshold_ = tau; }
+
+  // Get the final ordering key K(t) for a transaction.
+  // K(t) = min K_r(t) over the first f+1 committed ordering keys for t.
+  int64_t GetFinalOrderingKey(const std::string& txn_hash);
+
+  // Record a committed ordering key for a transaction from a committed block.
+  void AddCommittedOrderingKey(const std::string& txn_hash, int64_t key);
+
+  // Check if a transaction has been seen by the TEE (is in seen-set H).
+  bool HasSeenTransaction(const std::string& txn_hash) const;
 
  private:
   void UpdateLastSign(Block * block);
@@ -54,9 +111,6 @@ class ProposalManager {
   std::map<int, std::pair<int, int64_t>> slot_state_;
   std::map<int,int> new_blocks_;
 
-  //std::mutex t_mutex_;
-  //std::map<std::string, std::unique_ptr<Proposal>> local_proposal_;
-  //Stats* global_stats_;
   int total_num_;
   int f_;
   int64_t current_height_;
@@ -65,6 +119,39 @@ class ProposalManager {
   SignatureVerifier* verifier_;
 
   std::map<int, std::unique_ptr<Proposal> > pending_proposals_;
+
+  // ===========================================================
+  // Fair Ordering State
+  // ===========================================================
+
+  // Algorithm 1, line 1: ts_store[txn_hash] = list of signed timestamps
+  // Collected TEE-signed timestamps from all replicas for each transaction.
+  std::map<std::string, std::vector<SignedTimestamp>> ts_store_;
+  std::mutex ts_mutex_;
+
+  // Algorithm 1, line 2: H = seen-set (inside TEE).
+  // Set of transaction hashes that this replica's TEE has already attested.
+  std::set<std::string> tee_seen_set_;
+
+  // Simulated TEE monotonic clock (microsecond granularity).
+  int64_t tee_clock_ = 0;
+
+  // Local ordering keys K_r(t) computed by this replica.
+  // Keyed by txn_hash.
+  std::map<std::string, int64_t> local_ordering_keys_;
+  std::mutex ordering_mutex_;
+
+  // Final ordering keys K(t) = min over first f+1 committed keys.
+  // committed_keys_[txn_hash] = sorted list of committed K_r values.
+  std::map<std::string, std::vector<int64_t>> committed_keys_;
+
+  // Execution threshold state (Section V-B).
+  // last_seen_[i] = M_i = max last-seen timestamp from replica i across
+  // all committed blocks.
+  std::vector<int64_t> last_seen_;
+
+  // Previous execution threshold τ_prev.
+  int64_t prev_threshold_ = 0;
 };
 
 }  // namespace autobahn

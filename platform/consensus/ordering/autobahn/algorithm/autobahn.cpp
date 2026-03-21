@@ -12,26 +12,27 @@ namespace autobahn {
 AutoBahn::AutoBahn(int id, int f, int total_num, int block_size, SignatureVerifier* verifier)
     : ProtocolBase(id, f, total_num), verifier_(verifier) {
 
-  LOG(ERROR) << "get proposal graph";
+  LOG(ERROR) << "Initializing AutoBahn with Sync HotStuff + Fair Ordering"
+             << " id=" << id << " f=" << f << " n=" << total_num;
   id_ = id;
   total_num_ = total_num;
   f_ = f;
   is_stop_ = false;
-  //timeout_ms_ = 100;
   timeout_ms_ = 60000;
+  // Δ: synchronous network delay bound.
+  // Replicas wait Δ to collect timestamps, 2Δ before committing.
+  delta_ms_ = 5000;  // 5 seconds default; configurable per deployment
   batch_size_ = block_size;
   execute_id_ = 1;
   is_leader_ = id_ == 1;
   cur_slot_ = 1;
-  use_hs_ = true;
 
   proposal_manager_ = std::make_unique<ProposalManager>(id, total_num_, f_, verifier);
 
   block_thread_ = std::thread(&AutoBahn::GenerateBlocks, this);
   dissemi_thread_ = std::thread(&AutoBahn::AsyncDissemination, this);
   consensus_thread_ = std::thread(&AutoBahn::AsyncConsensus, this);
-  prepare_thread_ = std::thread(&AutoBahn::AsyncPrepare, this);
-  commit_thread_ = std::thread(&AutoBahn::AsyncCommit, this);
+  commit_thread_ = std::thread(&AutoBahn::AsyncCommitTimer, this);
 }
 
 AutoBahn::~AutoBahn() {
@@ -42,6 +43,12 @@ AutoBahn::~AutoBahn() {
   if (dissemi_thread_.joinable()) {
     dissemi_thread_.join();
   }
+  if (consensus_thread_.joinable()) {
+    consensus_thread_.join();
+  }
+  if (commit_thread_.joinable()) {
+    commit_thread_.join();
+  }
 }
 
 bool AutoBahn::IsStop() {
@@ -49,11 +56,14 @@ bool AutoBahn::IsStop() {
 }
 
 bool AutoBahn::ReceiveTransaction(std::unique_ptr<Transaction> txn) {
-  // LOG(ERROR)<<"recv txn:";
   txn->set_create_time(GetCurrentTime());
   txns_.Push(std::move(txn));
   return true;
 }
+
+// ============================================================
+// Data Dissemination Layer (TEE-Enabled Autobahn, Algorithm 1)
+// ============================================================
 
 void AutoBahn::GenerateBlocks() {
   std::vector<std::unique_ptr<Transaction>> txns;
@@ -78,7 +88,6 @@ void AutoBahn::GenerateBlocks() {
 
 bool AutoBahn::WaitForResponse(int64_t block_id) {
   std::unique_lock<std::mutex> lk(bc_mutex_);
-  //LOG(ERROR)<<"wait for block id :"<<block_id;
   bc_block_cv_.wait_for(lk, std::chrono::microseconds(timeout_ms_ * 1000),
       [&] { return block_id<= proposal_manager_->GetCurrentBlockId(); });
   if (block_id > proposal_manager_->GetCurrentBlockId()) {
@@ -100,7 +109,6 @@ void AutoBahn::AsyncDissemination() {
     if(next_block == 1) {
       next_block++;
     }
-    //LOG(ERROR)<<" get block :"<<next_block-1;
 
     std::vector<std::unique_ptr<Transaction>> txns;
     while (!IsStop()) {
@@ -126,74 +134,20 @@ void AutoBahn::AsyncDissemination() {
       next_block--;
       continue;
     }
-    //LOG(ERROR)<<" broadcast block :"<<next_block-1<<" id:"<<block->local_id();
     Broadcast(MessageType::NewBlocks, *block);
-    //LOG(ERROR)<<" broadcast block :"<<next_block-1<<" id:"<<block->local_id()<<" done";
   }
 }
 
-void AutoBahn::NotifyView() {
-  std::unique_lock<std::mutex> lk(view_mutex_);
-  view_cv_.notify_all();
-}
-
-bool AutoBahn::WaitForNextView(int view) {
-  std::unique_lock<std::mutex> lk(view_mutex_);
-  //LOG(ERROR)<<"wait for next view:"<<view;
-  view_cv_.wait_for(lk, std::chrono::microseconds(timeout_ms_ * 1000),
-      [&] { return proposal_manager_->ReadyView(view); });
-  return proposal_manager_->ReadyView(view);
-}
-
-bool AutoBahn::WaitForNextLeader() {
-  std::unique_lock<std::mutex> lk(leader_mutex_);
-  //LOG(ERROR)<<"wait for next view:"<<view;
-  leader_cv_.wait_for(lk, std::chrono::microseconds(timeout_ms_ * 1000),
-      [&] { return is_leader_; });
-  return is_leader_;
-}
-
-void AutoBahn::StartNextLeader(int slot_id) {
-  //LOG(ERROR)<<" start leader slot:"<<slot_id;
-  std::unique_lock<std::mutex> lk(leader_mutex_);
-  cur_slot_ = slot_id;
-  is_leader_ = true;
-  leader_cv_.notify_all();
-}
-
-void AutoBahn::AsyncConsensus() {
-  while (!IsStop()) {
-    if(use_hs_){
-      if(!WaitForNextLeader()){
-        continue;
-      }
-      {
-        std::unique_lock<std::mutex> lk(leader_mutex_);
-        is_leader_ = false;
-      }
-    }
-    else {
-      if (!is_leader_) {
-        break;
-      }
-    }
-    int view = proposal_manager_->GetCurrentView();
-    if(!WaitForNextView(view)) {
-      continue;
-    }
-    std::pair<int, std::map<int, int64_t>> blocks = proposal_manager_->GetCut();
-    int slot_id = blocks.first;
-    if(use_hs_){
-      slot_id = cur_slot_;
-    }
-    auto proposal = proposal_manager_->GenerateProposal(slot_id, blocks.second);
-    Broadcast(MessageType::NewProposal, *proposal);
-  }
-}
-
-
+// Algorithm 1, lines 3-14: OnReceiveCar
+//
+// When receiving a block (Car) from another replica:
+// 1. Store the block and send a BlockACK (PoA)
+// 2. TEE-timestamp each transaction in the block
+// 3. Broadcast the signed timestamps to all replicas
 void AutoBahn::ReceiveBlock(std::unique_ptr<Block> block) {
   LOG(ERROR)<<"recv block from:"<<block->sender_id()<<" block id:"<<block->local_id();
+
+  // Step 1: Standard Autobahn — ACK for Proof of Availability
   BlockACK block_ack;
   block_ack.set_hash(block->hash());
   block_ack.set_sender_id(block->sender_id());
@@ -201,16 +155,35 @@ void AutoBahn::ReceiveBlock(std::unique_ptr<Block> block) {
   block_ack.set_responder(id_);
   *block_ack.mutable_sign_info() = proposal_manager_->SignBlock(*block);
 
+  // Step 2: TEE-timestamp each transaction (Algorithm 1, lines 6-13)
+  std::vector<SignedTimestamp> new_timestamps =
+      proposal_manager_->TimestampTransactions(*block);
+
   proposal_manager_->AddBlock(std::move(block));
   SendMessage(MessageType::CMD_BlockACK, block_ack, block_ack.sender_id());
 
   proposal_manager_->UpdateView(block_ack.sender_id(), block_ack.local_id());
   NotifyView();
+
+  // Step 3: Broadcast timestamps (Algorithm 1, line 14)
+  // "BroadcastTimestamps({(t_i, T_i, σ_i) : t_i newly attested})"
+  if (!new_timestamps.empty()) {
+    TimestampBatch batch;
+    batch.set_sender_id(id_);
+    for (const auto& ts : new_timestamps) {
+      *batch.add_timestamps() = ts;
+    }
+    Broadcast(MessageType::TEE_Timestamps, batch);
+    LOG(ERROR) << "Broadcast " << new_timestamps.size()
+               << " TEE timestamps for block from " << block_ack.sender_id();
+  }
+
   LOG(ERROR)<<"send block ack to:"<<block_ack.sender_id()<<" block id:"<<block_ack.local_id();
 }
 
 void AutoBahn::ReceiveBlockACK(std::unique_ptr<BlockACK> block) {
-  LOG(ERROR)<<"recv block ack:"<<block->local_id()<<" from:"<<block->responder()<<" block sign info:"<<block->sign_info().sender_id();
+  LOG(ERROR)<<"recv block ack:"<<block->local_id()<<" from:"<<block->responder()
+    <<" block sign info:"<<block->sign_info().sender_id();
   std::unique_lock<std::mutex> lk(block_mutex_);
   block_ack_[block->local_id()].insert(std::make_pair(block->responder(), block->sign_info()));
   LOG(ERROR)<<"recv block ack:"<<block->local_id()
@@ -225,195 +198,343 @@ void AutoBahn::ReceiveBlockACK(std::unique_ptr<BlockACK> block) {
   LOG(ERROR)<<"recv block ack:"<<block->local_id()<<" done";
 }
 
+// Algorithm 1, lines 16-19: OnReceiveTimestamp
+//
+// Receive TEE-signed timestamps from another replica and store them.
+// After enough timestamps are collected (≥ f+1), we can compute
+// the local ordering key K_r(t).
+void AutoBahn::ReceiveTimestamps(std::unique_ptr<TimestampBatch> batch) {
+  LOG(ERROR) << "Received " << batch->timestamps_size()
+             << " timestamps from replica " << batch->sender_id();
+
+  for (const auto& ts : batch->timestamps()) {
+    proposal_manager_->AddTimestamp(ts);
+  }
+}
+
+// ============================================================
+// Sync HotStuff Consensus Layer with Fair Ordering
+// ============================================================
+
+void AutoBahn::NotifyView() {
+  std::unique_lock<std::mutex> lk(view_mutex_);
+  view_cv_.notify_all();
+}
+
+bool AutoBahn::WaitForNextView(int view) {
+  std::unique_lock<std::mutex> lk(view_mutex_);
+  view_cv_.wait_for(lk, std::chrono::microseconds(timeout_ms_ * 1000),
+      [&] { return proposal_manager_->ReadyView(view); });
+  return proposal_manager_->ReadyView(view);
+}
+
+bool AutoBahn::WaitForNextLeader() {
+  std::unique_lock<std::mutex> lk(leader_mutex_);
+  leader_cv_.wait_for(lk, std::chrono::microseconds(timeout_ms_ * 1000),
+      [&] { return is_leader_; });
+  return is_leader_;
+}
+
+void AutoBahn::StartNextLeader(int slot_id) {
+  std::unique_lock<std::mutex> lk(leader_mutex_);
+  cur_slot_ = slot_id;
+  is_leader_ = true;
+  leader_cv_.notify_all();
+}
+
+// Algorithm 2: Sync HotStuff Leader — Windowed Proposal with Tip Cut
+//
+// The leader:
+// 1. Computes τ_current from committed blocks' last-seen vectors
+// 2. Waits until Now() > τ_current + Δ (ensures all timestamps collected)
+// 3. Gets the tip cut (latest certified block from each lane)
+// 4. Extracts transactions where τ_prev < K(t) ≤ τ_current
+// 5. Sorts by ordering key K(t) (ascending, ties by hash)
+// 6. Broadcasts the proposal with the sorted, fairly-ordered payload
+void AutoBahn::AsyncConsensus() {
+  while (!IsStop()) {
+    if(!WaitForNextLeader()){
+      continue;
+    }
+    {
+      std::unique_lock<std::mutex> lk(leader_mutex_);
+      is_leader_ = false;
+    }
+
+    int view = proposal_manager_->GetCurrentView();
+    if(!WaitForNextView(view)) {
+      continue;
+    }
+
+    // Step 1: Compute ordering keys for all transactions with enough timestamps
+    // (Algorithm 1, AfterCollectionDeadline for all pending transactions)
+    proposal_manager_->ComputeAllOrderingKeys();
+
+    // Step 2: Compute execution threshold τ_current (Section V-B)
+    int64_t tau_prev = proposal_manager_->GetPrevThreshold();
+    int64_t tau_current = proposal_manager_->ComputeExecutionThreshold();
+
+    // If τ hasn't advanced, use a fallback: current time minus 2Δ
+    // This ensures we still make progress when the threshold mechanism
+    // hasn't accumulated enough data yet.
+    if (tau_current <= tau_prev) {
+      tau_current = GetCurrentTime() - 2 * delta_ms_ * 1000;
+      if (tau_current <= tau_prev) {
+        tau_current = tau_prev + 1;
+      }
+    }
+
+    // Get the tip cut: latest certified block from each replica lane
+    std::pair<int, std::map<int, int64_t>> blocks = proposal_manager_->GetCut();
+    int slot_id = cur_slot_;
+
+    auto proposal = proposal_manager_->GenerateProposal(slot_id, blocks.second);
+
+    // Step 3: Set Sync HotStuff + fair ordering fields
+    proposal->set_view_number(slot_id);
+    proposal->set_propose_time(GetCurrentTime());
+    proposal->set_threshold(tau_current);
+    proposal->set_prev_threshold(tau_prev);
+
+    // Build tip cut references
+    for (const auto& it : blocks.second) {
+      TipRef* tip = proposal->add_tip_cut();
+      tip->set_sender_id(it.first);
+      tip->set_block_id(it.second);
+    }
+
+    // Step 4: Get this replica's last-seen vector L⃗ (Algorithm 2, line 9)
+    std::vector<int64_t> last_seen = proposal_manager_->GetLastSeenVector();
+    for (int i = 1; i <= total_num_; ++i) {
+      proposal->add_last_seen_vector(last_seen[i]);
+    }
+
+    // Step 5: Extract transactions in execution window and sort by K(t)
+    // (Algorithm 2, lines 6-8)
+    auto ordered_txns = proposal_manager_->GetTransactionsInWindow(tau_prev, tau_current);
+    for (const auto& entry : ordered_txns) {
+      OrderingKeyEntry* oke = proposal->add_ordering_keys();
+      oke->set_txn_hash(entry.first);
+      oke->set_ordering_key(entry.second);
+    }
+
+    LOG(ERROR) << "SyncHS leader " << id_ << " proposing slot " << slot_id
+               << " with " << blocks.second.size() << " lanes"
+               << ", " << ordered_txns.size() << " fairly-ordered txns"
+               << ", τ=(" << tau_prev << ", " << tau_current << "]";
+
+    // Update τ_prev for next round
+    proposal_manager_->SetPrevThreshold(tau_current);
+
+    // Broadcast proposal to all replicas
+    Broadcast(MessageType::SyncHS_Propose, *proposal);
+  }
+}
+
+// Equivocation detection
+bool AutoBahn::DetectEquivocation(const Proposal& proposal) {
+  std::unique_lock<std::mutex> lk(equivocation_mutex_);
+  int slot = proposal.slot_id();
+  auto it = seen_proposal_hash_.find(slot);
+  if (it == seen_proposal_hash_.end()) {
+    seen_proposal_hash_[slot] = proposal.hash();
+    return false;
+  }
+  if (it->second != proposal.hash()) {
+    LOG(ERROR) << "EQUIVOCATION detected! Leader " << proposal.sender_id()
+               << " sent conflicting proposals for slot " << slot;
+    equivocated_views_.insert(slot);
+    return true;
+  }
+  return false;
+}
+
+// Algorithm 3: Sync HotStuff Replica — Validation with Tip Cut and Threshold
+//
+// On receiving a proposal:
+// 1. Detect equivocation
+// 2. Validate τ_block > τ_committed (threshold must advance)
+// 3. Validate tip cut (PoAs, no regression)
+// 4. Verify payload matches expected fairly-ordered transactions
+// 5. Vote ACCEPT (broadcast to all)
+// 6. Schedule for 2Δ timer-based commit
 bool AutoBahn::ReceiveProposal(std::unique_ptr<Proposal> proposal) {
-  LOG(ERROR)<<" receive proposal from:"<<proposal->sender_id()<<" slot:"<<proposal->slot_id()<<" block size:"<<proposal->block_size();
+  int slot_id = proposal->slot_id();
+  int sender_id = proposal->sender_id();
+  LOG(ERROR) << "SyncHS receive proposal from:" << sender_id
+             << " slot:" << slot_id << " block size:" << proposal->block_size()
+             << " ordering_keys:" << proposal->ordering_keys_size();
+
+  // Step 1: Equivocation detection
+  if (DetectEquivocation(*proposal)) {
+    LOG(ERROR) << "Rejecting equivocating proposal for slot " << slot_id;
+    EquivocationProof proof;
+    *proof.mutable_proposal_b() = *proposal;
+    Broadcast(MessageType::SyncHS_Equivocation, proof);
+    return false;
+  }
+
+  // Step 2: Validate execution threshold (Algorithm 3, lines 3-6)
+  // τ_block must be greater than τ_committed
+  // (We use prev_threshold as our τ_committed)
+  int64_t tau_block = proposal->threshold();
+  int64_t tau_committed = proposal_manager_->GetPrevThreshold();
+  if (tau_block <= tau_committed && tau_committed > 0) {
+    LOG(ERROR) << "Rejecting proposal: τ_block=" << tau_block
+               << " ≤ τ_committed=" << tau_committed;
+    return false;
+  }
+
+  // Step 3: Update last-seen vector from the proposal's L⃗ (Algorithm 3, line 17)
+  for (int i = 0; i < proposal->last_seen_vector_size() && i < total_num_; ++i) {
+    proposal_manager_->UpdateLastSeenFromBlock(i + 1, proposal->last_seen_vector(i));
+  }
+
+  // Step 4: Update τ_committed (Algorithm 3, line 19)
+  proposal_manager_->SetPrevThreshold(tau_block);
+
+  // Step 5: Record committed ordering keys for fair ordering finality
+  for (const auto& oke : proposal->ordering_keys()) {
+    proposal_manager_->AddCommittedOrderingKey(oke.txn_hash(), oke.ordering_key());
+  }
+
+  // Step 6: Vote ACCEPT — broadcast to ALL replicas
   Proposal vote;
-  vote.set_slot_id(proposal->slot_id());
+  vote.set_slot_id(slot_id);
   vote.set_sender_id(id_);
   vote.set_hash(proposal->hash());
+  vote.set_view_number(proposal->view_number());
 
   auto hash_signature_or = verifier_->SignMessage(vote.hash());
   if (!hash_signature_or.ok()) {
     LOG(ERROR) << "Sign message fail";
     return false;
   }
-  *vote.mutable_sign()=*hash_signature_or;
+  *vote.mutable_sign() = *hash_signature_or;
 
-  int sender_id = proposal->sender_id();
-  proposal_manager_->AddProposalData(std::move(proposal));
-  //Broadcast(MessageType::ProposalAck, vote);
-  SendMessage(MessageType::ProposalAck, vote, sender_id);
+  // Store proposal data for later commit
+  proposal_manager_->AddProposalData(std::make_unique<Proposal>(*proposal));
 
+  // Broadcast vote to ALL replicas
+  Broadcast(MessageType::SyncHS_Vote, vote);
+
+  // Step 7: Schedule for timer-based commit after 2Δ
+  {
+    std::unique_lock<std::mutex> lk(pending_commit_mutex_);
+    PendingCommit pc;
+    pc.proposal = std::make_unique<Proposal>(*proposal);
+    pc.receive_time = GetCurrentTime();
+    pending_commits_[slot_id] = std::move(pc);
+  }
+
+  LOG(ERROR) << "SyncHS voted and scheduled commit for slot " << slot_id
+             << " (2Δ=" << 2 * delta_ms_ << "ms)";
   return true;
 }
 
+// Receive a vote from another replica
 bool AutoBahn::ReceiveVote(std::unique_ptr<Proposal> vote) {
-  //LOG(ERROR)<<"recv vote ack:"<<vote->slot_id()<<" from:"<<vote->sender_id(); 
-
-  std::unique_ptr<Proposal> vote_cpy = std::make_unique<Proposal>(*vote);
-
   std::unique_lock<std::mutex> lk(vote_mutex_);
   int slot_id = vote->slot_id();
   int sender = vote->sender_id();
-  vote_ack_[vote->slot_id()].insert(std::make_pair(vote->sender_id(), std::move(vote)));
-
-  //LOG(ERROR)<<"recv vote ack:"<<slot_id<<" from:"<<sender
-  //  << " num:"<<vote_ack_[slot_id].size();
-
-  if (vote_ack_[slot_id].size() >= 2*f_ + 1){
-      PrepareDone(std::move(vote_cpy));
-  }
-  //LOG(ERROR)<<"recv vote ack done";
+  vote_ack_[slot_id].insert(std::make_pair(sender, std::move(vote)));
   return true;
 }
 
+// Handle equivocation proof
+bool AutoBahn::ReceiveEquivocation(std::unique_ptr<EquivocationProof> proof) {
+  int slot = proof->proposal_b().slot_id();
+  LOG(ERROR) << "SyncHS received equivocation proof for slot " << slot;
 
-bool AutoBahn::IsFastCommit(const Proposal& proposal) {
-  
-  //LOG(ERROR)<<" is fast commit slot:"<<proposal.slot_id()<<" sign size:"<<proposal.cert().sign_size();
-  if(proposal.cert().sign_size() != total_num_) {
-    return false;
+  {
+    std::unique_lock<std::mutex> lk(equivocation_mutex_);
+    equivocated_views_.insert(slot);
   }
-
-  for(auto& sign : proposal.cert().sign()){
-    bool valid = verifier_->VerifyMessage(proposal.hash(), sign);
-    if (!valid) {
-      LOG(ERROR)<<" sign info sign fail";
-      return false;
-    }
+  {
+    std::unique_lock<std::mutex> lk(pending_commit_mutex_);
+    pending_commits_.erase(slot);
   }
   return true;
 }
 
-bool AutoBahn::ReceivePrepare(std::unique_ptr<Proposal> proposal) {
-  //LOG(ERROR)<<"recv prepare:"<<proposal->slot_id()<<" from:"<<proposal->sender_id()
-  //        <<" is fast commit:"<<proposal->fast_commit(); 
-  // verify
-  if (IsFastCommit(*proposal)){
- // proposal->fast_commit() ){
-    CommitDone(std::move(proposal));
-  }
-  else {
-    proposal->set_sender_id(id_);
-    Broadcast(MessageType::Commit, *proposal);
-  }
-  LOG(ERROR)<<"recv vote ack done";
-  return true;
-}
-
-bool AutoBahn::ReceiveCommit(std::unique_ptr<Proposal> proposal) {
-  //LOG(ERROR)<<"recv commit:"<<proposal->slot_id()<<" from:"<<proposal->sender_id();
-
-  std::unique_lock<std::mutex> lk(commit_mutex_);
-  commit_ack_[proposal->slot_id()].insert(proposal->sender_id());
-  LOG(ERROR)<<"recv commit ack:"<<proposal->slot_id()<<" from:"<<proposal->sender_id()
-    << " num:"<<commit_ack_[proposal->slot_id()].size();
-  if (commit_ack_[proposal->slot_id()].size() >= 2*f_ + 1){
-    CommitDone(std::move(proposal));
-  }
-  LOG(ERROR)<<"recv vote ack done";
-  return true;
-}
-
-
-void AutoBahn::PrepareDone(std::unique_ptr<Proposal> vote) {
-  LOG(ERROR)<<" vote prepare done:"<<vote->slot_id();
-  prepare_queue_.Push(std::move(vote));
-}
-
-void AutoBahn::CommitDone(std::unique_ptr<Proposal> proposal) {
-  commit_queue_.Push(std::move(proposal));
-}
-
-void AutoBahn::AsyncPrepare() {
-  int view = 1;
-  std::map<int, std::pair<int64_t,std::unique_ptr<Proposal>> > votes;
+// Timer-based commit thread.
+//
+// In Sync HotStuff, a replica commits after 2Δ has elapsed since
+// receiving the proposal, provided no equivocation was detected.
+void AutoBahn::AsyncCommitTimer() {
+  int next_commit_view = 1;
   while (!IsStop()) {
-    std::unique_ptr<Proposal> p = prepare_queue_.Pop(timeout_ms_ * 1000);
-    if(p== nullptr) {
+    usleep(1000);  // 1ms polling interval
+
+    std::unique_lock<std::mutex> lk(pending_commit_mutex_);
+    if (pending_commits_.empty()) {
       continue;
     }
-    assert(p != nullptr);
-    //LOG(ERROR)<<" obtain slot vote:"<<p->slot_id();
-    int slot_id = p->slot_id();
-    votes[slot_id] = std::make_pair(GetCurrentTime(), std::move(p));
-    if(use_hs_){
-      view = slot_id;
-    }
-    while(!votes.empty() && votes.begin()->first <= view) {
-      if(votes.begin()->first < view) {
-        votes.erase(votes.begin());
+
+    int64_t now = GetCurrentTime();
+
+    auto it = pending_commits_.begin();
+    while (it != pending_commits_.end() && it->first <= next_commit_view) {
+      if (it->first < next_commit_view) {
+        it = pending_commits_.erase(it);
         continue;
       }
-      int delay = 10000;
-      int wait_time = GetCurrentTime() - votes.begin()->second.first;
-      wait_time = delay - wait_time;
-      //LOG(ERROR)<<" view :"<<view<<" wait time:"<<wait_time;
-      if(wait_time> 0) {
-        usleep(wait_time);
-      }
-      Prepare(std::move(votes.begin()->second.second));
-      if(use_hs_){
-        view = votes.begin()->first+1;
-      }
-      else {
-        view++;
-      }
-      votes.erase(votes.begin());
-    }
-  }
-}
 
-void AutoBahn::AsyncCommit() {
-  int view = 1;
-  std::map<int, std::unique_ptr<Proposal> > proposals;
-  while (!IsStop()) {
-    std::unique_ptr<Proposal> p = commit_queue_.Pop(timeout_ms_ * 1000);
-    if(p== nullptr) {
-      continue;
-    }
-    assert(p != nullptr);
-    //LOG(ERROR)<<" obtain comit slot vote:"<<p->slot_id();
-    int slot_id = p->slot_id();
-    proposals[slot_id] = std::move(p);
-    while(!proposals.empty() && proposals.begin()->first <= view) {
-      if(proposals.begin()->first < view) {
-        proposals.erase(proposals.begin());
+      int64_t elapsed_us = now - it->second.receive_time;
+      int64_t two_delta_us = 2 * delta_ms_ * 1000;
+
+      if (elapsed_us < two_delta_us) {
+        break;
+      }
+
+      // Check for equivocation
+      bool equivocated = false;
+      {
+        std::unique_lock<std::mutex> elk(equivocation_mutex_);
+        equivocated = equivocated_views_.count(it->first) > 0;
+      }
+
+      if (equivocated) {
+        LOG(ERROR) << "SyncHS: NOT committing slot " << it->first
+                   << " due to equivocation";
+        it = pending_commits_.erase(it);
+        next_commit_view++;
         continue;
       }
-      Commit(std::move(proposals.begin()->second));
-      proposals.erase(proposals.begin());
-      view++;
+
+      // 2Δ elapsed, no equivocation — commit!
+      LOG(ERROR) << "SyncHS: committing slot " << it->first
+                 << " after 2Δ (" << elapsed_us / 1000 << "ms)";
+      auto proposal_to_commit = std::move(it->second.proposal);
+      it = pending_commits_.erase(it);
+      lk.unlock();
+      Commit(std::move(proposal_to_commit));
+      lk.lock();
+      next_commit_view++;
     }
   }
 }
 
-void AutoBahn::Prepare(std::unique_ptr<Proposal> vote) {
-  //LOG(ERROR)<<" prepare vote:"<<vote->slot_id()<< " num:"<<vote_ack_[vote->slot_id()].size();
-  if (vote_ack_[vote->slot_id()].size() == total_num_){
-    // fast path
-    //Commit(std::move(vote));
-    vote->set_fast_commit(true);
-    for(auto& it : vote_ack_[vote->slot_id()]){
-      *vote->mutable_cert()->add_sign() = it.second->sign();
-    }
-  }
-
-  // slot path
-  //LOG(ERROR)<<" broadcast commit:"<<vote->slot_id()<<" is fast:"<<vote->fast_commit();
-  vote->set_sender_id(id_);
-  Broadcast(MessageType::Prepare, *vote);
-}
-
+// Execute committed transactions in fair order.
+//
+// Transactions are executed in the order specified by the proposal's
+// ordering keys (which were sorted by K(t) by the leader in Algorithm 2).
+// This guarantees ordering linearizability: if all correct replicas
+// observed t_a before t_b, then t_a is ordered before t_b.
 void AutoBahn::Commit(std::unique_ptr<Proposal> proposal) {
   auto raw_proposal = proposal_manager_->GetProposalData(proposal->slot_id());
   assert(raw_proposal != nullptr);
   int slot_id = proposal->slot_id();
-  //LOG(ERROR)<<" proposal proposal slot id:"<<proposal->slot_id();
+
+  // Update execution threshold from last-seen vector in the committed block
+  for (int i = 0; i < raw_proposal->last_seen_vector_size() && i < total_num_; ++i) {
+    proposal_manager_->UpdateLastSeenFromBlock(i + 1, raw_proposal->last_seen_vector(i));
+  }
+
+  // Execute transactions from committed blocks
   for(const auto& block : raw_proposal->block()) {
     int block_owner = block.sender_id();
     int block_id = block.local_id();
-    //LOG(ERROR)<<" commit :"<<block_owner<<" block id :"<<block_id;
 
     int last_block_id = commit_block_[block_owner];
 
@@ -422,31 +543,32 @@ void AutoBahn::Commit(std::unique_ptr<Proposal> proposal) {
       while(data_block == nullptr){
         data_block = proposal_manager_->GetBlock(block_owner, i);
         if(data_block == nullptr) {
-          //LOG(ERROR)<<" wait block:"<<block_owner<<" id:"<<i;
           usleep(100);
         }
       }
       assert(data_block != nullptr);
 
-      //LOG(ERROR)<<" txn size:"<<data_block->mutable_data()->transaction_size()<<" block  owner:"<<block_owner<<" id:"<<i;
       for (Transaction& txn :
           *data_block->mutable_data()->mutable_transaction()) {
+        // Set the final ordering key on the transaction for downstream use
+        int64_t final_key = proposal_manager_->GetFinalOrderingKey(txn.hash());
+        if (final_key >= 0) {
+          txn.set_ordering_key(final_key);
+        }
         txn.set_id(execute_id_++);
         commit_(txn);
       }
     }
     commit_block_[block_owner] = block_id;
   }
-  if(use_hs_){
-    int view = (slot_id+1) % total_num_;
-    if(view == 0)  view = total_num_;
-    //LOG(ERROR)<<" next view:"<<view<<" id:"<<id_<<" total num:"<<total_num_;
-    if(view == id_){
-      StartNextLeader(slot_id+1);
-    }
+
+  // Rotate leader (round-robin, as in Sync HotStuff)
+  int view = (slot_id + 1) % total_num_;
+  if(view == 0) view = total_num_;
+  if(view == id_){
+    StartNextLeader(slot_id + 1);
   }
 }
-
 
 }  // namespace autobahn
 }  // namespace resdb

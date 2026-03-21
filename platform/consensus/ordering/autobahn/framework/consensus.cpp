@@ -37,7 +37,9 @@ Consensus::Consensus(const ResDBConfig& config,
                      std::unique_ptr<TransactionManager> executor)
     : common::Consensus(config, std::move(executor)){
   int total_replicas = config_.GetReplicaNum();
-  int f = (total_replicas - 1) / 3;
+  // Sync HotStuff operates in a synchronous network with 2f+1 replicas.
+  // f = (n-1)/2 (tolerates minority Byzantine faults under synchrony).
+  int f = (total_replicas - 1) / 2;
 
   Init();
 
@@ -49,7 +51,7 @@ Consensus::Consensus(const ResDBConfig& config,
           .type() != CertificateKeyInfo::CLIENT) {
     autobahn_ = std::make_unique<AutoBahn>(
         config_.GetSelfInfo().id(), f,
-                                   total_replicas, config_.GetConfigData().block_size(), 
+                                   total_replicas, config_.GetConfigData().block_size(),
                                    GetSignatureVerifier());
 
     InitProtocol(autobahn_.get());
@@ -58,32 +60,32 @@ Consensus::Consensus(const ResDBConfig& config,
 }
 
 int Consensus::ProcessCustomConsensus(std::unique_ptr<Request> request) {
-  //LOG(ERROR)<<"receive commit:"<<request->type()<<" "<<MessageType_Name(request->user_type())<<" from:"<<request->sender_id();
+  // Data dissemination messages (unchanged)
   if (request->user_type() == MessageType::NewBlocks) {
     std::unique_ptr<Block> block = std::make_unique<Block>();
     if (!block->ParseFromString(request->data())) {
       assert(1 == 0);
-      LOG(ERROR) << "parse proposal fail";
+      LOG(ERROR) << "parse block fail";
       return -1;
     }
     autobahn_->ReceiveBlock(std::move(block));
     return 0;
-  } 
+  }
   else if (request->user_type() == MessageType::CMD_BlockACK) {
     std::unique_ptr<BlockACK> block_ack = std::make_unique<BlockACK>();
     if (!block_ack->ParseFromString(request->data())) {
-      LOG(ERROR) << "parse proposal fail";
+      LOG(ERROR) << "parse block ack fail";
       assert(1 == 0);
       return -1;
     }
     autobahn_->ReceiveBlockACK(std::move(block_ack));
     return 0;
-
-  } else if (request->user_type() == MessageType::NewProposal) {
-    // LOG(ERROR)<<"receive proposal:";
+  }
+  // Sync HotStuff consensus messages
+  else if (request->user_type() == MessageType::SyncHS_Propose) {
     std::unique_ptr<Proposal> proposal = std::make_unique<Proposal>();
     if (!proposal->ParseFromString(request->data())) {
-      LOG(ERROR) << "parse proposal fail";
+      LOG(ERROR) << "parse SyncHS proposal fail";
       assert(1 == 0);
       return -1;
     }
@@ -91,73 +93,52 @@ int Consensus::ProcessCustomConsensus(std::unique_ptr<Request> request) {
       return -1;
     }
     return 0;
-  } else if (request->user_type() == MessageType::ProposalAck) {
-    // LOG(ERROR)<<"receive proposal:";
-    std::unique_ptr<Proposal> proposal = std::make_unique<Proposal>();
-    if (!proposal->ParseFromString(request->data())) {
-      LOG(ERROR) << "parse proposal fail";
+  }
+  else if (request->user_type() == MessageType::SyncHS_Vote) {
+    std::unique_ptr<Proposal> vote = std::make_unique<Proposal>();
+    if (!vote->ParseFromString(request->data())) {
+      LOG(ERROR) << "parse SyncHS vote fail";
       assert(1 == 0);
       return -1;
     }
-    if (!autobahn_->ReceiveVote(std::move(proposal))) {
+    if (!autobahn_->ReceiveVote(std::move(vote))) {
       return -1;
     }
     return 0;
-  } else if (request->user_type() == MessageType::Prepare) {
-    std::unique_ptr<Proposal> proposal = std::make_unique<Proposal>();
-    if (!proposal->ParseFromString(request->data())) {
-      LOG(ERROR) << "parse proposal fail";
+  }
+  else if (request->user_type() == MessageType::SyncHS_Equivocation) {
+    std::unique_ptr<EquivocationProof> proof = std::make_unique<EquivocationProof>();
+    if (!proof->ParseFromString(request->data())) {
+      LOG(ERROR) << "parse equivocation proof fail";
       assert(1 == 0);
       return -1;
     }
-    if (!autobahn_->ReceivePrepare(std::move(proposal))) {
+    if (!autobahn_->ReceiveEquivocation(std::move(proof))) {
       return -1;
     }
     return 0;
-
-  } else if (request->user_type() == MessageType::Commit) {
-    std::unique_ptr<Proposal> proposal = std::make_unique<Proposal>();
-    if (!proposal->ParseFromString(request->data())) {
-      LOG(ERROR) << "parse proposal fail";
+  }
+  // Fair ordering: TEE timestamp dissemination
+  else if (request->user_type() == MessageType::TEE_Timestamps) {
+    std::unique_ptr<TimestampBatch> batch = std::make_unique<TimestampBatch>();
+    if (!batch->ParseFromString(request->data())) {
+      LOG(ERROR) << "parse TEE timestamp batch fail";
       assert(1 == 0);
       return -1;
     }
-    if (!autobahn_->ReceiveCommit(std::move(proposal))) {
-      return -1;
-    }
+    autobahn_->ReceiveTimestamps(std::move(batch));
     return 0;
-
-    /*
-  } else if (request->user_type() == MessageType::CMD_BlockQuery) {
-    std::unique_ptr<BlockQuery> block = std::make_unique<BlockQuery>();
-    if (!block->ParseFromString(request->data())) {
-      assert(1 == 0);
-      LOG(ERROR) << "parse proposal fail";
-      return -1;
-    }
-    autobahn_->SendBlock(*block);
+  }
+  // Legacy PBFT messages — log and ignore (protocol replaced by Sync HotStuff)
+  else if (request->user_type() == MessageType::NewProposal ||
+           request->user_type() == MessageType::ProposalAck ||
+           request->user_type() == MessageType::Prepare ||
+           request->user_type() == MessageType::Commit) {
+    LOG(ERROR) << "Received legacy PBFT message type "
+               << MessageType_Name(request->user_type())
+               << " — ignoring (Sync HotStuff active)";
     return 0;
-  } else if (request->user_type() == MessageType::CMD_ProposalQuery) {
-    std::unique_ptr<ProposalQuery> query =
-      std::make_unique<ProposalQuery>();
-    if (!query->ParseFromString(request->data())) {
-      assert(1 == 0);
-      LOG(ERROR) << "parse proposal fail";
-      return -1;
-    }
-    autobahn_->SendProposal(*query);
-  } else if (request->user_type() ==
-      MessageType::CMD_ProposalQueryResponse) {
-    std::unique_ptr<ProposalQueryResp> resp =
-      std::make_unique<ProposalQueryResp>();
-    if (!resp->ParseFromString(request->data())) {
-      assert(1 == 0);
-      LOG(ERROR) << "parse proposal fail";
-      return -1;
-    }
-    autobahn_->ReceiveProposalQueryResp(*resp);
-    */
-  } 
+  }
   return 0;
 }
 
@@ -166,7 +147,6 @@ int Consensus::ProcessNewTransaction(std::unique_ptr<Request> request) {
   txn->set_data(request->data());
   txn->set_hash(request->hash());
   txn->set_proxy_id(request->proxy_id());
-  //LOG(ERROR)<<"receive txn";
   return autobahn_->ReceiveTransaction(std::move(txn));
 }
 
@@ -175,17 +155,12 @@ int Consensus::CommitMsg(const google::protobuf::Message& msg) {
 }
 
 int Consensus::CommitMsgInternal(const Transaction& txn) {
-  //LOG(ERROR)<<"commit txn:"<<txn.id()<<" proxy id:"<<txn.proxy_id()<<" uid:"<<txn.uid();
   std::unique_ptr<Request> request = std::make_unique<Request>();
   request->set_queuing_time(txn.queuing_time());
   request->set_data(txn.data());
   request->set_seq(txn.id());
   request->set_uid(txn.uid());
-  //if (txn.proposer_id() == config_.GetSelfInfo().id()) {
-    request->set_proxy_id(txn.proxy_id());
-   // LOG(ERROR)<<"commit txn:"<<txn.id()<<" proxy id:"<<request->uid();
-    //assert(request->uid()>0);
-  //}
+  request->set_proxy_id(txn.proxy_id());
 
   transaction_executor_->AddExecuteMessage(std::move(request));
   return 0;
@@ -193,8 +168,6 @@ int Consensus::CommitMsgInternal(const Transaction& txn) {
 
 
 int Consensus::Prepare(const Transaction& txn) {
-  // LOG(ERROR)<<"prepare txn:"<<txn.id()<<" proxy id:"<<txn.proxy_id()<<"
-  // uid:"<<txn.uid();
   std::unique_ptr<Request> request = std::make_unique<Request>();
   request->set_data(txn.data());
   request->set_uid(txn.uid());

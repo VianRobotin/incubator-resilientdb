@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs wc:*)",
+      "Read(//c/Users/viene/**)",
+      "Bash(python3 -c \":*)",
+      "Bash(bazel build:*)",
+      "Bash(ls /c/Users/viene/.bazel*/bin/)",
+      "Read(//c//**)",
+      "Bash(find /c/Users/viene -maxdepth 3 -name bazel* -type f)",
+      "Bash(xargs ls:*)"
+    ]
+  }
+}

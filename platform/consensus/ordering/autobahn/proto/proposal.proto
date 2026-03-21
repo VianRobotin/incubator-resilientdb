@@ -13,6 +13,30 @@ message Transaction{
   int64 uid = 6;
   int64 create_time = 7;
   int64 queuing_time = 8;
+  int64 ordering_key = 9;     // K(t): final ordering key for fair ordering
+}
+
+// Algorithm 1: TEE-signed timestamp attestation for a single transaction.
+// σ_i = Sign_TEE(t_i, T_i) where T_i is the TEE's clock reading.
+message SignedTimestamp {
+  bytes txn_hash = 1;          // Transaction identifier (hash digest)
+  int64 timestamp = 2;        // T_i: TEE clock value at time of receipt
+  SignatureInfo signature = 3; // TEE signature over (txn_hash, timestamp)
+  int32 sender_id = 4;        // Replica that produced this timestamp
+}
+
+// Batch of signed timestamps broadcast after timestamping a Car's transactions.
+message TimestampBatch {
+  repeated SignedTimestamp timestamps = 1;
+  int32 sender_id = 2;
+}
+
+// Per-transaction ordering key included in consensus blocks.
+// K_r(t) = (f+1)-th smallest timestamp from collected TEE timestamps.
+message OrderingKeyEntry {
+  bytes txn_hash = 1;
+  int64 ordering_key = 2;     // K_r(t): local ordering key computed by this replica
+  SignatureInfo signature = 3; // TEE signature certifying this ordering key
 }
 
 message Header {
@@ -33,6 +57,13 @@ message Cert {
   repeated SignatureInfo sign = 1;
 }
 
+// Tip reference for one lane in the Autobahn DAG.
+message TipRef {
+  int32 sender_id = 1;
+  int64 block_id = 2;
+}
+
+// Sync HotStuff proposal extending the original Proposal.
 message Proposal {
   int32 slot_id = 1;
   int32 sender_id = 2;
@@ -41,6 +72,16 @@ message Proposal {
   SignatureInfo sign = 5;
   bytes hash = 6;
   Cert cert = 7;
+
+  // Sync HotStuff fields
+  int32 view_number = 8;
+  repeated TipRef tip_cut = 9;
+  int64 threshold = 10;        // tau_current: execution threshold
+  int64 prev_threshold = 11;   // tau_prev: previous execution threshold
+  repeated int64 last_seen_vector = 12; // L vector: latest timestamp seen from each replica's TEE
+  int64 propose_time = 13;     // time when proposal was created (for 2*delta timer)
+  // Fair ordering: ordering keys for transactions in the execution window
+  repeated OrderingKeyEntry ordering_keys = 14;
 };
 
 enum MessageType {
@@ -57,6 +98,12 @@ enum MessageType {
   CMD_SingleBlock = 10;
   CMD_ProposalQuery = 11;
   CMD_ProposalQueryResponse = 12;
+  // Sync HotStuff message types
+  SyncHS_Propose = 13;
+  SyncHS_Vote = 14;
+  SyncHS_Equivocation = 15;
+  // Fair ordering: TEE timestamp dissemination
+  TEE_Timestamps = 16;
 };
 
 message VoteMessage {
@@ -84,7 +131,7 @@ message SignInfo {
 }
 
 message Block {
-  message BlockData { 
+  message BlockData {
     repeated Transaction transaction = 1;
   }
   BlockData data = 1;
@@ -130,4 +177,10 @@ message ProposalResponse {
 message VoteMsg {
   int32 slot_id = 1;
   int32 sender_id = 2;
+}
+
+// Equivocation proof: two conflicting proposals from the same leader in the same view.
+message EquivocationProof {
+  Proposal proposal_a = 1;
+  Proposal proposal_b = 2;
 }
