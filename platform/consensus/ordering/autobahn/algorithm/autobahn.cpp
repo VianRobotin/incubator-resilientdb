@@ -21,7 +21,7 @@ AutoBahn::AutoBahn(int id, int f, int total_num, int block_size, SignatureVerifi
   timeout_ms_ = 60000;
   // Δ: synchronous network delay bound.
   // Replicas wait Δ to collect timestamps, 2Δ before committing.
-  delta_ms_ = 5000;  // 5 seconds default; configurable per deployment
+  delta_ms_ = 1000;  // 1 second for local testing; increase for real deployments
   batch_size_ = block_size;
   execute_id_ = 1;
   is_leader_ = id_ == 1;
@@ -103,6 +103,7 @@ void AutoBahn::BlockDone() {
 void AutoBahn::AsyncDissemination() {
   int next_block = 1;
   while (!IsStop()) {
+    // Wait for previous block to be certified (enough ACKs)
     if(WaitForResponse(next_block-1)){
       next_block++;
     }
@@ -110,30 +111,53 @@ void AutoBahn::AsyncDissemination() {
       next_block++;
     }
 
-    std::vector<std::unique_ptr<Transaction>> txns;
-    while (!IsStop()) {
-      std::unique_ptr<Transaction> txn = txns_.Pop();
-      if (txn == nullptr) {
-        continue;
+    // Get the next local block (created by GenerateBlocks thread).
+    // GetLocalBlock attaches PoA signatures from the previous block.
+    // Poll until the block is available.
+    const Block* block = nullptr;
+    while (!IsStop() && block == nullptr) {
+      block = proposal_manager_->GetLocalBlock(next_block-1);
+      if(block == nullptr) {
+        usleep(1000);  // 1ms poll
       }
-      txns.push_back(std::move(txn));
-      for(int i = 1; i < batch_size_; ++i){
-        std::unique_ptr<Transaction> txn = txns_.Pop(100);
-        if(txn == nullptr){
-          break;
-        }
-        txns.push_back(std::move(txn));
-      }
+    }
+    if (block == nullptr) break;
 
-      proposal_manager_->MakeBlock(txns);
-      txns.clear();
-      break;
+    LOG(ERROR) << "Disseminating block " << (next_block-1)
+               << " with " << block->data().transaction_size() << " txns";
+
+    // The originating replica must also TEE-timestamp its own transactions.
+    // Other replicas do this in ReceiveBlock(), but the sender never calls
+    // ReceiveBlock on its own blocks. Without this, each transaction would
+    // be missing the sender's timestamp, reducing the available timestamps
+    // for computing the ordering key K(t).
+    std::vector<SignedTimestamp> own_timestamps =
+        proposal_manager_->TimestampTransactions(*block);
+    if (!own_timestamps.empty()) {
+      TimestampBatch batch;
+      batch.set_sender_id(id_);
+      for (const auto& ts : own_timestamps) {
+        *batch.add_timestamps() = ts;
+      }
+      Broadcast(MessageType::TEE_Timestamps, batch);
+      LOG(ERROR) << "Broadcast " << own_timestamps.size()
+                 << " own TEE timestamps for local block " << (next_block-1);
     }
-    const Block* block = proposal_manager_->GetLocalBlock(next_block-1);
-    if(block == nullptr) {
-      next_block--;
-      continue;
+
+    // Self-ACK: generate a local ACK for our own block so that BlockReady
+    // can be triggered without depending on network self-delivery.
+    // Other replicas' ACKs arrive via the network, but our own ACK is
+    // needed for the f+1 threshold check (which requires self in the set).
+    {
+      BlockACK self_ack;
+      self_ack.set_hash(block->hash());
+      self_ack.set_sender_id(id_);
+      self_ack.set_local_id(block->local_id());
+      self_ack.set_responder(id_);
+      *self_ack.mutable_sign_info() = proposal_manager_->SignBlock(*block);
+      ReceiveBlockACK(std::make_unique<BlockACK>(self_ack));
     }
+
     Broadcast(MessageType::NewBlocks, *block);
   }
 }
@@ -160,7 +184,11 @@ void AutoBahn::ReceiveBlock(std::unique_ptr<Block> block) {
       proposal_manager_->TimestampTransactions(*block);
 
   proposal_manager_->AddBlock(std::move(block));
-  SendMessage(MessageType::CMD_BlockACK, block_ack, block_ack.sender_id());
+  // Use Broadcast instead of SendMessage for BlockACK delivery.
+  // The point-to-point SendMessage path doesn't work reliably because
+  // bc_client_'s replicas_ list may not contain all peers.
+  // Receivers filter by sender_id to only process ACKs for their own blocks.
+  Broadcast(MessageType::CMD_BlockACK, block_ack);
 
   proposal_manager_->UpdateView(block_ack.sender_id(), block_ack.local_id());
   NotifyView();
@@ -182,20 +210,35 @@ void AutoBahn::ReceiveBlock(std::unique_ptr<Block> block) {
 }
 
 void AutoBahn::ReceiveBlockACK(std::unique_ptr<BlockACK> block) {
+  // Only process ACKs for our own blocks (since ACKs are now broadcast to all)
+  if (block->sender_id() != id_) return;
+
   LOG(ERROR)<<"recv block ack:"<<block->local_id()<<" from:"<<block->responder()
     <<" block sign info:"<<block->sign_info().sender_id();
-  std::unique_lock<std::mutex> lk(block_mutex_);
-  block_ack_[block->local_id()].insert(std::make_pair(block->responder(), block->sign_info()));
-  LOG(ERROR)<<"recv block ack:"<<block->local_id()
-    <<" from:"<<block->responder()<< " num:"<<block_ack_[block->local_id()].size();
-  if (block_ack_[block->local_id()].size() >= f_ + 1 &&
-      block_ack_[block->local_id()].find(id_) !=
-          block_ack_[block->local_id()].end()) {
+
+  bool ready = false;
+  std::map<int, SignInfo> ack_copy;
+  int64_t local_id = block->local_id();
+
+  {
+    std::unique_lock<std::mutex> lk(block_mutex_);
+    block_ack_[local_id].insert(std::make_pair(block->responder(), block->sign_info()));
+    LOG(ERROR)<<"recv block ack:"<<local_id
+      <<" from:"<<block->responder()<< " num:"<<block_ack_[local_id].size();
+    if (block_ack_[local_id].size() >= f_ + 1 &&
+        block_ack_[local_id].find(id_) != block_ack_[local_id].end()) {
+      ready = true;
+      ack_copy = block_ack_[local_id];
+    }
+  }
+  // Release block_mutex_ before acquiring bc_mutex_ to avoid deadlock
+  // with AsyncDissemination's WaitForResponse which holds bc_mutex_.
+  if (ready) {
+    proposal_manager_->BlockReady(ack_copy, local_id);
     std::unique_lock<std::mutex> lk(bc_mutex_);
-    proposal_manager_->BlockReady(block_ack_[block->local_id()], block->local_id());
     BlockDone();
   }
-  LOG(ERROR)<<"recv block ack:"<<block->local_id()<<" done";
+  LOG(ERROR)<<"recv block ack:"<<local_id<<" done";
 }
 
 // Algorithm 1, lines 16-19: OnReceiveTimestamp
@@ -323,11 +366,16 @@ void AutoBahn::AsyncConsensus() {
                << ", " << ordered_txns.size() << " fairly-ordered txns"
                << ", τ=(" << tau_prev << ", " << tau_current << "]";
 
-    // Update τ_prev for next round
-    proposal_manager_->SetPrevThreshold(tau_current);
-
-    // Broadcast proposal to all replicas
+    // Broadcast proposal to all replicas (other replicas receive via network)
     Broadcast(MessageType::SyncHS_Propose, *proposal);
+
+    // Self-deliver: the leader must also process its own proposal locally.
+    // This must happen BEFORE SetPrevThreshold, because ReceiveProposal
+    // checks tau_block > tau_committed, and SetPrevThreshold would set
+    // tau_committed = tau_current = tau_block, causing the check to fail.
+    // ReceiveProposal itself calls SetPrevThreshold(tau_block) on success.
+    auto self_proposal = std::make_unique<Proposal>(*proposal);
+    ReceiveProposal(std::move(self_proposal));
   }
 }
 
@@ -461,57 +509,78 @@ bool AutoBahn::ReceiveEquivocation(std::unique_ptr<EquivocationProof> proof) {
 //
 // In Sync HotStuff, a replica commits after 2Δ has elapsed since
 // receiving the proposal, provided no equivocation was detected.
+// If a slot is missing (no proposal received), skip it after 4Δ
+// to prevent blocking subsequent slots.
 void AutoBahn::AsyncCommitTimer() {
   int next_commit_view = 1;
+  int64_t slot_wait_start = 0;  // 0 = not started waiting yet
+  bool first_proposal_seen = false;
   while (!IsStop()) {
     usleep(1000);  // 1ms polling interval
 
     std::unique_lock<std::mutex> lk(pending_commit_mutex_);
-    if (pending_commits_.empty()) {
+    int64_t now = GetCurrentTime();
+
+    // Don't start skipping slots until we've seen at least one proposal
+    if (!first_proposal_seen) {
+      if (!pending_commits_.empty()) {
+        first_proposal_seen = true;
+        slot_wait_start = now;
+      }
+      // If the expected slot is already here, process it
+      if (pending_commits_.find(next_commit_view) == pending_commits_.end()) {
+        continue;
+      }
+    }
+
+    // Check if next_commit_view is in pending_commits_
+    auto it = pending_commits_.find(next_commit_view);
+    if (it == pending_commits_.end()) {
+      // Slot not yet received. Skip after 4Δ timeout to avoid stalling.
+      if (slot_wait_start == 0) slot_wait_start = now;
+      int64_t skip_timeout_us = 4 * delta_ms_ * 1000;
+      if (now - slot_wait_start > skip_timeout_us) {
+        LOG(ERROR) << "SyncHS: skipping slot " << next_commit_view
+                   << " (no proposal received after 4Δ)";
+        next_commit_view++;
+        slot_wait_start = now;
+      }
       continue;
     }
 
-    int64_t now = GetCurrentTime();
+    int64_t elapsed_us = now - it->second.receive_time;
+    int64_t two_delta_us = 2 * delta_ms_ * 1000;
 
-    auto it = pending_commits_.begin();
-    while (it != pending_commits_.end() && it->first <= next_commit_view) {
-      if (it->first < next_commit_view) {
-        it = pending_commits_.erase(it);
-        continue;
-      }
-
-      int64_t elapsed_us = now - it->second.receive_time;
-      int64_t two_delta_us = 2 * delta_ms_ * 1000;
-
-      if (elapsed_us < two_delta_us) {
-        break;
-      }
-
-      // Check for equivocation
-      bool equivocated = false;
-      {
-        std::unique_lock<std::mutex> elk(equivocation_mutex_);
-        equivocated = equivocated_views_.count(it->first) > 0;
-      }
-
-      if (equivocated) {
-        LOG(ERROR) << "SyncHS: NOT committing slot " << it->first
-                   << " due to equivocation";
-        it = pending_commits_.erase(it);
-        next_commit_view++;
-        continue;
-      }
-
-      // 2Δ elapsed, no equivocation — commit!
-      LOG(ERROR) << "SyncHS: committing slot " << it->first
-                 << " after 2Δ (" << elapsed_us / 1000 << "ms)";
-      auto proposal_to_commit = std::move(it->second.proposal);
-      it = pending_commits_.erase(it);
-      lk.unlock();
-      Commit(std::move(proposal_to_commit));
-      lk.lock();
-      next_commit_view++;
+    if (elapsed_us < two_delta_us) {
+      continue;  // Not yet 2Δ, keep waiting
     }
+
+    // Check for equivocation
+    bool equivocated = false;
+    {
+      std::unique_lock<std::mutex> elk(equivocation_mutex_);
+      equivocated = equivocated_views_.count(next_commit_view) > 0;
+    }
+
+    if (equivocated) {
+      LOG(ERROR) << "SyncHS: NOT committing slot " << next_commit_view
+                 << " due to equivocation";
+      pending_commits_.erase(it);
+      next_commit_view++;
+      slot_wait_start = now;
+      continue;
+    }
+
+    // 2Δ elapsed, no equivocation — commit!
+    LOG(ERROR) << "SyncHS: committing slot " << next_commit_view
+               << " after 2Δ (" << elapsed_us / 1000 << "ms)";
+    auto proposal_to_commit = std::move(it->second.proposal);
+    pending_commits_.erase(it);
+    lk.unlock();
+    Commit(std::move(proposal_to_commit));
+    lk.lock();
+    next_commit_view++;
+    slot_wait_start = now;
   }
 }
 

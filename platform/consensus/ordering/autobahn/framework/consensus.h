@@ -25,6 +25,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <thread>
+
 #include "executor/common/transaction_manager.h"
 #include "platform/consensus/ordering/common/framework/consensus.h"
 #include "platform/consensus/ordering/autobahn/algorithm/autobahn.h"
@@ -46,6 +49,7 @@ class Consensus : public common::Consensus {
   int CommitMsgInternal(const Transaction& txn);
 
   int Prepare(const Transaction& txn);
+  void StartLocalTxnGeneration();
 
  protected:
   std::unique_ptr<AutoBahn> autobahn_;
@@ -53,6 +57,8 @@ class Consensus : public common::Consensus {
   int64_t start_;
   std::mutex mutex_;
   int send_num_[200];
+  std::atomic<bool> local_txn_gen_started_;
+  std::thread local_txn_gen_thread_;
 };
 
 }  // namespace autobahn

@@ -8,9 +8,11 @@ cc_library(
         "//visibility:public",
     ],
     deps = [
+        "//common/crypto:signature_verifier",
         "//common/utils",
         "//platform/consensus/ordering/common/framework:consensus",
         "//platform/consensus/ordering/autobahn/algorithm:autobahn",
+        "//proto/kv:kv_cc_proto",
     ],
 )
 

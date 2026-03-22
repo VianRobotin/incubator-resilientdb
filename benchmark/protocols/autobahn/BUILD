@@ -14,3 +14,13 @@ cc_binary(
     ],
 )
 
+cc_binary(
+    name = "kv_service_tools",
+    srcs = ["kv_service_tools.cpp"],
+    deps = [
+        "//common/proto:signature_info_cc_proto",
+        "//interface/kv:kv_client",
+        "//platform/config:resdb_config_utils",
+    ],
+)
+

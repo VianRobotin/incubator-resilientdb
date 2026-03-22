@@ -1,0 +1,19 @@
+======================================================================
+  AUTOBAHN BENCHMARK RESULTS SUMMARY
+  Sync HotStuff + Fair Ordering (TEE)
+======================================================================
+
+--- bs100 ---
+  Throughput:  avg=1565 txn/s  peak=2000 txn/s  median=1600 txn/s
+  Total commits: 144000  proposals: 0
+  Replicas: 4
+
+--- bs200 ---
+  Throughput:  avg=1829 txn/s  peak=3200 txn/s  median=800 txn/s
+  Total commits: 12800  proposals: 0
+  Replicas: 4
+
+--- bs400 ---
+  Throughput:  avg=4000 txn/s  peak=6400 txn/s  median=4000 txn/s
+  Total commits: 16000  proposals: 0
+  Replicas: 4

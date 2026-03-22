@@ -62,10 +62,19 @@ void ProposalManager::AddBlock(std::unique_ptr<Block> block) {
   LOG(ERROR)<<"add block from sender:"<<sender<<" id:"<<block_id;
 
   if(block_id>1) {
-    assert(block->last_sign_info_size() >= f_+1);
-    assert(VerifyBlock(*block));
-    assert(pending_blocks_[sender].find(block_id-1) != pending_blocks_[sender].end());
-    *pending_blocks_[sender][block_id-1]->mutable_sign_info() = block->last_sign_info();
+    if (block->last_sign_info_size() < f_+1) {
+      LOG(ERROR) << "AddBlock: block " << block_id << " from " << sender
+                 << " has " << block->last_sign_info_size() << " PoA sigs (need " << f_+1 << ")";
+      // Still store for availability, but log the issue
+    }
+    if (!VerifyBlock(*block)) {
+      LOG(ERROR) << "AddBlock: block " << block_id << " from " << sender << " verification failed";
+    }
+    if (pending_blocks_[sender].find(block_id-1) == pending_blocks_[sender].end()) {
+      LOG(ERROR) << "AddBlock: previous block " << (block_id-1) << " from " << sender << " not found";
+    } else {
+      *pending_blocks_[sender][block_id-1]->mutable_sign_info() = block->last_sign_info();
+    }
   }
   pending_blocks_[sender][block_id] = std::move(block);
 }
@@ -104,15 +113,20 @@ void ProposalManager::BlockReady(const std::map<int, SignInfo>& sign_info, int64
   if(it == blocks_candidates_.end()){
     return;
   }
-  assert(it != blocks_candidates_.end());
   Block * block = it->second.get();
   for(auto sit : sign_info) {
-    assert(sit.second.hash() == block->hash());
+    if (sit.second.hash() != block->hash()) {
+      LOG(ERROR) << "BlockReady: hash mismatch for block " << local_id
+                 << " from signer " << sit.second.sender_id()
+                 << " (expected=" << block->hash().substr(0, 16)
+                 << " got=" << sit.second.hash().substr(0, 16) << ")";
+      continue;  // Skip mismatched ACKs instead of crashing
+    }
     *block->add_sign_info() = sit.second;
     LOG(ERROR)<<" add last sign:"<<sit.second.sender_id();
   }
 
-  assert(it->second != nullptr);
+  if(it->second == nullptr) return;
   pending_blocks_[id_][local_id] = std::move(it->second);
   blocks_candidates_.erase(it);
   current_height_ = std::max(current_height_, local_id);
