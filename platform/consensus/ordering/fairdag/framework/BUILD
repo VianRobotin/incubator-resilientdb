@@ -9,12 +9,14 @@ cc_library(
     ],
     deps = [
       ":performance_manager",
+        "//common/crypto:signature_verifier",
         "//common/utils",
         "//executor/common:transaction_manager",
         "//platform/consensus/ordering/common/framework:consensus",
         "//platform/consensus/execution:transaction_executor",
         "//platform/consensus/ordering/fairdag/algorithm:fairdag",
         "//platform/networkstrate:consensus_manager",
+        "//proto/kv:kv_cc_proto",
     ],
 )
 

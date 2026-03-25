@@ -97,6 +97,29 @@ class ProposalManager {
   // Check if a transaction has been seen by the TEE (is in seen-set H).
   bool HasSeenTransaction(const std::string& txn_hash) const;
 
+  // ===========================================================
+  // Batch-Order Fairness (γ-BOF, Definition 2)
+  // ===========================================================
+
+  // Record a replica's local receive ordering for a set of transactions.
+  // Called when a RelativeOrdering message is received from a replica.
+  void AddRelativeOrdering(const RelativeOrdering& ordering);
+
+  // Record this replica's own receive order for transactions in a block.
+  // Returns the RelativeOrdering to broadcast to other replicas.
+  RelativeOrdering RecordLocalReceiveOrder(const Block& block);
+
+  // Build the batch-order-fair ordering for transactions in the execution window.
+  // Uses the dependency graph: edge t_a → t_b exists if f+1 replicas observed
+  // t_a before t_b. Transactions in the same SCC form a batch (unordered).
+  // Returns batches in topological order.
+  std::vector<std::vector<std::string>> GetBatchOrderedTransactions(
+      int64_t tau_prev, int64_t tau_current);
+
+  // Set whether batch-order fairness mode is enabled.
+  void SetBatchOrderFairness(bool enabled) { batch_order_fairness_ = enabled; }
+  bool IsBatchOrderFairness() const { return batch_order_fairness_; }
+
  private:
   void UpdateLastSign(Block * block);
 
@@ -152,6 +175,26 @@ class ProposalManager {
 
   // Previous execution threshold τ_prev.
   int64_t prev_threshold_ = 0;
+
+  // ===========================================================
+  // Batch-Order Fairness State
+  // ===========================================================
+  bool batch_order_fairness_ = false;
+
+  // Per-replica receive orderings: receive_orders_[replica_id] is a list of
+  // txn hashes in the order that replica observed them.
+  std::map<int, std::vector<std::string>> receive_orders_;
+  std::mutex bof_mutex_;
+
+  // Pairwise precedence counts: precedes_count_[{a,b}] = number of replicas
+  // that observed transaction a before transaction b.
+  std::map<std::pair<std::string, std::string>, int> precedes_count_;
+
+  // Set of all transaction hashes known to the BOF system.
+  std::set<std::string> bof_known_txns_;
+
+  // Track which transactions have already been committed via BOF.
+  std::set<std::string> bof_committed_txns_;
 };
 
 }  // namespace autobahn

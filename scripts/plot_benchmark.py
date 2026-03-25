@@ -210,10 +210,10 @@ def plot_latency_breakdown(replica_data, title_suffix, save_path):
     fig.suptitle(f'Latency Breakdown — {title_suffix}', fontsize=14, fontweight='bold')
 
     latency_keys = [
-        ('commit_latency', 'Commit Latency (s)'),
         ('execute_latency', 'Execute Latency (s)'),
-        ('queuing_latency', 'Queuing Latency (s)'),
-        ('round_latency', 'Round Latency (s)'),
+        ('execute_queuing_latency', 'Execute Queuing Latency (s)'),
+        ('commit_latency', 'Commit Latency (s)'),
+        ('cpu_usage', 'CPU Usage (%)'),
     ]
 
     for ax_idx, (key, ylabel) in enumerate(latency_keys):

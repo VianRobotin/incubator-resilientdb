@@ -52,10 +52,12 @@ Consensus::Consensus(const ResDBConfig& config,
           .public_key()
           .public_key_info()
           .type() != CertificateKeyInfo::CLIENT) {
+    bool batch_order_fairness = config_.GetConfigData().batch_order_fairness();
     autobahn_ = std::make_unique<AutoBahn>(
         config_.GetSelfInfo().id(), f,
                                    total_replicas, config_.GetConfigData().block_size(),
-                                   GetSignatureVerifier());
+                                   GetSignatureVerifier(),
+                                   batch_order_fairness);
 
     InitProtocol(autobahn_.get());
 
@@ -143,6 +145,17 @@ int Consensus::ProcessCustomConsensus(std::unique_ptr<Request> request) {
       return -1;
     }
     autobahn_->ReceiveTimestamps(std::move(batch));
+    return 0;
+  }
+  // Batch-order fairness: relative ordering dissemination
+  else if (request->user_type() == MessageType::BOF_RelativeOrder) {
+    std::unique_ptr<RelativeOrdering> ordering = std::make_unique<RelativeOrdering>();
+    if (!ordering->ParseFromString(request->data())) {
+      LOG(ERROR) << "parse relative ordering fail";
+      assert(1 == 0);
+      return -1;
+    }
+    autobahn_->ReceiveRelativeOrdering(std::move(ordering));
     return 0;
   }
   // Legacy PBFT messages — log and ignore (protocol replaced by Sync HotStuff)

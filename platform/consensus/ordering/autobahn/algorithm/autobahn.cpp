@@ -9,10 +9,13 @@
 namespace resdb {
 namespace autobahn {
 
-AutoBahn::AutoBahn(int id, int f, int total_num, int block_size, SignatureVerifier* verifier)
-    : ProtocolBase(id, f, total_num), verifier_(verifier) {
+AutoBahn::AutoBahn(int id, int f, int total_num, int block_size, SignatureVerifier* verifier,
+                   bool batch_order_fairness)
+    : ProtocolBase(id, f, total_num), verifier_(verifier),
+      batch_order_fairness_(batch_order_fairness) {
 
-  LOG(ERROR) << "Initializing AutoBahn with Sync HotStuff + Fair Ordering"
+  LOG(ERROR) << "Initializing AutoBahn with Sync HotStuff + "
+             << (batch_order_fairness_ ? "Batch-Order Fairness" : "Ordering Linearizability")
              << " id=" << id << " f=" << f << " n=" << total_num;
   id_ = id;
   total_num_ = total_num;
@@ -28,6 +31,7 @@ AutoBahn::AutoBahn(int id, int f, int total_num, int block_size, SignatureVerifi
   cur_slot_ = 1;
 
   proposal_manager_ = std::make_unique<ProposalManager>(id, total_num_, f_, verifier);
+  proposal_manager_->SetBatchOrderFairness(batch_order_fairness_);
 
   block_thread_ = std::thread(&AutoBahn::GenerateBlocks, this);
   dissemi_thread_ = std::thread(&AutoBahn::AsyncDissemination, this);
@@ -144,6 +148,14 @@ void AutoBahn::AsyncDissemination() {
                  << " own TEE timestamps for local block " << (next_block-1);
     }
 
+    // Batch-order fairness: broadcast our local receive order for this block
+    if (batch_order_fairness_) {
+      RelativeOrdering rel_order = proposal_manager_->RecordLocalReceiveOrder(*block);
+      if (rel_order.txn_hashes_size() > 0) {
+        Broadcast(MessageType::BOF_RelativeOrder, rel_order);
+      }
+    }
+
     // Self-ACK: generate a local ACK for our own block so that BlockReady
     // can be triggered without depending on network self-delivery.
     // Other replicas' ACKs arrive via the network, but our own ACK is
@@ -182,6 +194,15 @@ void AutoBahn::ReceiveBlock(std::unique_ptr<Block> block) {
   // Step 2: TEE-timestamp each transaction (Algorithm 1, lines 6-13)
   std::vector<SignedTimestamp> new_timestamps =
       proposal_manager_->TimestampTransactions(*block);
+
+  // Batch-order fairness: record and broadcast our receive order for this block.
+  // Must be done before AddBlock moves the block.
+  if (batch_order_fairness_) {
+    RelativeOrdering rel_order = proposal_manager_->RecordLocalReceiveOrder(*block);
+    if (rel_order.txn_hashes_size() > 0) {
+      Broadcast(MessageType::BOF_RelativeOrder, rel_order);
+    }
+  }
 
   proposal_manager_->AddBlock(std::move(block));
   // Use Broadcast instead of SendMessage for BlockACK delivery.
@@ -253,6 +274,13 @@ void AutoBahn::ReceiveTimestamps(std::unique_ptr<TimestampBatch> batch) {
   for (const auto& ts : batch->timestamps()) {
     proposal_manager_->AddTimestamp(ts);
   }
+}
+
+// Batch-order fairness: receive a relative ordering from another replica.
+void AutoBahn::ReceiveRelativeOrdering(std::unique_ptr<RelativeOrdering> ordering) {
+  LOG(ERROR) << "Received relative ordering from replica " << ordering->sender_id()
+             << " with " << ordering->txn_hashes_size() << " txns";
+  proposal_manager_->AddRelativeOrdering(*ordering);
 }
 
 // ============================================================
@@ -352,18 +380,36 @@ void AutoBahn::AsyncConsensus() {
       proposal->add_last_seen_vector(last_seen[i]);
     }
 
-    // Step 5: Extract transactions in execution window and sort by K(t)
-    // (Algorithm 2, lines 6-8)
-    auto ordered_txns = proposal_manager_->GetTransactionsInWindow(tau_prev, tau_current);
-    for (const auto& entry : ordered_txns) {
-      OrderingKeyEntry* oke = proposal->add_ordering_keys();
-      oke->set_txn_hash(entry.first);
-      oke->set_ordering_key(entry.second);
+    // Step 5: Extract and order transactions in the execution window.
+    // Two modes:
+    //   - Ordering Linearizability: sort by K(t) (ascending, ties by hash)
+    //   - Batch-Order Fairness: group into batches via dependency graph
+    int total_fair_txns = 0;
+    if (batch_order_fairness_) {
+      // BOF mode: build dependency graph and extract batches
+      auto batches = proposal_manager_->GetBatchOrderedTransactions(tau_prev, tau_current);
+      for (const auto& batch : batches) {
+        BatchGroup* bg = proposal->add_batch_groups();
+        for (const auto& txn_hash : batch) {
+          bg->add_txn_hashes(txn_hash);
+          total_fair_txns++;
+        }
+      }
+    } else {
+      // OL mode: sort by ordering key K(t)
+      auto ordered_txns = proposal_manager_->GetTransactionsInWindow(tau_prev, tau_current);
+      for (const auto& entry : ordered_txns) {
+        OrderingKeyEntry* oke = proposal->add_ordering_keys();
+        oke->set_txn_hash(entry.first);
+        oke->set_ordering_key(entry.second);
+        total_fair_txns++;
+      }
     }
 
     LOG(ERROR) << "SyncHS leader " << id_ << " proposing slot " << slot_id
                << " with " << blocks.second.size() << " lanes"
-               << ", " << ordered_txns.size() << " fairly-ordered txns"
+               << ", " << total_fair_txns << " fairly-ordered txns"
+               << " (" << (batch_order_fairness_ ? "BOF" : "OL") << ")"
                << ", τ=(" << tau_prev << ", " << tau_current << "]";
 
     // Broadcast proposal to all replicas (other replicas receive via network)
@@ -600,7 +646,8 @@ void AutoBahn::Commit(std::unique_ptr<Proposal> proposal) {
     proposal_manager_->UpdateLastSeenFromBlock(i + 1, raw_proposal->last_seen_vector(i));
   }
 
-  // Execute transactions from committed blocks
+  // Collect all transactions from committed blocks into a map for lookup
+  std::map<std::string, Transaction*> txn_by_hash;
   for(const auto& block : raw_proposal->block()) {
     int block_owner = block.sender_id();
     int block_id = block.local_id();
@@ -619,16 +666,49 @@ void AutoBahn::Commit(std::unique_ptr<Proposal> proposal) {
 
       for (Transaction& txn :
           *data_block->mutable_data()->mutable_transaction()) {
-        // Set the final ordering key on the transaction for downstream use
-        int64_t final_key = proposal_manager_->GetFinalOrderingKey(txn.hash());
-        if (final_key >= 0) {
-          txn.set_ordering_key(final_key);
+        txn_by_hash[txn.hash()] = &txn;
+      }
+    }
+    commit_block_[block_owner] = block_id;
+  }
+
+  if (batch_order_fairness_ && raw_proposal->batch_groups_size() > 0) {
+    // BOF mode: execute transactions in batch order.
+    // Batches are ordered (batch 0 before batch 1, etc.).
+    // Within each batch, transactions can be in any order — we use the
+    // deterministic hash order from the proposal.
+    std::set<std::string> committed_in_batches;
+    for (const auto& bg : raw_proposal->batch_groups()) {
+      for (const auto& txn_hash : bg.txn_hashes()) {
+        auto it = txn_by_hash.find(txn_hash);
+        if (it != txn_by_hash.end()) {
+          Transaction& txn = *it->second;
+          txn.set_id(execute_id_++);
+          commit_(txn);
+          committed_in_batches.insert(txn_hash);
         }
+      }
+    }
+    // Execute any remaining transactions not covered by batch groups
+    // (e.g., transactions without enough relative ordering data)
+    for (auto& entry : txn_by_hash) {
+      if (committed_in_batches.count(entry.first) == 0) {
+        Transaction& txn = *entry.second;
         txn.set_id(execute_id_++);
         commit_(txn);
       }
     }
-    commit_block_[block_owner] = block_id;
+  } else {
+    // OL mode: execute in ordering key order (block-by-block, as committed)
+    for (auto& entry : txn_by_hash) {
+      Transaction& txn = *entry.second;
+      int64_t final_key = proposal_manager_->GetFinalOrderingKey(txn.hash());
+      if (final_key >= 0) {
+        txn.set_ordering_key(final_key);
+      }
+      txn.set_id(execute_id_++);
+      commit_(txn);
+    }
   }
 
   // Rotate leader (round-robin, as in Sync HotStuff)

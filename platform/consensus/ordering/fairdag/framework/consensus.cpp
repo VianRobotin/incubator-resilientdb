@@ -28,7 +28,9 @@
 #include <glog/logging.h>
 #include <unistd.h>
 
+#include "common/crypto/signature_verifier.h"
 #include "common/utils/utils.h"
+#include "proto/kv/kv.pb.h"
 
 namespace resdb {
 namespace fairdag {
@@ -68,9 +70,17 @@ FairDAGConsensus::FairDAGConsensus(const ResDBConfig& config,
         });
 
     fairdag_->SetCommitFunc(
-        [&](const google::protobuf::Message& msg) { 
-          return CommitMsg(dynamic_cast<const Transaction& >(msg)); 
+        [&](const google::protobuf::Message& msg) {
+          return CommitMsg(dynamic_cast<const Transaction& >(msg));
         });
+
+    if (config_.IsPerformanceRunning()) {
+      std::thread([this]() {
+        LOG(ERROR) << "FairDAG: Waiting for peer discovery before auto-starting txn generation...";
+        sleep(10);
+        StartLocalTxnGeneration();
+      }).detach();
+    }
   }
 }
 
@@ -132,6 +142,39 @@ int FairDAGConsensus::CommitMsgInternal(const Transaction& txn) {
   return 0;
 }
 
+
+void FairDAGConsensus::StartLocalTxnGeneration() {
+  if (!config_.IsPerformanceRunning() || fairdag_ == nullptr) return;
+  if (local_txn_gen_started_.exchange(true)) return;
+
+  LOG(ERROR) << "FairDAG: Starting local transaction generation for replica "
+             << config_.GetSelfInfo().id();
+  local_txn_gen_thread_ = std::thread([this]() {
+    int count = 0;
+    while (!is_stop_) {
+      auto txn = std::make_unique<Transaction>();
+      KVRequest kv_req;
+      kv_req.set_cmd(KVRequest::SET);
+      kv_req.set_key(std::to_string(config_.GetSelfInfo().id()) + "_" + std::to_string(count));
+      kv_req.set_value("perf_data");
+      std::string data;
+      kv_req.SerializeToString(&data);
+      txn->set_data(data);
+      txn->set_create_time(GetCurrentTime());
+      std::string unique_id = std::to_string(config_.GetSelfInfo().id())
+          + "_" + std::to_string(count) + "_" + std::to_string(GetCurrentTime());
+      txn->set_hash(SignatureVerifier::CalculateHash(unique_id));
+      txn->set_proxy_id(config_.GetSelfInfo().id());
+      txn->set_user_seq(count);
+      fairdag_->ReceiveTransaction(std::move(txn));
+      count++;
+      if (count % 100 == 0) {
+        usleep(500000);
+      }
+    }
+    LOG(ERROR) << "FairDAG: Local txn generation stopped after: " << count << " txns";
+  });
+}
 
 }  // namespace fairdag
 }  // namespace resdb

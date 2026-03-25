@@ -3,6 +3,8 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <functional>
+#include <queue>
 
 #include "common/crypto/signature_verifier.h"
 #include "common/utils/utils.h"
@@ -510,6 +512,230 @@ int64_t ProposalManager::GetFinalOrderingKey(const std::string& txn_hash) {
 
 bool ProposalManager::HasSeenTransaction(const std::string& txn_hash) const {
   return tee_seen_set_.count(txn_hash) > 0;
+}
+
+// ============================================================
+// Batch-Order Fairness (γ-BOF, Definition 2)
+// ============================================================
+
+// Record this replica's own receive order for transactions in a block.
+// The TEE timestamps provide the local ordering: transactions are sorted
+// by their TEE timestamp to determine this replica's receive order.
+RelativeOrdering ProposalManager::RecordLocalReceiveOrder(const Block& block) {
+  RelativeOrdering ordering;
+  ordering.set_sender_id(id_);
+  ordering.set_block_local_id(block.local_id());
+  ordering.set_block_sender_id(block.sender_id());
+
+  // Use TEE timestamp order (already assigned during TimestampTransactions)
+  // as this replica's local receive order.
+  std::vector<std::pair<int64_t, std::string>> ts_order;
+  {
+    std::unique_lock<std::mutex> lk(ts_mutex_);
+    for (const auto& txn : block.data().transaction()) {
+      std::string txn_hash = txn.hash();
+      auto it = ts_store_.find(txn_hash);
+      if (it != ts_store_.end()) {
+        // Find our own timestamp for this transaction
+        for (const auto& ts : it->second) {
+          if (ts.sender_id() == id_) {
+            ts_order.push_back({ts.timestamp(), txn_hash});
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // Sort by our local timestamp (= our receive order)
+  std::sort(ts_order.begin(), ts_order.end());
+
+  for (const auto& entry : ts_order) {
+    ordering.add_txn_hashes(entry.second);
+  }
+
+  // Self-deliver: also record our own ordering
+  AddRelativeOrdering(ordering);
+
+  return ordering;
+}
+
+// Record a replica's relative ordering of transactions.
+// Updates pairwise precedence counts for the dependency graph.
+void ProposalManager::AddRelativeOrdering(const RelativeOrdering& ordering) {
+  std::unique_lock<std::mutex> lk(bof_mutex_);
+  int sender = ordering.sender_id();
+
+  // Check if we already have an ordering from this replica for this block
+  // (dedup by checking receive_orders_ - we use a composite key)
+  std::string dedup_key = std::to_string(sender) + "_" +
+      std::to_string(ordering.block_sender_id()) + "_" +
+      std::to_string(ordering.block_local_id());
+
+  // Collect the txn hashes in order
+  std::vector<std::string> txn_list;
+  for (const auto& h : ordering.txn_hashes()) {
+    txn_list.push_back(h);
+    bof_known_txns_.insert(h);
+  }
+
+  // Update pairwise precedence counts:
+  // For every pair (i, j) where i appears before j in this ordering,
+  // increment precedes_count_[{txn_i, txn_j}].
+  for (size_t i = 0; i < txn_list.size(); ++i) {
+    for (size_t j = i + 1; j < txn_list.size(); ++j) {
+      precedes_count_[{txn_list[i], txn_list[j]}]++;
+    }
+  }
+}
+
+// Build batch-ordered transaction groups using the dependency graph.
+//
+// Algorithm:
+// 1. For all transaction pairs in the execution window, build a directed graph:
+//    edge t_a → t_b if f+1 replicas observed t_a before t_b
+// 2. Find strongly connected components (SCCs) — transactions in the same SCC
+//    have no clear majority ordering and form a batch
+// 3. Topologically sort the SCCs to produce the final batch order
+std::vector<std::vector<std::string>> ProposalManager::GetBatchOrderedTransactions(
+    int64_t tau_prev, int64_t tau_current) {
+
+  // Step 1: Get candidate transactions in the execution window
+  // (reuse the same windowing logic as ordering linearizability)
+  std::vector<std::string> candidates;
+  {
+    std::unique_lock<std::mutex> lk(ordering_mutex_);
+    for (const auto& entry : local_ordering_keys_) {
+      int64_t key = entry.second;
+      if (key > tau_prev && key <= tau_current) {
+        std::unique_lock<std::mutex> blk(bof_mutex_);
+        if (bof_committed_txns_.count(entry.first) == 0) {
+          candidates.push_back(entry.first);
+        }
+      }
+    }
+  }
+
+  if (candidates.empty()) {
+    return {};
+  }
+
+  // Step 2: Build adjacency list for the dependency graph
+  // Edge t_a → t_b means t_a must be ordered before t_b (f+1 replicas saw a before b)
+  std::map<std::string, int> idx;
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    idx[candidates[i]] = i;
+  }
+  int n = candidates.size();
+  std::vector<std::vector<int>> adj(n), radj(n);
+
+  {
+    std::unique_lock<std::mutex> lk(bof_mutex_);
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      for (size_t j = i + 1; j < candidates.size(); ++j) {
+        const auto& a = candidates[i];
+        const auto& b = candidates[j];
+        int a_before_b = 0, b_before_a = 0;
+        auto it_ab = precedes_count_.find({a, b});
+        if (it_ab != precedes_count_.end()) a_before_b = it_ab->second;
+        auto it_ba = precedes_count_.find({b, a});
+        if (it_ba != precedes_count_.end()) b_before_a = it_ba->second;
+
+        // Edge exists if f+1 replicas agree on the ordering
+        if (a_before_b >= f_ + 1) {
+          adj[i].push_back(j);
+          radj[j].push_back(i);
+        }
+        if (b_before_a >= f_ + 1) {
+          adj[j].push_back(i);
+          radj[i].push_back(j);
+        }
+      }
+    }
+  }
+
+  // Step 3: Kosaraju's algorithm to find SCCs
+  // First pass: compute finish order via DFS on forward graph
+  std::vector<bool> visited(n, false);
+  std::vector<int> finish_order;
+  std::function<void(int)> dfs1 = [&](int u) {
+    visited[u] = true;
+    for (int v : adj[u]) {
+      if (!visited[v]) dfs1(v);
+    }
+    finish_order.push_back(u);
+  };
+  for (int i = 0; i < n; ++i) {
+    if (!visited[i]) dfs1(i);
+  }
+
+  // Second pass: DFS on reverse graph in reverse finish order
+  std::vector<int> comp(n, -1);
+  int num_comp = 0;
+  std::function<void(int, int)> dfs2 = [&](int u, int c) {
+    comp[u] = c;
+    for (int v : radj[u]) {
+      if (comp[v] == -1) dfs2(v, c);
+    }
+  };
+  for (int i = n - 1; i >= 0; --i) {
+    int u = finish_order[i];
+    if (comp[u] == -1) {
+      dfs2(u, num_comp++);
+    }
+  }
+
+  // Step 4: Build condensation graph (DAG of SCCs) and topologically sort
+  // Collect SCCs
+  std::vector<std::vector<std::string>> sccs(num_comp);
+  for (int i = 0; i < n; ++i) {
+    sccs[comp[i]].push_back(candidates[i]);
+  }
+
+  // Sort transactions within each SCC by hash for determinism
+  for (auto& scc : sccs) {
+    std::sort(scc.begin(), scc.end());
+  }
+
+  // Build condensation DAG edges
+  std::vector<std::set<int>> cond_adj(num_comp);
+  std::vector<int> in_degree(num_comp, 0);
+  for (int u = 0; u < n; ++u) {
+    for (int v : adj[u]) {
+      if (comp[u] != comp[v]) {
+        if (cond_adj[comp[u]].insert(comp[v]).second) {
+          in_degree[comp[v]]++;
+        }
+      }
+    }
+  }
+
+  // Topological sort of condensation DAG (Kahn's algorithm)
+  std::queue<int> q;
+  for (int i = 0; i < num_comp; ++i) {
+    if (in_degree[i] == 0) q.push(i);
+  }
+
+  std::vector<std::vector<std::string>> result;
+  while (!q.empty()) {
+    int u = q.front(); q.pop();
+    result.push_back(sccs[u]);
+    for (int v : cond_adj[u]) {
+      if (--in_degree[v] == 0) q.push(v);
+    }
+  }
+
+  // Mark these transactions as committed in BOF
+  {
+    std::unique_lock<std::mutex> lk(bof_mutex_);
+    for (const auto& batch : result) {
+      for (const auto& h : batch) {
+        bof_committed_txns_.insert(h);
+      }
+    }
+  }
+
+  return result;
 }
 
 }  // namespace autobahn

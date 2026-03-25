@@ -372,13 +372,17 @@ void Tusk::ReceiveBlockACK(std::unique_ptr<Metadata> metadata) {
     cert.set_round(round);
     cert.set_proposer(id_);
     const Proposal* p = proposal_manager_->GetLocalBlock(hash);
-    assert(p != nullptr);
-    assert(p->header().proposer_id() == id_);
-    assert(p->header().round() == round);
+    if (p == nullptr) {
+      LOG(ERROR) << "ReceiveBlockACK: local block not found for hash, round=" << round;
+      return;
+    }
+    if (p->header().proposer_id() != id_ || p->header().round() != round) {
+      LOG(ERROR) << "ReceiveBlockACK: block mismatch, expected proposer=" << id_
+                 << " round=" << round;
+      return;
+    }
     global_stats_->AddExecutePrepareDelay(GetCurrentTime() - p->header().create_time());
-    //global_stats_->AddCommitLatency(GetCurrentTime() - p->header().create_time());
     *cert.mutable_strong_cert() = p->header().strong_cert();
-    //LOG(ERROR)<<"send cert, round:"<<p->header().round();
     broadcast_call_(MessageType::Cert, cert);
   }
 }

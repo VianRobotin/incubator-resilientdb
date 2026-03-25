@@ -36,7 +36,8 @@ namespace autobahn {
 //     - Guarantees no future transaction can have K(t') ≤ τ (Lemma 5)
 class AutoBahn: public common::ProtocolBase {
  public:
-  AutoBahn(int id, int f, int total_num, int block_size, SignatureVerifier* verifier);
+  AutoBahn(int id, int f, int total_num, int block_size, SignatureVerifier* verifier,
+           bool batch_order_fairness = false);
   ~AutoBahn();
 
   bool ReceiveTransaction(std::unique_ptr<Transaction> txn);
@@ -50,6 +51,9 @@ class AutoBahn: public common::ProtocolBase {
 
   // Fair ordering: TEE timestamp collection
   void ReceiveTimestamps(std::unique_ptr<TimestampBatch> batch);
+
+  // Batch-order fairness: relative ordering collection
+  void ReceiveRelativeOrdering(std::unique_ptr<RelativeOrdering> ordering);
 
  private:
   bool IsStop();
@@ -80,6 +84,7 @@ class AutoBahn: public common::ProtocolBase {
   int execute_id_;
 
   int id_, total_num_, f_, batch_size_;
+  bool batch_order_fairness_;
   std::atomic<int> is_stop_;
   int timeout_ms_;
   int64_t delta_ms_;  // Synchronous network delay bound (Δ)

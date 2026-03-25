@@ -82,6 +82,10 @@ message Proposal {
   int64 propose_time = 13;     // time when proposal was created (for 2*delta timer)
   // Fair ordering: ordering keys for transactions in the execution window
   repeated OrderingKeyEntry ordering_keys = 14;
+  // Batch-order fairness: ordered batches of transaction hashes.
+  // Transactions within the same BatchGroup can be in any order relative to
+  // each other, but batches are ordered (batch 0 before batch 1, etc.).
+  repeated BatchGroup batch_groups = 15;
 };
 
 enum MessageType {
@@ -104,6 +108,8 @@ enum MessageType {
   SyncHS_Equivocation = 15;
   // Fair ordering: TEE timestamp dissemination
   TEE_Timestamps = 16;
+  // Batch-order fairness: relative ordering dissemination
+  BOF_RelativeOrder = 17;
 };
 
 message VoteMessage {
@@ -177,6 +183,23 @@ message ProposalResponse {
 message VoteMsg {
   int32 slot_id = 1;
   int32 sender_id = 2;
+}
+
+// Batch-Order Fairness: a group of transactions that may be ordered in any
+// relative order (no f+1 majority distinguishes their receive order).
+// Batches themselves are totally ordered.
+message BatchGroup {
+  repeated bytes txn_hashes = 1;
+}
+
+// Batch-Order Fairness: a replica's local receive order for transactions in a block.
+// Each replica broadcasts this after receiving a block, recording the order in which
+// it first observed each transaction (relative ordering indicator).
+message RelativeOrdering {
+  repeated bytes txn_hashes = 1;  // Transaction hashes in the order received by this replica
+  int32 sender_id = 2;           // Replica that observed this ordering
+  int64 block_local_id = 3;      // Block that triggered this ordering report
+  int32 block_sender_id = 4;     // Owner of the block
 }
 
 // Equivocation proof: two conflicting proposals from the same leader in the same view.

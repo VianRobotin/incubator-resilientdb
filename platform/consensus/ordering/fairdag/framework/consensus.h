@@ -49,7 +49,10 @@ class FairDAGConsensus : public common::Consensus{
   std::unique_ptr<FairDAGPerformanceManager> GetPerformanceManager();
 
   private:
+    void StartLocalTxnGeneration();
     std::unique_ptr<FairDAG> fairdag_;
+    std::thread local_txn_gen_thread_;
+    std::atomic<bool> local_txn_gen_started_{false};
 };
 
 }  // namespace tusk

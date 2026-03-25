@@ -8,7 +8,12 @@
       "Bash(ls /c/Users/viene/.bazel*/bin/)",
       "Read(//c//**)",
       "Bash(find /c/Users/viene -maxdepth 3 -name bazel* -type f)",
-      "Bash(xargs ls:*)"
+      "Bash(xargs ls:*)",
+      "Bash(wsl -e bash -c \"cd /home/vian/incubator-resilientdb && bazel build //benchmark/protocols/fairdag:kv_server_performance 2>&1 | tail -5\")",
+      "Bash(wsl -e bash -c 'grep -i \"\"error\\\\|fatal\\\\|assert\\\\|abort\\\\|txn gen\\\\|Starting\\\\|ReceiveTransaction\\\\|AsyncSend\\\\|block\"\" /home/vian/incubator-resilientdb/benchmark_results/logs_fairdag_4r/server_1.log | head -30')",
+      "Bash(wsl -e bash -c \"cd /home/vian/incubator-resilientdb && bazel build //benchmark/protocols/fairdag:kv_server_performance 2>&1 | tail -3\")",
+      "Bash(wsl -d Ubuntu -e bash -c \"cd /home/vian/incubator-resilientdb && bazel build //platform/consensus/ordering/autobahn/... 2>&1 | tail -40\")",
+      "Bash(wsl -d Ubuntu -e bash -c \"cd /home/vian/incubator-resilientdb && bazel build //platform/consensus/ordering/autobahn/algorithm:autobahn //platform/consensus/ordering/autobahn/framework:consensus 2>&1 | tail -20\")"
     ]
   }
 }
