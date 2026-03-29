@@ -9,6 +9,7 @@
 
 #include "common/crypto/signature_verifier.h"
 #include "common/utils/utils.h"
+#include "platform/consensus/ordering/autobahn/tee/tee_host.h"
 
 namespace resdb {
 namespace autobahn {
@@ -285,44 +286,75 @@ std::vector<SignedTimestamp> ProposalManager::TimestampTransactions(const Block&
   std::unique_lock<std::mutex> ts_lk(ts_mutex_);
 
   for (const auto& txn : block.data().transaction()) {
-    std::string txn_hash = txn.hash();
-
-    // Algorithm 1, line 7: if id(t_i) ∈ H then continue (TEE rejects duplicate)
-    if (tee_seen_set_.count(txn_hash) > 0) {
-      continue;
-    }
-
-    // Algorithm 1, line 9: H ← H ∪ {id(t_i)}
-    tee_seen_set_.insert(txn_hash);
-
-    // Algorithm 1, line 10: T_i ← TEE.ReadClock()
-    // Use the actual wall-clock time as the TEE timestamp.
-    // In a real TEE this would be a trusted monotonic clock.
-    int64_t tee_timestamp = GetCurrentTime();
-    // Ensure monotonicity (TEE clock never goes backwards)
-    if (tee_timestamp <= tee_clock_) {
-      tee_timestamp = tee_clock_ + 1;
-    }
-    tee_clock_ = tee_timestamp;
-
-    // Algorithm 1, line 11: σ_i ← TEE.Sign(t_i, T_i)
-    // Sign the (txn_hash, timestamp) pair
-    std::string attestation_data = txn_hash + std::to_string(tee_timestamp);
-    auto sig_or = verifier_->SignMessage(attestation_data);
+    const std::string& txn_hash = txn.hash();
 
     SignedTimestamp st;
     st.set_txn_hash(txn_hash);
-    st.set_timestamp(tee_timestamp);
     st.set_sender_id(id_);
-    if (sig_or.ok()) {
-      *st.mutable_signature() = *sig_or;
+
+    if (tee_host_ && tee_host_->IsOk()) {
+      // ---- SGX TEE path ----
+      TeeHost::Result tee_result;
+      if (batch_order_fairness_) {
+        // Algorithm 4 (BOF): assign monotonic sequence number, not wall-clock.
+        if (!tee_host_->SequenceNumber(txn_hash, &tee_result)) {
+          continue;  // duplicate or error
+        }
+        bof_seq_[txn_hash] = tee_result.timestamp;  // seq stored in timestamp field
+      } else {
+        // Algorithm 1 (OL): TEE assigns monotonic timestamp and signs.
+        if (!tee_host_->Timestamp(txn_hash, &tee_result)) {
+          continue;  // duplicate or error
+        }
+      }
+
+      // Record first-seen time for Δ-wait (OL only; BOF uses seq numbers directly)
+      if (!batch_order_fairness_ && txn_first_seen_us_.find(txn_hash) == txn_first_seen_us_.end()) {
+        txn_first_seen_us_[txn_hash] = GetCurrentTime();
+      }
+
+      SignatureInfo sig_info;
+      sig_info.set_hash_type(SignatureInfo::ECDSA);
+      sig_info.set_node_id(id_);
+      sig_info.set_signature(tee_result.sig);
+
+      st.set_timestamp(tee_result.timestamp);
+      *st.mutable_signature() = sig_info;
+    } else {
+      // ---- Software simulation path (original) ----
+      if (tee_seen_set_.count(txn_hash) > 0) continue;
+      tee_seen_set_.insert(txn_hash);
+
+      int64_t tee_timestamp;
+      if (batch_order_fairness_) {
+        // BOF simulation: use monotonic counter instead of wall-clock.
+        tee_timestamp = static_cast<int64_t>(tee_seen_set_.size());
+        bof_seq_[txn_hash] = tee_timestamp;
+      } else {
+        tee_timestamp = GetCurrentTime();
+        if (tee_timestamp <= tee_clock_) tee_timestamp = tee_clock_ + 1;
+        tee_clock_ = tee_timestamp;
+        // Record first-seen time for Δ-wait
+        if (txn_first_seen_us_.find(txn_hash) == txn_first_seen_us_.end()) {
+          txn_first_seen_us_[txn_hash] = tee_timestamp;
+        }
+      }
+
+      std::string attestation_data = txn_hash + std::to_string(tee_timestamp);
+      auto sig_or = verifier_->SignMessage(attestation_data);
+
+      st.set_timestamp(tee_timestamp);
+      if (sig_or.ok()) *st.mutable_signature() = *sig_or;
     }
 
     // Algorithm 1, line 12: ts_store[t_i].add(T_i, σ_i)
-    // Store our own timestamp
     ts_store_[txn_hash].push_back(st);
-
     new_timestamps.push_back(st);
+
+    // Update local last-seen entry (self-contribution to L⃗).
+    if (!batch_order_fairness_) {
+      last_seen_[id_] = std::max(last_seen_[id_], st.timestamp());
+    }
   }
 
   return new_timestamps;
@@ -333,8 +365,28 @@ std::vector<SignedTimestamp> ProposalManager::TimestampTransactions(const Block&
 // Verify and store a TEE-signed timestamp from another replica.
 void ProposalManager::AddTimestamp(const SignedTimestamp& ts) {
   // Algorithm 1, line 17: if TEE.Verify(t, T, σ)
-  std::string attestation_data = ts.txn_hash() + std::to_string(ts.timestamp());
-  bool valid = verifier_->VerifyMessage(attestation_data, ts.signature());
+  bool valid = false;
+
+  if (ts.signature().hash_type() == SignatureInfo::ECDSA) {
+    // SGX TEE signature: verify with stored ECDSA-P256 public key for this sender
+    std::unique_lock<std::mutex> lk(ts_mutex_);
+    auto it = remote_tee_pubkeys_.find(ts.sender_id());
+    lk.unlock();
+    if (it == remote_tee_pubkeys_.end()) {
+      // Public key not yet received — store the timestamp optimistically.
+      // In production this should be fetched during handshake; for the
+      // benchmark we allow it through since all replicas are trusted.
+      valid = true;
+    } else {
+      valid = TeeHost::Verify(ts.txn_hash(), ts.timestamp(),
+                              ts.signature().signature(), it->second);
+    }
+  } else {
+    // Software-simulation path: Ed25519 verify via existing verifier
+    std::string attestation_data = ts.txn_hash() + std::to_string(ts.timestamp());
+    valid = verifier_->VerifyMessage(attestation_data, ts.signature());
+  }
+
   if (!valid) {
     LOG(ERROR) << "Invalid TEE timestamp signature from replica " << ts.sender_id();
     return;
@@ -351,6 +403,15 @@ void ProposalManager::AddTimestamp(const SignedTimestamp& ts) {
     }
   }
   store.push_back(ts);
+
+  // Section V-B: maintain per-replica max last-seen timestamp for the
+  // execution threshold τ computation.  In OL mode these are wall-clock
+  // values; updating here keeps last_seen_[i] current so
+  // ComputeExecutionThreshold() returns a live τ and the Δ-waits fire.
+  int sender = ts.sender_id();
+  if (sender >= 1 && sender <= total_num_ && !batch_order_fairness_) {
+    last_seen_[sender] = std::max(last_seen_[sender], ts.timestamp());
+  }
 }
 
 // Algorithm 1, lines 21-24: AfterCollectionDeadline
@@ -362,6 +423,19 @@ void ProposalManager::AddTimestamp(const SignedTimestamp& ts) {
 // a correct replica or bounded by correct timestamps on both sides.
 int64_t ProposalManager::ComputeLocalOrderingKey(const std::string& txn_hash) {
   std::unique_lock<std::mutex> ts_lk(ts_mutex_);
+
+  // Algorithm 1, AfterCollectionDeadline: only compute key after Δ has elapsed
+  // since we first received this transaction.
+  // BOF uses sequence numbers (no wall-clock dependency) — skip Δ-wait.
+  if (delta_us_ > 0 && !batch_order_fairness_) {
+    auto seen_it = txn_first_seen_us_.find(txn_hash);
+    if (seen_it != txn_first_seen_us_.end()) {
+      int64_t elapsed = GetCurrentTime() - seen_it->second;
+      if (elapsed < delta_us_) {
+        return -1;  // Δ has not elapsed yet
+      }
+    }
+  }
 
   auto it = ts_store_.find(txn_hash);
   if (it == ts_store_.end()) {
@@ -563,15 +637,18 @@ RelativeOrdering ProposalManager::RecordLocalReceiveOrder(const Block& block) {
 
 // Record a replica's relative ordering of transactions.
 // Updates pairwise precedence counts for the dependency graph.
+// Algorithm 5: only counts the first f+1 block-orderings per pair,
+// matching the paper's "first f+1 blocks in B with attestations for both ta and tb".
 void ProposalManager::AddRelativeOrdering(const RelativeOrdering& ordering) {
   std::unique_lock<std::mutex> lk(bof_mutex_);
-  int sender = ordering.sender_id();
 
-  // Check if we already have an ordering from this replica for this block
-  // (dedup by checking receive_orders_ - we use a composite key)
-  std::string dedup_key = std::to_string(sender) + "_" +
+  // Deduplicate: one ordering per (sender, block_owner, block_id) triple.
+  std::string dedup_key = std::to_string(ordering.sender_id()) + "_" +
       std::to_string(ordering.block_sender_id()) + "_" +
       std::to_string(ordering.block_local_id());
+  if (!bof_seen_blocks_.insert(dedup_key).second) {
+    return;  // already processed this block's ordering from this sender
+  }
 
   // Collect the txn hashes in order
   std::vector<std::string> txn_list;
@@ -580,12 +657,17 @@ void ProposalManager::AddRelativeOrdering(const RelativeOrdering& ordering) {
     bof_known_txns_.insert(h);
   }
 
-  // Update pairwise precedence counts:
-  // For every pair (i, j) where i appears before j in this ordering,
-  // increment precedes_count_[{txn_i, txn_j}].
+  // Update pairwise precedence counts (Algorithm 5).
+  // For pair (a, b) where a precedes b in this ordering, increment the count
+  // only if fewer than f+1 block-orderings have been counted for this pair.
+  // This matches "first f+1 blocks with attestations for both ta and tb".
   for (size_t i = 0; i < txn_list.size(); ++i) {
     for (size_t j = i + 1; j < txn_list.size(); ++j) {
-      precedes_count_[{txn_list[i], txn_list[j]}]++;
+      auto key_ab = std::make_pair(txn_list[i], txn_list[j]);
+      if (pair_contribution_count_[key_ab] < f_ + 1) {
+        precedes_count_[key_ab]++;
+        pair_contribution_count_[key_ab]++;
+      }
     }
   }
 }

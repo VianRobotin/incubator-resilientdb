@@ -12,6 +12,10 @@ RESULTS_DIR="$PROJ_ROOT/benchmark_results"
 rm -rf "$RESULTS_DIR"
 mkdir -p "$RESULTS_DIR"
 
+# SGX enclave path — picked up by AutoBahn constructor via getenv("TEE_ENCLAVE_PATH")
+export TEE_ENCLAVE_PATH="$PROJ_ROOT/platform/consensus/ordering/autobahn/tee/tee_enclave.signed.so"
+export LD_LIBRARY_PATH="/opt/intel/sgxsdk/lib64:${LD_LIBRARY_PATH:-}"
+
 echo "=== Autobahn Benchmark: OL vs BOF ==="
 echo "Project root: $PROJ_ROOT"
 echo "Results dir:  $RESULTS_DIR"
@@ -32,7 +36,7 @@ SERVER_BIN="$PROJ_ROOT/bazel-bin/benchmark/protocols/autobahn/kv_server_performa
 # ---------------------------------------------------------------
 # Parameters
 # ---------------------------------------------------------------
-NUM_REPLICAS=4
+NUM_REPLICAS=3
 BASE_PORT=10001
 RUNTIME=90       # seconds per run
 WARMUP=20        # seconds to skip before collecting stats
@@ -150,15 +154,20 @@ run_benchmark() {
   killall -9 kv_server_performance 2>/dev/null || true
   sleep 2
 
+  # Build replicaInfo array dynamically from NUM_REPLICAS
+  local replica_entries=""
+  for i in $(seq 1 $NUM_REPLICAS); do
+    local port=$(( BASE_PORT + i - 1 ))
+    [ $i -gt 1 ] && replica_entries+=","$'\n'
+    replica_entries+="        {\"id\": $i, \"ip\": \"127.0.0.1\", \"port\": $port}"
+  done
+
   cat > "$CONFIG_DIR/server.config" << CONFIGEOF
 {
   "region": [
     {
       "replicaInfo": [
-        {"id": 1, "ip": "127.0.0.1", "port": 10001},
-        {"id": 2, "ip": "127.0.0.1", "port": 10002},
-        {"id": 3, "ip": "127.0.0.1", "port": 10003},
-        {"id": 4, "ip": "127.0.0.1", "port": 10004}
+${replica_entries}
       ]
     }
   ],
@@ -286,6 +295,18 @@ CONFIGEOF
     nonempty=$(( nonempty + n ))
   done
   printf "    %-50s %s\n" "Non-empty fair-ordering proposals:" "$nonempty"
+
+  # 8. SGX TEE mode active
+  local tee_active=0
+  for i in $(seq 1 $NUM_REPLICAS); do
+    local n; n=$(grep "SGX enclave initialized" "$LOG_DIR/server_$i.log" 2>/dev/null | wc -l) || n=0
+    tee_active=$(( tee_active + n ))
+  done
+  if [ "$tee_active" -gt 0 ]; then
+    printf "    %-50s %s\n" "SGX TEE active:" "$tee_active / $NUM_REPLICAS replicas ✓"
+  else
+    printf "    %-50s %s\n" "SGX TEE active:" "0 (software simulation fallback)"
+  fi
   echo ""
 }
 

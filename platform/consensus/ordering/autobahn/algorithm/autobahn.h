@@ -10,6 +10,7 @@
 #include "platform/consensus/ordering/common/algorithm/protocol_base.h"
 #include "platform/consensus/ordering/autobahn/algorithm/proposal_manager.h"
 #include "platform/consensus/ordering/autobahn/proto/proposal.pb.h"
+#include "platform/consensus/ordering/autobahn/tee/tee_host.h"
 #include "platform/statistic/stats.h"
 
 namespace resdb {
@@ -99,6 +100,9 @@ class AutoBahn: public common::ProtocolBase {
 
   Stats* global_stats_;
   std::map<int, int64_t> commit_block_;
+
+  // SGX TEE enclave (nullptr when running without SGX)
+  std::unique_ptr<TeeHost> tee_host_;
 
   bool is_leader_;
   int cur_slot_;

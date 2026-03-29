@@ -1,0 +1,9 @@
+libsgx_trts.so {
+    global:
+        g_global_data_sim;
+        g_global_data;
+        enclave_entry;
+        g_peak_heap_used;
+    local:
+        *;
+};

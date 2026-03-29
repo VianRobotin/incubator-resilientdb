@@ -3,13 +3,18 @@
 #include <algorithm>
 #include <condition_variable>
 #include <list>
+#include <map>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "platform/consensus/ordering/autobahn/algorithm/proposal_graph.h"
 #include "platform/consensus/ordering/autobahn/proto/proposal.pb.h"
 #include "platform/statistic/stats.h"
 #include "common/crypto/signature_verifier.h"
+
+namespace resdb { namespace autobahn { class TeeHost; } }  // forward declaration
 
 namespace resdb {
 namespace autobahn {
@@ -124,6 +129,37 @@ class ProposalManager {
   // γ ∈ (0.5, 1.0]; default 1.0 (= f+1, strictest, works for n=2f+1).
   void SetBofGamma(float gamma) { bof_gamma_ = gamma; }
 
+  // ===========================================================
+  // Δ-wait and timing parameters
+  // ===========================================================
+
+  // Set the Δ parameter (collection deadline, microseconds).
+  // After Δ since first receipt, ComputeLocalOrderingKey() uses whatever
+  // timestamps have been collected (Algorithm 1 AfterCollectionDeadline).
+  void SetDeltaUs(int64_t delta_us) { delta_us_ = delta_us; }
+
+  // ===========================================================
+  // SGX TEE integration
+  // ===========================================================
+
+  // Set the SGX TeeHost instance. When set, TimestampTransactions() calls
+  // the enclave via ECALL instead of the software simulation.
+  void SetTeeHost(TeeHost* host) { tee_host_ = host; }
+
+  // Store the ECDSA-P256 public key (64 bytes) for a remote replica's TEE.
+  // Called when a TimestampBatch with tee_pubkey is received.
+  void SetRemoteTeePublicKey(int sender_id, const std::string& pubkey64) {
+    std::unique_lock<std::mutex> lk(ts_mutex_);
+    remote_tee_pubkeys_[sender_id] = pubkey64;
+  }
+
+  // Get the cached TEE public key for a remote sender (empty if not yet received).
+  std::string GetRemoteTeePublicKey(int sender_id) {
+    std::unique_lock<std::mutex> lk(ts_mutex_);
+    auto it = remote_tee_pubkeys_.find(sender_id);
+    return (it != remote_tee_pubkeys_.end()) ? it->second : std::string();
+  }
+
  private:
   void UpdateLastSign(Block * block);
 
@@ -144,6 +180,10 @@ class ProposalManager {
   int current_slot_;
 
   SignatureVerifier* verifier_;
+  TeeHost* tee_host_ = nullptr;  // non-owning; set via SetTeeHost()
+
+  // Per-sender ECDSA-P256 public keys received from remote TEEs (64 bytes each).
+  std::map<int, std::string> remote_tee_pubkeys_;
 
   std::map<int, std::unique_ptr<Proposal> > pending_proposals_;
 
@@ -191,15 +231,52 @@ class ProposalManager {
   std::map<int, std::vector<std::string>> receive_orders_;
   std::mutex bof_mutex_;
 
-  // Pairwise precedence counts: precedes_count_[{a,b}] = number of replicas
-  // that observed transaction a before transaction b.
-  std::map<std::pair<std::string, std::string>, int> precedes_count_;
+  // Hash function for string pairs used in the BOF maps below.
+  struct PairHash {
+    size_t operator()(const std::pair<std::string, std::string>& p) const {
+      size_t h1 = std::hash<std::string>{}(p.first);
+      size_t h2 = std::hash<std::string>{}(p.second);
+      // Asymmetric mix so (a,b) and (b,a) hash differently.
+      return h1 ^ (h2 * 2654435761ULL);
+    }
+  };
+
+  // Pairwise precedence counts: precedes_count_[{a,b}] = number of blocks
+  // (up to f+1) where replica observed a before b.
+  // Uses unordered_map for O(1) amortized lookup (vs O(log n) for std::map),
+  // critical for large transaction sets (Algorithm 5 is O(|T|²)).
+  std::unordered_map<std::pair<std::string, std::string>, int, PairHash>
+      precedes_count_;
+
+  // Per-pair contribution count: how many block-orderings have been counted
+  // toward this pair so far. Capped at f+1 (Algorithm 5 "first f+1 blocks").
+  std::unordered_map<std::pair<std::string, std::string>, int, PairHash>
+      pair_contribution_count_;
+
+  // Deduplication: blocks for which we have already recorded a relative
+  // ordering (keyed by "sender_id_block_sender_id_block_local_id").
+  std::unordered_set<std::string> bof_seen_blocks_;
 
   // Set of all transaction hashes known to the BOF system.
   std::set<std::string> bof_known_txns_;
 
   // Track which transactions have already been committed via BOF.
   std::set<std::string> bof_committed_txns_;
+
+  // ===========================================================
+  // Δ-wait state
+  // ===========================================================
+
+  // Δ parameter in microseconds (collection deadline for OL).
+  int64_t delta_us_ = 200000;  // default: 200 ms
+
+  // Time (microseconds since epoch) when each transaction was first seen.
+  // Used to enforce the AfterCollectionDeadline check.
+  std::map<std::string, int64_t> txn_first_seen_us_;
+
+  // BOF sequence numbers assigned by TEE (ecall_assign_sequence_number).
+  // Stored as the ordering_key in the SignedTimestamp for BOF transactions.
+  std::map<std::string, int64_t> bof_seq_;
 };
 
 }  // namespace autobahn

@@ -16,6 +16,7 @@ cc_library(
         "//common/crypto:signature_verifier",
         "//common/utils",
         "//platform/consensus/ordering/autobahn/proto:proposal_cc_proto",
+        "//platform/consensus/ordering/autobahn/tee:tee_host",
     ],
 )
 
@@ -46,6 +47,13 @@ cc_library(
     name = "autobahn",
     srcs = ["autobahn.cpp"],
     hdrs = ["autobahn.h"],
+    linkopts = [
+        "-L/opt/intel/sgxsdk/lib64",
+        "-lsgx_urts_sim",
+        "-lssl",
+        "-lcrypto",
+        "-lpthread",
+    ],
     deps = [
         ":proposal_graph",
         ":proposal_manager",
@@ -55,6 +63,7 @@ cc_library(
         "//platform/consensus/ordering/common/algorithm:protocol_base",
         "//platform/consensus/ordering/autobahn/proto:proposal_cc_proto",
         "//platform/common/queue:lock_free_queue",
+        "//platform/consensus/ordering/autobahn/tee:tee_host",
     ],
 )
 

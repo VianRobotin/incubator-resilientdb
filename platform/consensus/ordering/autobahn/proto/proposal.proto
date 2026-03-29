@@ -29,6 +29,10 @@ message SignedTimestamp {
 message TimestampBatch {
   repeated SignedTimestamp timestamps = 1;
   int32 sender_id = 2;
+  // 64-byte ECDSA-P256 public key of the sender's TEE enclave: gx[32] || gy[32]
+  // (SGX little-endian format). Present only when running with SGX TEE.
+  // Receivers cache this per sender_id for signature verification.
+  bytes tee_pubkey = 3;
 }
 
 // Per-transaction ordering key included in consensus blocks.
@@ -86,6 +90,10 @@ message Proposal {
   // Transactions within the same BatchGroup can be in any order relative to
   // each other, but batches are ordered (batch 0 before batch 1, etc.).
   repeated BatchGroup batch_groups = 15;
+  // TEE-signed last-seen vector L⃗ (Section V-B).
+  // 64-byte ECDSA-P256 signature from the proposer's TEE over the serialized
+  // last_seen_vector bytes. Replicas verify this to prevent Byzantine inflation of τ.
+  bytes last_seen_sig = 16;
 };
 
 enum MessageType {

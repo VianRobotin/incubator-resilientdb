@@ -1,0 +1,69 @@
+/* TEE Enclave EDL — ECALL/OCALL interface for the AutoBahn fair-ordering TEE.
+ *
+ * The enclave provides:
+ *   - Monotonic clock (OCALL-backed, monotonicity enforced inside enclave)
+ *   - ECDSA-P256 key pair (hardware-sealed in hardware mode)
+ *   - Seen-set for deduplication (inside enclave memory)
+ */
+
+enclave {
+    from "sgx_tstdc.edl" import *;
+
+    trusted {
+        /* Initialize the TEE: generate ECDSA-P256 key pair.
+         * Returns the 64-byte uncompressed public key: gx[32] || gy[32]
+         * (SGX little-endian format).
+         * Idempotent: returns the same key on subsequent calls.
+         */
+        public sgx_status_t ecall_init_tee(
+            [out, size=64] uint8_t* pubkey_out
+        );
+
+        /* Timestamp a transaction.
+         * hash:          32-byte transaction hash
+         * timestamp_out: microseconds since epoch (monotonically increasing)
+         * sig_out:       64-byte ECDSA-P256 signature over SHA-256(hash||timestamp)
+         *                in SGX format: r[32] || s[32] (little-endian)
+         *
+         * Returns SGX_SUCCESS on new transaction.
+         * Returns SGX_ERROR_INVALID_PARAMETER if hash was already attested
+         * (deduplication — the TEE will not sign twice for the same tx).
+         */
+        public sgx_status_t ecall_timestamp_txn(
+            [in,  size=32] const uint8_t* hash,
+            [out]          int64_t*       timestamp_out,
+            [out, size=64] uint8_t*       sig_out
+        );
+
+        /* Assign a monotonically increasing sequence number to a transaction.
+         * Used for Batch-Order Fairness (Algorithm 4): relative ordering only,
+         * no wall-clock dependency.
+         * Returns SGX_ERROR_INVALID_PARAMETER if the hash was already attested.
+         */
+        public sgx_status_t ecall_assign_sequence_number(
+            [in,  size=32] const uint8_t* hash,
+            [out]          int64_t*       seq_out,
+            [out, size=64] uint8_t*       sig_out
+        );
+
+        /* Sign arbitrary bytes with the enclave's ECDSA-P256 key.
+         * Used to produce a tamper-proof TEE attestation of the last-seen
+         * vector L⃗ included in each consensus proposal (Section V-B).
+         * data_len must be > 0 and ≤ 1024.
+         */
+        public sgx_status_t ecall_sign_bytes(
+            [in, size=data_len] const uint8_t* data,
+            uint32_t                            data_len,
+            [out, size=64]      uint8_t*        sig_out
+        );
+    };
+
+    untrusted {
+        /* Host-provided wall-clock time (microseconds since epoch).
+         * The enclave enforces monotonicity on top of this value, so the host
+         * cannot cause timestamps to go backward, only forward.
+         * In hardware mode this would be replaced by sgx_get_trusted_time().
+         */
+        void ocall_get_time([out] int64_t* t);
+    };
+};
