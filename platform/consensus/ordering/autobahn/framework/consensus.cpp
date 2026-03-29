@@ -53,11 +53,15 @@ Consensus::Consensus(const ResDBConfig& config,
           .public_key_info()
           .type() != CertificateKeyInfo::CLIENT) {
     bool batch_order_fairness = config_.GetConfigData().batch_order_fairness();
+    // γ ∈ (0.5, 1.0] for BOF; default 1.0 (strictest, works for n=2f+1).
+    float bof_gamma = config_.GetConfigData().has_bof_gamma()
+                          ? config_.GetConfigData().bof_gamma()
+                          : 1.0f;
     autobahn_ = std::make_unique<AutoBahn>(
         config_.GetSelfInfo().id(), f,
                                    total_replicas, config_.GetConfigData().block_size(),
                                    GetSignatureVerifier(),
-                                   batch_order_fairness);
+                                   batch_order_fairness, bof_gamma);
 
     InitProtocol(autobahn_.get());
 
@@ -227,14 +231,13 @@ int Consensus::CommitMsg(const google::protobuf::Message& msg) {
 }
 
 int Consensus::CommitMsgInternal(const Transaction& txn) {
-  std::unique_ptr<Request> request = std::make_unique<Request>();
-  request->set_queuing_time(txn.queuing_time());
-  request->set_data(txn.data());
-  request->set_seq(txn.id());
-  request->set_uid(txn.uid());
-  request->set_proxy_id(txn.proxy_id());
-
-  transaction_executor_->AddExecuteMessage(std::move(request));
+  // Autobahn updates throughput stats directly in Commit() via
+  // global_stats_->ConsumeTransactions(). The standard executor path
+  // (AddExecuteMessage → RegisterExecute) uses a 1024-slot bucket ring that
+  // overflows when a full block of transactions is submitted at once.
+  // Transactions are internally generated for benchmarking so there is no
+  // external client waiting for a response; skip the executor path entirely.
+  (void)txn;
   return 0;
 }
 

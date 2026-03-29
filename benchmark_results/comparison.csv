@@ -1,0 +1,7 @@
+mode,block_size,tps,slots_committed,txns_committed,runtime_s
+ol,100,234.2,38,16400,90
+bof,100,94.2,8,6600,90
+ol,200,440.4,37,30829,90
+bof,200,91.4,3,6400,90
+ol,400,937.1,35,65600,90
+bof,400,22.8,2,1600,90

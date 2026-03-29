@@ -37,7 +37,7 @@ namespace autobahn {
 class AutoBahn: public common::ProtocolBase {
  public:
   AutoBahn(int id, int f, int total_num, int block_size, SignatureVerifier* verifier,
-           bool batch_order_fairness = false);
+           bool batch_order_fairness = false, float bof_gamma = 1.0f);
   ~AutoBahn();
 
   bool ReceiveTransaction(std::unique_ptr<Transaction> txn);

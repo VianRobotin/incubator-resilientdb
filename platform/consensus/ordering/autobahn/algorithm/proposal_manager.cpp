@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <queue>
 
@@ -641,12 +642,14 @@ std::vector<std::vector<std::string>> ProposalManager::GetBatchOrderedTransactio
         auto it_ba = precedes_count_.find({b, a});
         if (it_ba != precedes_count_.end()) b_before_a = it_ba->second;
 
-        // Edge exists if f+1 replicas agree on the ordering
-        if (a_before_b >= f_ + 1) {
+        // Algorithm 5, line 2: θ = ⌈γ(f+1)⌉
+        // Edge exists if θ replicas agree on the ordering direction.
+        int theta = static_cast<int>(std::ceil(bof_gamma_ * (f_ + 1)));
+        if (a_before_b >= theta) {
           adj[i].push_back(j);
           radj[j].push_back(i);
         }
-        if (b_before_a >= f_ + 1) {
+        if (b_before_a >= theta) {
           adj[j].push_back(i);
           radj[i].push_back(j);
         }

@@ -10,13 +10,14 @@ namespace resdb {
 namespace autobahn {
 
 AutoBahn::AutoBahn(int id, int f, int total_num, int block_size, SignatureVerifier* verifier,
-                   bool batch_order_fairness)
+                   bool batch_order_fairness, float bof_gamma)
     : ProtocolBase(id, f, total_num), verifier_(verifier),
       batch_order_fairness_(batch_order_fairness) {
 
   LOG(ERROR) << "Initializing AutoBahn with Sync HotStuff + "
              << (batch_order_fairness_ ? "Batch-Order Fairness" : "Ordering Linearizability")
-             << " id=" << id << " f=" << f << " n=" << total_num;
+             << " id=" << id << " f=" << f << " n=" << total_num
+             << (batch_order_fairness_ ? " gamma=" + std::to_string(bof_gamma) : "");
   id_ = id;
   total_num_ = total_num;
   f_ = f;
@@ -30,8 +31,11 @@ AutoBahn::AutoBahn(int id, int f, int total_num, int block_size, SignatureVerifi
   is_leader_ = id_ == 1;
   cur_slot_ = 1;
 
+  global_stats_ = Stats::GetGlobalStats(5);
+
   proposal_manager_ = std::make_unique<ProposalManager>(id, total_num_, f_, verifier);
   proposal_manager_->SetBatchOrderFairness(batch_order_fairness_);
+  proposal_manager_->SetBofGamma(bof_gamma);
 
   block_thread_ = std::thread(&AutoBahn::GenerateBlocks, this);
   dissemi_thread_ = std::thread(&AutoBahn::AsyncDissemination, this);
@@ -349,9 +353,24 @@ void AutoBahn::AsyncConsensus() {
     // This ensures we still make progress when the threshold mechanism
     // hasn't accumulated enough data yet.
     if (tau_current <= tau_prev) {
-      tau_current = GetCurrentTime() - 2 * delta_ms_ * 1000;
+      tau_current = static_cast<int64_t>(GetCurrentTime()) - 2 * delta_ms_ * 1000;
       if (tau_current <= tau_prev) {
         tau_current = tau_prev + 1;
+      }
+    }
+
+    // Algorithm 2, line 4: wait until Now() > τ_current + Δ
+    // Guarantees that all TEE-signed timestamps with T ≤ τ_current have had
+    // Δ time to propagate to all correct replicas before we propose.
+    {
+      int64_t wait_until_us = tau_current + delta_ms_ * 1000;
+      int64_t now_us = static_cast<int64_t>(GetCurrentTime());
+      if (now_us < wait_until_us) {
+        int64_t sleep_us = wait_until_us - now_us;
+        // Cap at 2Δ to guard against a very large τ_current.
+        sleep_us = std::min(sleep_us, static_cast<int64_t>(2 * delta_ms_ * 1000));
+        LOG(ERROR) << "Algorithm 2: waiting " << sleep_us / 1000 << "ms for τ+Δ";
+        usleep(static_cast<useconds_t>(sleep_us));
       }
     }
 
@@ -477,6 +496,21 @@ bool AutoBahn::ReceiveProposal(std::unique_ptr<Proposal> proposal) {
     LOG(ERROR) << "Rejecting proposal: τ_block=" << tau_block
                << " ≤ τ_committed=" << tau_committed;
     return false;
+  }
+
+  // Algorithm 3, lines 10-12: wait until Now() ≥ τ_block + Δ
+  // Ensures all TEE timestamps ≤ τ_block have propagated to this replica
+  // before we vote, so our local K_r(t) computation is complete.
+  {
+    int64_t wait_until_us = tau_block + delta_ms_ * 1000;
+    int64_t now_us = static_cast<int64_t>(GetCurrentTime());
+    if (now_us < wait_until_us) {
+      int64_t sleep_us = wait_until_us - now_us;
+      // Cap at 2Δ to avoid blocking forever if the threshold is unusually far ahead.
+      sleep_us = std::min(sleep_us, static_cast<int64_t>(2 * delta_ms_ * 1000));
+      LOG(ERROR) << "Algorithm 3: waiting " << sleep_us / 1000 << "ms for τ_block+Δ";
+      usleep(static_cast<useconds_t>(sleep_us));
+    }
   }
 
   // Step 3: Update last-seen vector from the proposal's L⃗ (Algorithm 3, line 17)
@@ -699,16 +733,36 @@ void AutoBahn::Commit(std::unique_ptr<Proposal> proposal) {
       }
     }
   } else {
-    // OL mode: execute in ordering key order (block-by-block, as committed)
+    // OL mode: execute in final ordering key order.
+    // K(t) = min over first f+1 committed K_r(t) values (Section V-A).
+    // Ties broken deterministically by txn hash (per paper Section V-B).
+    std::vector<std::pair<int64_t, Transaction*>> sorted_txns;
+    sorted_txns.reserve(txn_by_hash.size());
     for (auto& entry : txn_by_hash) {
-      Transaction& txn = *entry.second;
-      int64_t final_key = proposal_manager_->GetFinalOrderingKey(txn.hash());
-      if (final_key >= 0) {
-        txn.set_ordering_key(final_key);
+      int64_t final_key = proposal_manager_->GetFinalOrderingKey(entry.first);
+      if (final_key < 0) {
+        // No committed key yet; fall back to local key and put at end.
+        final_key = INT64_MAX;
       }
+      sorted_txns.push_back({final_key, entry.second});
+    }
+    std::sort(sorted_txns.begin(), sorted_txns.end(),
+        [](const std::pair<int64_t, Transaction*>& a,
+           const std::pair<int64_t, Transaction*>& b) {
+          if (a.first != b.first) return a.first < b.first;
+          return a.second->hash() < b.second->hash();  // deterministic tie-break
+        });
+    for (auto& kv : sorted_txns) {
+      Transaction& txn = *kv.second;
+      txn.set_ordering_key(kv.first);
       txn.set_id(execute_id_++);
       commit_(txn);
     }
+  }
+
+  // Update throughput stats so the monitoring system tracks committed txns.
+  if (!txn_by_hash.empty()) {
+    global_stats_->ConsumeTransactions(static_cast<int>(txn_by_hash.size()));
   }
 
   // Rotate leader (round-robin, as in Sync HotStuff)

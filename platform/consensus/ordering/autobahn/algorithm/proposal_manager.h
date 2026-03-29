@@ -120,6 +120,10 @@ class ProposalManager {
   void SetBatchOrderFairness(bool enabled) { batch_order_fairness_ = enabled; }
   bool IsBatchOrderFairness() const { return batch_order_fairness_; }
 
+  // Set the γ parameter for BOF (edge threshold θ = ⌈γ(f+1)⌉).
+  // γ ∈ (0.5, 1.0]; default 1.0 (= f+1, strictest, works for n=2f+1).
+  void SetBofGamma(float gamma) { bof_gamma_ = gamma; }
+
  private:
   void UpdateLastSign(Block * block);
 
@@ -180,6 +184,7 @@ class ProposalManager {
   // Batch-Order Fairness State
   // ===========================================================
   bool batch_order_fairness_ = false;
+  float bof_gamma_ = 1.0f;  // γ ∈ (0.5, 1.0]; edge threshold θ = ⌈γ(f+1)⌉
 
   // Per-replica receive orderings: receive_orders_[replica_id] is a list of
   // txn hashes in the order that replica observed them.
