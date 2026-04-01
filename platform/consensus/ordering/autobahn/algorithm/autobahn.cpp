@@ -917,6 +917,15 @@ void AutoBahn::Commit(std::unique_ptr<Proposal> proposal) {
         commit_(txn);
       }
     }
+    // Mark all executed transactions as BOF-committed NOW (post-commit),
+    // not at proposal time — transactions from a failed slot must remain
+    // available for the next proposal.
+    {
+      std::vector<std::string> all_hashes;
+      all_hashes.reserve(txn_by_hash.size());
+      for (const auto& entry : txn_by_hash) all_hashes.push_back(entry.first);
+      proposal_manager_->MarkBofCommitted(all_hashes);
+    }
   } else {
     // OL mode: execute in final ordering key order.
     // K(t) = min over first f+1 committed K_r(t) values (Section V-A).

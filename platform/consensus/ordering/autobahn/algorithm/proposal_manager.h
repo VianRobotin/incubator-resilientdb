@@ -117,10 +117,15 @@ class ProposalManager {
   // Build the batch-order-fair ordering for transactions in the execution window.
   // Uses the dependency graph: edge t_a → t_b exists if f+1 replicas observed
   // t_a before t_b. Transactions in the same SCC form a batch (unordered).
-  // Returns batches in topological order. Marks returned transactions as
-  // committed in bof_committed_txns_ (so they are excluded from future calls).
+  // Returns batches in topological order. Does NOT mark transactions committed —
+  // call MarkBofCommitted() only after the slot is actually committed (2Δ timer).
   std::vector<std::vector<std::string>> GetBatchOrderedTransactions(
       int64_t tau_prev, int64_t tau_current);
+
+  // Mark transactions as committed in the BOF system.
+  // Must be called from Commit() (not at proposal time) so that transactions
+  // from a failed/skipped slot are not permanently lost.
+  void MarkBofCommitted(const std::vector<std::string>& hashes);
 
   // Read-only variant: same computation as GetBatchOrderedTransactions but does
   // NOT mark transactions as committed. Used by replicas to validate a leader's
@@ -172,7 +177,7 @@ class ProposalManager {
 
   // Returns candidate transactions for BOF batch computation: those in the
   // window (tau_prev, tau_current] that are not yet in bof_committed_txns_.
-  // Used by both GetBatchOrderedTransactions and ComputeBatchOrderingReadOnly.
+  // Used by GetBatchOrderedTransactions, ComputeBatchOrderingReadOnly.
   std::vector<std::string> CollectBofCandidates(int64_t tau_prev, int64_t tau_current);
 
  private:

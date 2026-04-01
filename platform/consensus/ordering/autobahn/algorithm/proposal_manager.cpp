@@ -772,7 +772,10 @@ std::vector<std::string> ProposalManager::CollectBofCandidates(
   return candidates;
 }
 
-// Algorithm 5 + 6: build batch-ordered groups and mark committed.
+// Algorithm 5 + 6: build batch-ordered groups.
+// Does NOT mark transactions committed — Commit() calls MarkBofCommitted()
+// after the slot is actually executed so that transactions from a failed
+// or skipped slot are never silently discarded.
 std::vector<std::vector<std::string>> ProposalManager::GetBatchOrderedTransactions(
     int64_t tau_prev, int64_t tau_current) {
 
@@ -785,16 +788,14 @@ std::vector<std::vector<std::string>> ProposalManager::GetBatchOrderedTransactio
     for (const auto& kv : precedes_count_) counts_copy[kv.first] = kv.second;
   }
 
-  auto result = ComputeBatchOrderingImpl(candidates, counts_copy, bof_gamma_, f_);
+  return ComputeBatchOrderingImpl(candidates, counts_copy, bof_gamma_, f_);
+}
 
-  // Mark committed so they are excluded from future calls.
-  {
-    std::unique_lock<std::mutex> lk(bof_mutex_);
-    for (const auto& batch : result)
-      for (const auto& h : batch)
-        bof_committed_txns_.insert(h);
-  }
-  return result;
+// Mark a set of transactions as BOF-committed so CollectBofCandidates
+// excludes them from future proposals.  Called from Commit() only.
+void ProposalManager::MarkBofCommitted(const std::vector<std::string>& hashes) {
+  std::unique_lock<std::mutex> lk(bof_mutex_);
+  for (const auto& h : hashes) bof_committed_txns_.insert(h);
 }
 
 // Read-only variant: same computation but does NOT mark transactions committed.
