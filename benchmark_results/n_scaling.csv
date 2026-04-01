@@ -1,0 +1,7 @@
+n,mode,tps,slots_committed,txns_committed,runtime_s
+3,ol,54.6,161,4918,90
+3,bof,28.5,12,2000,90
+5,ol,46.7,56,4205,90
+5,bof,7.2,4,509,90
+7,ol,10.0,2,700,90
+7,bof,1.2,1,84,90

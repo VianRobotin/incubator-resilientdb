@@ -28,7 +28,7 @@ AutoBahn::AutoBahn(int id, int f, int total_num, int block_size, SignatureVerifi
   timeout_ms_ = 60000;
   // Δ: synchronous network delay bound.
   // Replicas wait Δ to collect timestamps, 2Δ before committing.
-  delta_ms_ = 1000;  // 1 second for local testing; increase for real deployments
+  delta_ms_ = 1000;  // 1 second Δ; adjust for deployment network latency
   batch_size_ = block_size;
   execute_id_ = 1;
   is_leader_ = id_ == 1;
