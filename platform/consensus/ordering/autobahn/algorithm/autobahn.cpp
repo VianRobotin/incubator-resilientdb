@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 #include <limits>
 #include <set>
+#include <unordered_map>
 
 #include "common/crypto/signature_verifier.h"
 #include "common/utils/utils.h"
@@ -632,6 +633,68 @@ bool AutoBahn::ReceiveProposal(std::unique_ptr<Proposal> proposal) {
                  << " — accepting (non-Byzantine assumption)";
       // Accept despite mismatch (timestamps may not have fully propagated
       // due to timing; a strict Byzantine deployment should return false here).
+    }
+  }
+
+  // Algorithm 3, lines 13-16: Validate BOF payload.
+  // Mirror of the OL check above but for batch-order fairness mode.
+  // After waiting τ_block + Δ, the replica independently builds its dependency
+  // graph from collected ordering indicators and verifies that the leader's
+  // proposed batch groups are consistent with the locally computed ordering.
+  //
+  // Consistency rule (Definition 2 + Algorithm 5):
+  //   For any two transactions ta, tb that are known to both the replica and
+  //   the proposal, if the proposal places ta in an earlier batch than tb, the
+  //   replica must not independently place ta in a LATER batch than tb.
+  //   Same-batch placement is always acceptable (γ-BOF relaxation).
+  if (batch_order_fairness_) {
+    // Compute local batch ordering without marking anything committed yet.
+    auto local_batches = proposal_manager_->ComputeBatchOrderingReadOnly(
+        -1, std::numeric_limits<int64_t>::max());
+
+    // Build txn → batch-index maps for both sides.
+    std::unordered_map<std::string, int> local_idx, proposal_idx;
+    for (int bi = 0; bi < static_cast<int>(local_batches.size()); ++bi)
+      for (const auto& h : local_batches[bi])
+        local_idx[h] = bi;
+
+    for (int bi = 0; bi < proposal->batch_groups_size(); ++bi)
+      for (const auto& h : proposal->batch_groups(bi).txn_hashes())
+        proposal_idx[h] = bi;
+
+    // Check ordering consistency for every pair known to both sides.
+    bool order_ok = true;
+    for (const auto& [ta, pa] : proposal_idx) {
+      if (local_idx.count(ta) == 0) continue;
+      for (const auto& [tb, pb] : proposal_idx) {
+        if (tb <= ta) continue;  // visit each unordered pair once
+        if (local_idx.count(tb) == 0) continue;
+        int la = local_idx.at(ta), lb = local_idx.at(tb);
+        // Proposal says ta strictly before tb, but local says tb strictly before ta.
+        if (pa < pb && la > lb) { order_ok = false; break; }
+        // Proposal says tb strictly before ta, but local says ta strictly before tb.
+        if (pb < pa && lb > la) { order_ok = false; break; }
+      }
+      if (!order_ok) break;
+    }
+
+    if (!order_ok) {
+      LOG(ERROR) << "BOF payload validation: batch ordering contradicts local "
+                 << "dependency graph for slot " << slot_id << " — rejecting";
+      return false;
+    }
+
+    // Soft set-equality check (mirrors the OL check): log discrepancies that
+    // arise from ordering indicators still in transit, but do not hard-reject,
+    // since a strict check would require all indicators to have propagated.
+    std::set<std::string> proposal_set, local_set;
+    for (const auto& [h, _] : proposal_idx) proposal_set.insert(h);
+    for (const auto& [h, _] : local_idx)   local_set.insert(h);
+    if (proposal_set != local_set) {
+      LOG(ERROR) << "BOF payload validation: proposal set (" << proposal_set.size()
+                 << " txns) != local set (" << local_set.size()
+                 << " txns) for slot " << slot_id
+                 << " — accepting (ordering indicators may still be in transit)";
     }
   }
 

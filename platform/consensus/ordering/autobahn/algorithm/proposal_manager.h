@@ -117,8 +117,15 @@ class ProposalManager {
   // Build the batch-order-fair ordering for transactions in the execution window.
   // Uses the dependency graph: edge t_a → t_b exists if f+1 replicas observed
   // t_a before t_b. Transactions in the same SCC form a batch (unordered).
-  // Returns batches in topological order.
+  // Returns batches in topological order. Marks returned transactions as
+  // committed in bof_committed_txns_ (so they are excluded from future calls).
   std::vector<std::vector<std::string>> GetBatchOrderedTransactions(
+      int64_t tau_prev, int64_t tau_current);
+
+  // Read-only variant: same computation as GetBatchOrderedTransactions but does
+  // NOT mark transactions as committed. Used by replicas to validate a leader's
+  // BOF proposal payload (Algorithm 3) without mutating state prematurely.
+  std::vector<std::vector<std::string>> ComputeBatchOrderingReadOnly(
       int64_t tau_prev, int64_t tau_current);
 
   // Set whether batch-order fairness mode is enabled.
@@ -162,6 +169,11 @@ class ProposalManager {
 
  private:
   void UpdateLastSign(Block * block);
+
+  // Returns candidate transactions for BOF batch computation: those in the
+  // window (tau_prev, tau_current] that are not yet in bof_committed_txns_.
+  // Used by both GetBatchOrderedTransactions and ComputeBatchOrderingReadOnly.
+  std::vector<std::string> CollectBofCandidates(int64_t tau_prev, int64_t tau_current);
 
  private:
   int32_t id_;

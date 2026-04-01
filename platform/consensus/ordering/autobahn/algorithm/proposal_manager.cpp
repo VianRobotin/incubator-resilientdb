@@ -672,155 +672,147 @@ void ProposalManager::AddRelativeOrdering(const RelativeOrdering& ordering) {
   }
 }
 
-// Build batch-ordered transaction groups using the dependency graph.
-//
-// Algorithm:
-// 1. For all transaction pairs in the execution window, build a directed graph:
-//    edge t_a → t_b if f+1 replicas observed t_a before t_b
-// 2. Find strongly connected components (SCCs) — transactions in the same SCC
-//    have no clear majority ordering and form a batch
-// 3. Topologically sort the SCCs to produce the final batch order
-std::vector<std::vector<std::string>> ProposalManager::GetBatchOrderedTransactions(
-    int64_t tau_prev, int64_t tau_current) {
+// ============================================================
+// BOF core computation (shared by GetBatchOrderedTransactions
+// and ComputeBatchOrderingReadOnly)
+// ============================================================
 
-  // Step 1: Get candidate transactions in the execution window
-  // (reuse the same windowing logic as ordering linearizability)
-  std::vector<std::string> candidates;
-  {
-    std::unique_lock<std::mutex> lk(ordering_mutex_);
-    for (const auto& entry : local_ordering_keys_) {
-      int64_t key = entry.second;
-      if (key > tau_prev && key <= tau_current) {
-        std::unique_lock<std::mutex> blk(bof_mutex_);
-        if (bof_committed_txns_.count(entry.first) == 0) {
-          candidates.push_back(entry.first);
-        }
-      }
-    }
-  }
+// Ordered-map copy of pairwise precedence counts.  std::map<pair<string,string>>
+// works without a custom hasher and avoids exposing the private PairHash type.
+using PairMap = std::map<std::pair<std::string, std::string>, int>;
 
-  if (candidates.empty()) {
-    return {};
-  }
+// ComputeBatchOrderingImpl: pure dependency-graph computation with no side
+// effects.  Candidates must already be filtered for the desired window and
+// must not include already-committed transactions.
+static std::vector<std::vector<std::string>> ComputeBatchOrderingImpl(
+    const std::vector<std::string>& candidates,
+    const PairMap& precedes_count,
+    float bof_gamma, int f) {
 
-  // Step 2: Build adjacency list for the dependency graph
-  // Edge t_a → t_b means t_a must be ordered before t_b (f+1 replicas saw a before b)
-  std::map<std::string, int> idx;
-  for (size_t i = 0; i < candidates.size(); ++i) {
-    idx[candidates[i]] = i;
-  }
+  if (candidates.empty()) return {};
+
   int n = candidates.size();
   std::vector<std::vector<int>> adj(n), radj(n);
+  int theta = static_cast<int>(std::ceil(bof_gamma * (f + 1)));
 
-  {
-    std::unique_lock<std::mutex> lk(bof_mutex_);
-    for (size_t i = 0; i < candidates.size(); ++i) {
-      for (size_t j = i + 1; j < candidates.size(); ++j) {
-        const auto& a = candidates[i];
-        const auto& b = candidates[j];
-        int a_before_b = 0, b_before_a = 0;
-        auto it_ab = precedes_count_.find({a, b});
-        if (it_ab != precedes_count_.end()) a_before_b = it_ab->second;
-        auto it_ba = precedes_count_.find({b, a});
-        if (it_ba != precedes_count_.end()) b_before_a = it_ba->second;
+  for (int i = 0; i < n; ++i) {
+    for (int j = i + 1; j < n; ++j) {
+      const auto& a = candidates[i];
+      const auto& b = candidates[j];
+      int a_before_b = 0, b_before_a = 0;
+      auto it_ab = precedes_count.find({a, b});
+      if (it_ab != precedes_count.end()) a_before_b = it_ab->second;
+      auto it_ba = precedes_count.find({b, a});
+      if (it_ba != precedes_count.end()) b_before_a = it_ba->second;
 
-        // Algorithm 5, line 2: θ = ⌈γ(f+1)⌉
-        // Edge exists if θ replicas agree on the ordering direction.
-        int theta = static_cast<int>(std::ceil(bof_gamma_ * (f_ + 1)));
-        if (a_before_b >= theta) {
-          adj[i].push_back(j);
-          radj[j].push_back(i);
-        }
-        if (b_before_a >= theta) {
-          adj[j].push_back(i);
-          radj[i].push_back(j);
-        }
-      }
+      if (a_before_b >= theta) { adj[i].push_back(j); radj[j].push_back(i); }
+      if (b_before_a >= theta) { adj[j].push_back(i); radj[i].push_back(j); }
     }
   }
 
-  // Step 3: Kosaraju's algorithm to find SCCs
-  // First pass: compute finish order via DFS on forward graph
+  // Kosaraju's SCC (Algorithm 6)
   std::vector<bool> visited(n, false);
   std::vector<int> finish_order;
   std::function<void(int)> dfs1 = [&](int u) {
     visited[u] = true;
-    for (int v : adj[u]) {
-      if (!visited[v]) dfs1(v);
-    }
+    for (int v : adj[u]) if (!visited[v]) dfs1(v);
     finish_order.push_back(u);
   };
-  for (int i = 0; i < n; ++i) {
-    if (!visited[i]) dfs1(i);
-  }
+  for (int i = 0; i < n; ++i) if (!visited[i]) dfs1(i);
 
-  // Second pass: DFS on reverse graph in reverse finish order
   std::vector<int> comp(n, -1);
   int num_comp = 0;
-  std::function<void(int, int)> dfs2 = [&](int u, int c) {
+  std::function<void(int,int)> dfs2 = [&](int u, int c) {
     comp[u] = c;
-    for (int v : radj[u]) {
-      if (comp[v] == -1) dfs2(v, c);
-    }
+    for (int v : radj[u]) if (comp[v] == -1) dfs2(v, c);
   };
   for (int i = n - 1; i >= 0; --i) {
-    int u = finish_order[i];
-    if (comp[u] == -1) {
-      dfs2(u, num_comp++);
-    }
+    if (comp[finish_order[i]] == -1) dfs2(finish_order[i], num_comp++);
   }
 
-  // Step 4: Build condensation graph (DAG of SCCs) and topologically sort
-  // Collect SCCs
+  // Collect SCCs; deterministic intra-batch order by hash (Algorithm 6, line 6)
   std::vector<std::vector<std::string>> sccs(num_comp);
-  for (int i = 0; i < n; ++i) {
-    sccs[comp[i]].push_back(candidates[i]);
-  }
-
-  // Sort transactions within each SCC by hash for determinism
-  for (auto& scc : sccs) {
-    std::sort(scc.begin(), scc.end());
-  }
-
-  // Build condensation DAG edges
-  std::vector<std::set<int>> cond_adj(num_comp);
-  std::vector<int> in_degree(num_comp, 0);
-  for (int u = 0; u < n; ++u) {
-    for (int v : adj[u]) {
-      if (comp[u] != comp[v]) {
-        if (cond_adj[comp[u]].insert(comp[v]).second) {
-          in_degree[comp[v]]++;
-        }
-      }
-    }
-  }
+  for (int i = 0; i < n; ++i) sccs[comp[i]].push_back(candidates[i]);
+  for (auto& scc : sccs) std::sort(scc.begin(), scc.end());
 
   // Topological sort of condensation DAG (Kahn's algorithm)
+  std::vector<std::set<int>> cond_adj(num_comp);
+  std::vector<int> in_degree(num_comp, 0);
+  for (int u = 0; u < n; ++u)
+    for (int v : adj[u])
+      if (comp[u] != comp[v] && cond_adj[comp[u]].insert(comp[v]).second)
+        in_degree[comp[v]]++;
+
   std::queue<int> q;
-  for (int i = 0; i < num_comp; ++i) {
-    if (in_degree[i] == 0) q.push(i);
-  }
+  for (int i = 0; i < num_comp; ++i) if (in_degree[i] == 0) q.push(i);
 
   std::vector<std::vector<std::string>> result;
   while (!q.empty()) {
     int u = q.front(); q.pop();
     result.push_back(sccs[u]);
-    for (int v : cond_adj[u]) {
-      if (--in_degree[v] == 0) q.push(v);
+    for (int v : cond_adj[u]) if (--in_degree[v] == 0) q.push(v);
+  }
+  return result;
+}
+
+// Collect candidate transactions (window filter + not-yet-committed).
+// Caller holds neither ordering_mutex_ nor bof_mutex_.
+std::vector<std::string> ProposalManager::CollectBofCandidates(
+    int64_t tau_prev, int64_t tau_current) {
+  std::vector<std::string> candidates;
+  std::unique_lock<std::mutex> lk(ordering_mutex_);
+  for (const auto& entry : local_ordering_keys_) {
+    int64_t key = entry.second;
+    if (key > tau_prev && key <= tau_current) {
+      std::unique_lock<std::mutex> blk(bof_mutex_);
+      if (bof_committed_txns_.count(entry.first) == 0)
+        candidates.push_back(entry.first);
     }
   }
+  return candidates;
+}
 
-  // Mark these transactions as committed in BOF
+// Algorithm 5 + 6: build batch-ordered groups and mark committed.
+std::vector<std::vector<std::string>> ProposalManager::GetBatchOrderedTransactions(
+    int64_t tau_prev, int64_t tau_current) {
+
+  auto candidates = CollectBofCandidates(tau_prev, tau_current);
+  if (candidates.empty()) return {};
+
+  PairMap counts_copy;
   {
     std::unique_lock<std::mutex> lk(bof_mutex_);
-    for (const auto& batch : result) {
-      for (const auto& h : batch) {
-        bof_committed_txns_.insert(h);
-      }
-    }
+    for (const auto& kv : precedes_count_) counts_copy[kv.first] = kv.second;
   }
 
+  auto result = ComputeBatchOrderingImpl(candidates, counts_copy, bof_gamma_, f_);
+
+  // Mark committed so they are excluded from future calls.
+  {
+    std::unique_lock<std::mutex> lk(bof_mutex_);
+    for (const auto& batch : result)
+      for (const auto& h : batch)
+        bof_committed_txns_.insert(h);
+  }
   return result;
+}
+
+// Read-only variant: same computation but does NOT mark transactions committed.
+// Used by replicas to validate a leader's BOF proposal (Algorithm 3) without
+// mutating bof_committed_txns_ prematurely.
+std::vector<std::vector<std::string>> ProposalManager::ComputeBatchOrderingReadOnly(
+    int64_t tau_prev, int64_t tau_current) {
+
+  auto candidates = CollectBofCandidates(tau_prev, tau_current);
+  if (candidates.empty()) return {};
+
+  PairMap counts_copy;
+  {
+    std::unique_lock<std::mutex> lk(bof_mutex_);
+    for (const auto& kv : precedes_count_) counts_copy[kv.first] = kv.second;
+  }
+
+  return ComputeBatchOrderingImpl(candidates, counts_copy, bof_gamma_, f_);
 }
 
 }  // namespace autobahn
