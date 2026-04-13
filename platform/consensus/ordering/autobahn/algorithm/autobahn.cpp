@@ -959,6 +959,18 @@ void AutoBahn::Commit(std::unique_ptr<Proposal> proposal) {
     global_stats_->ConsumeTransactions(static_cast<int>(txn_by_hash.size()));
   }
 
+  // Consensus latency: time from when the leader created the proposal to
+  // when it was committed. Feeds into the 'round latency' stats line so
+  // parse_log can extract average consensus latency per interval.
+  if (proposal->propose_time() > 0) {
+    uint64_t consensus_latency_us = GetCurrentTime() - proposal->propose_time();
+    global_stats_->AddRoundLatency(consensus_latency_us);
+    // Also emit a structured line for per-slot parsing.
+    LOG(ERROR) << "consensus commit slot:" << slot_id
+               << " txns:" << txn_by_hash.size()
+               << " consensus_latency_us:" << consensus_latency_us;
+  }
+
   // Rotate leader (round-robin, as in Sync HotStuff)
   int view = (slot_id + 1) % total_num_;
   if(view == 0) view = total_num_;

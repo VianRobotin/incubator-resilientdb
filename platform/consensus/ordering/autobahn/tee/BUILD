@@ -17,7 +17,7 @@ cc_library(
     hdrs = ["tee_host.h"],
     deps = [":tee_host_prebuilt"],
     linkopts = [
-        "-L/opt/intel/sgxsdk/lib64",
+        "-L/var/scratch/vrobotin/sgxsdk/lib64",
         "-lsgx_urts_sim",
         "-lssl",
         "-lcrypto",

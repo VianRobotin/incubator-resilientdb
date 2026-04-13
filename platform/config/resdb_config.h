@@ -111,6 +111,7 @@ class ResDBConfig {
 
   uint32_t ClientBatchNum() const;
   void SetClientBatchNum(uint32_t num);
+  uint32_t GetTargetInputTps() const;
 
   uint32_t GetWorkerNum() const;
   uint32_t GetInputWorkerNum() const;

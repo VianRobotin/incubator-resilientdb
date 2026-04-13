@@ -5,6 +5,14 @@ load("//:repositories.bzl", "nexres_repositories")
 
 nexres_repositories()
 
+# --- Skylib (REQUIRED) ---
+http_archive(
+    name = "bazel_skylib",
+    urls = ["https://github.com/bazelbuild/bazel-skylib/archive/refs/tags/1.4.2.tar.gz"],
+    strip_prefix = "bazel-skylib-1.4.2",
+)
+
+# --- rules_foreign_cc ---
 http_archive(
     name = "rules_foreign_cc",
     sha256 = "69023642d5781c68911beda769f91fcbc8ca48711db935a75da7f6536b65047f",
@@ -13,9 +21,9 @@ http_archive(
 )
 
 load("@rules_foreign_cc//foreign_cc:repositories.bzl", "rules_foreign_cc_dependencies")
-
 rules_foreign_cc_dependencies()
 
+# --- rules_proto ---
 http_archive(
     name = "rules_proto",
     sha256 = "66bfdf8782796239d3875d37e7de19b1d94301e8972b3cbd2446b332429b4df1",
@@ -27,11 +35,10 @@ http_archive(
 )
 
 load("@rules_proto//proto:repositories.bzl", "rules_proto_dependencies", "rules_proto_toolchains")
-
 rules_proto_dependencies()
-
 rules_proto_toolchains()
 
+# --- rules_python (FIXED ORDER) ---
 http_archive(
     name = "rules_python",
     sha256 = "ffc7b877c95413c82bfd5482c017edcf759a6250d8b24e82f41f3c8b8d9e287e",
@@ -39,19 +46,20 @@ http_archive(
     url = "https://github.com/bazelbuild/rules_python/releases/download/0.19.0/rules_python-0.19.0.tar.gz",
 )
 
+load("@rules_python//python:repositories.bzl", "python_register_toolchains")
+python_register_toolchains(
+    name = "python3",
+    python_version = "3.8",
+)
+
 load("@rules_python//python:pip.bzl", "pip_install")
-load("@rules_proto//proto:repositories.bzl", "rules_proto_dependencies", "rules_proto_toolchains")
 
-rules_proto_dependencies()
-
-rules_proto_toolchains()
-
+# --- proto grpc ---
 load("@rules_proto_grpc//:repositories.bzl", "rules_proto_grpc_repos", "rules_proto_grpc_toolchains")
-
 rules_proto_grpc_toolchains()
-
 rules_proto_grpc_repos()
 
+# --- logging / testing ---
 bind(
     name = "gtest",
     actual = "@com_google_googletest//:gtest",
@@ -69,6 +77,7 @@ http_archive(
     urls = ["https://github.com/google/glog/archive/v0.5.0.zip"],
 )
 
+# --- protobuf ---
 load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 
 git_repository(
@@ -78,13 +87,9 @@ git_repository(
 )
 
 load("@com_google_protobuf//:protobuf_deps.bzl", "protobuf_deps")
-
 protobuf_deps()
 
-all_content = """filegroup(name = "all_srcs", srcs = glob(["**"]), visibility = ["//visibility:public"])"""
-
-# buildifier is written in Go and hence needs rules_go to be built.
-# See https://github.com/bazelbuild/rules_go for the up to date setup instructions.
+# --- Go rules ---
 http_archive(
     name = "io_bazel_rules_go",
     sha256 = "d6b2513456fe2229811da7eb67a444be7785f5323c6708b38d851d2b51e54d83",
@@ -94,14 +99,11 @@ http_archive(
     ],
 )
 
-load("@io_bazel_rules_go//go:deps.bzl", "go_rules_dependencies")
-
+load("@io_bazel_rules_go//go:deps.bzl", "go_rules_dependencies", "go_register_toolchains")
 go_rules_dependencies()
-
-load("@io_bazel_rules_go//go:deps.bzl", "go_register_toolchains")
-
 go_register_toolchains(version = "1.19.5")
 
+# --- gazelle ---
 http_archive(
     name = "bazel_gazelle",
     sha256 = "de69a09dc70417580aabf20a28619bb3ef60d038470c7cf8442fafcf627c21cb",
@@ -112,23 +114,21 @@ http_archive(
 )
 
 load("@bazel_gazelle//:deps.bzl", "gazelle_dependencies")
-
 gazelle_dependencies()
 
+# --- buildtools ---
 http_archive(
     name = "com_github_bazelbuild_buildtools",
     sha256 = "518b2ce90b1f8ad7c9a319ca84fd7de9a0979dd91e6d21648906ea68faa4f37a",
     strip_prefix = "buildtools-5.0.1",
-    urls = [
-        "https://github.com/bazelbuild/buildtools/archive/refs/tags/5.0.1.zip",
-    ],
+    urls = ["https://github.com/bazelbuild/buildtools/archive/refs/tags/5.0.1.zip"],
 )
 
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+# --- boost ---
 load("@com_github_nelhage_rules_boost//:boost/boost.bzl", "boost_deps")
-
 boost_deps()
 
+# --- compression libs ---
 http_archive(
     name = "net_zlib_zlib",
     build_file = "@com_resdb_nexres//third_party:z.BUILD",
@@ -139,8 +139,6 @@ http_archive(
         "https://storage.googleapis.com/bazel-mirror/zlib.net/zlib-1.2.12.tar.gz",
     ],
 )
-
-#prometheus cpp client library
 
 http_archive(
     name = "com_google_leveldb",
@@ -183,7 +181,7 @@ bind(
 
 http_archive(
     name = "com_facebook_zstd",
-    build_file_content = all_content,
+    build_file_content = """filegroup(name = "all_srcs", srcs = glob(["**"]), visibility = ["//visibility:public"])""",
     strip_prefix = "zstd-1.5.2",
     url = "https://github.com/facebook/zstd/archive/refs/tags/v1.5.2.zip",
 )
@@ -196,6 +194,7 @@ http_archive(
     url = "https://github.com/facebook/rocksdb/archive/refs/tags/v7.2.2.zip",
 )
 
+# --- pybind11 ---
 http_archive(
     name = "pybind11_bazel",
     strip_prefix = "pybind11_bazel-2.11.1.bzl.1",
@@ -211,15 +210,15 @@ http_archive(
 )
 
 load("@pybind11_bazel//:python_configure.bzl", "python_configure")
-
 python_configure(
     name = "local_config_python",
     python_version = "3",
 )
 
+# --- json ---
 http_archive(
     name = "nlohmann_json",
-    build_file = "@com_resdb_nexres//third_party:json.BUILD",  # see below
+    build_file = "@com_resdb_nexres//third_party:json.BUILD",
     sha256 = "4cf0df69731494668bdd6460ed8cb269b68de9c19ad8c27abc24cd72605b2d5b",
     strip_prefix = "json-3.9.1",
     urls = ["https://github.com/nlohmann/json/archive/v3.9.1.tar.gz"],

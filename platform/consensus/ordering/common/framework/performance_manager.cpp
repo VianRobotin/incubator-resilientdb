@@ -193,15 +193,22 @@ void PerformanceManager::SendResponseToClient(
 
 // =================== request ========================
 int PerformanceManager::BatchProposeMsg() {
+  uint32_t target_tps = config_.GetTargetInputTps();
+  // batch_interval_us: how long to wait between sends to hit target_tps.
+  // With clientBatchNum=1 each DoBatch sends 1 txn, so interval = 1s / target_tps.
+  uint64_t batch_interval_us = (target_tps > 0) ? (1000000u / target_tps) : 0;
   LOG(WARNING) << "batch wait time:" << config_.ClientBatchWaitTimeMS()
                << " batch num:" << config_.ClientBatchNum()
-               << " max txn:" << config_.GetMaxProcessTxn();
+               << " max txn:" << config_.GetMaxProcessTxn()
+               << " target_input_tps:" << target_tps
+               << " batch_interval_us:" << batch_interval_us;
+
   std::vector<std::unique_ptr<QueueItem>> batch_req;
   eval_ready_future_.get();
   bool start = false;
+  uint64_t next_send_us = GetCurrentTime();
   while (!stop_) {
     if (send_num_ > config_.GetMaxProcessTxn()) {
-      // LOG(ERROR)<<"wait send num:"<<send_num_;
       usleep(100000);
       continue;
     }
@@ -220,10 +227,19 @@ int PerformanceManager::BatchProposeMsg() {
       }
     }
     start = true;
-    for(int i = 0; i < 1;++i){
-      int ret = DoBatch(batch_req);
-    }
+    DoBatch(batch_req);
     batch_req.clear();
+
+    if (batch_interval_us > 0) {
+      next_send_us += batch_interval_us;
+      uint64_t now = GetCurrentTime();
+      if (now < next_send_us) {
+        usleep(next_send_us - now);
+      } else {
+        // We're behind schedule; reset to avoid a burst of catch-up sends.
+        next_send_us = now;
+      }
+    }
   }
   return 0;
 }

@@ -24,6 +24,7 @@
  */
 
 #include "platform/consensus/ordering/autobahn/framework/consensus.h"
+#include "platform/consensus/ordering/autobahn/framework/autobahn_performance_manager.h"
 
 #include <glog/logging.h>
 #include <unistd.h>
@@ -43,15 +44,27 @@ Consensus::Consensus(const ResDBConfig& config,
   // f = (n-1)/2 (tolerates minority Byzantine faults under synchrony).
   int f = (total_replicas - 1) / 2;
 
+  start_ = 0;
+
+  bool is_client = config_.GetPublicKeyCertificateInfo()
+                       .public_key()
+                       .public_key_info()
+                       .type() == CertificateKeyInfo::CLIENT;
+
+  // CLIENT cert nodes use AutobahnPerformanceManager, which sends transactions
+  // round-robin across all replica lanes (correct for a multi-lane DAG protocol).
+  // Must be set BEFORE Init() so Init() skips creating the base PerformanceManager.
+  // If Init() runs first it creates a base PerformanceManager whose constructor
+  // spawns BatchProposeMsg (blocking on eval_ready_future_), then SetPerformanceManager
+  // destroys it, which joins the blocked thread — deadlock.
+  if (is_client) {
+    SetPerformanceManager(std::make_unique<AutobahnPerformanceManager>(
+        config_, GetBroadCastClient(), GetSignatureVerifier()));
+  }
+
   Init();
 
-  start_ = 0;
-  local_txn_gen_started_ = false;
-
-  if (config_.GetPublicKeyCertificateInfo()
-          .public_key()
-          .public_key_info()
-          .type() != CertificateKeyInfo::CLIENT) {
+  if (!is_client) {
     bool batch_order_fairness = config_.GetConfigData().batch_order_fairness();
     // γ ∈ (0.5, 1.0] for BOF; default 1.0 (strictest, works for n=2f+1).
     float bof_gamma = config_.GetConfigData().has_bof_gamma()
@@ -59,22 +72,11 @@ Consensus::Consensus(const ResDBConfig& config,
                           : 1.0f;
     autobahn_ = std::make_unique<AutoBahn>(
         config_.GetSelfInfo().id(), f,
-                                   total_replicas, config_.GetConfigData().block_size(),
-                                   GetSignatureVerifier(),
-                                   batch_order_fairness, bof_gamma);
+        total_replicas, config_.GetConfigData().block_size(),
+        GetSignatureVerifier(),
+        batch_order_fairness, bof_gamma);
 
     InitProtocol(autobahn_.get());
-
-    // Auto-start local transaction generation after a delay to allow
-    // peer discovery. In performance mode, each replica generates its own
-    // transactions for its Autobahn lane.
-    if (config_.IsPerformanceRunning()) {
-      std::thread([this]() {
-        LOG(ERROR) << "Waiting for peer discovery before auto-starting txn generation...";
-        sleep(10);  // Wait for heartbeat/peer discovery
-        StartLocalTxnGeneration();
-      }).detach();
-    }
   }
 }
 
@@ -87,9 +89,6 @@ int Consensus::ProcessCustomConsensus(std::unique_ptr<Request> request) {
       LOG(ERROR) << "parse block fail";
       return -1;
     }
-    // When we see blocks from other replicas in performance mode,
-    // start generating our own transactions for our lane.
-    StartLocalTxnGeneration();
     autobahn_->ReceiveBlock(std::move(block));
     return 0;
   }
@@ -175,50 +174,8 @@ int Consensus::ProcessCustomConsensus(std::unique_ptr<Request> request) {
   return 0;
 }
 
-void Consensus::StartLocalTxnGeneration() {
-  if (!config_.IsPerformanceRunning() || autobahn_ == nullptr) return;
-  if (local_txn_gen_started_.exchange(true)) return;
-
-  LOG(ERROR) << "Starting local transaction generation for replica "
-             << config_.GetSelfInfo().id();
-  local_txn_gen_thread_ = std::thread([this]() {
-    int count = 0;
-    int batch_size = config_.GetConfigData().block_size();
-    if (batch_size <= 0) batch_size = 100;
-    // Continuous generation: keep producing transactions until stopped.
-    // This ensures steady-state throughput for benchmarking.
-    while (!is_stop_) {
-      auto txn = std::make_unique<Transaction>();
-      KVRequest kv_req;
-      kv_req.set_cmd(KVRequest::SET);
-      kv_req.set_key(std::to_string(config_.GetSelfInfo().id()) + "_" + std::to_string(count));
-      kv_req.set_value("perf_data");
-      std::string data;
-      kv_req.SerializeToString(&data);
-      txn->set_data(data);
-      txn->set_create_time(GetCurrentTime());
-      // Each transaction MUST have a unique hash for fair ordering.
-      // The TEE timestamping uses txn.hash() to deduplicate — without
-      // unique hashes, all transactions are treated as the same one.
-      std::string unique_id = std::to_string(config_.GetSelfInfo().id())
-          + "_" + std::to_string(count) + "_" + std::to_string(GetCurrentTime());
-      txn->set_hash(SignatureVerifier::CalculateHash(unique_id));
-      autobahn_->ReceiveTransaction(std::move(txn));
-      count++;
-      // Spread transactions over time to simulate continuous arrival.
-      // This ensures fair ordering distributes txns across multiple
-      // consensus slots rather than clustering in a single window.
-      if (count % batch_size == 0) {
-        usleep(500000);  // 500ms pause between batches
-      }
-    }
-    LOG(ERROR) << "Local transaction generation stopped after: " << count << " txns";
-  });
-}
 
 int Consensus::ProcessNewTransaction(std::unique_ptr<Request> request) {
-  StartLocalTxnGeneration();
-
   std::unique_ptr<Transaction> txn = std::make_unique<Transaction>();
   txn->set_data(request->data());
   txn->set_hash(request->hash());

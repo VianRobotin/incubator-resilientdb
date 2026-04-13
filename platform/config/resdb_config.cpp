@@ -229,6 +229,10 @@ void ResDBConfig::SetClientBatchNum(uint32_t num) {
   config_data_.set_client_batch_num(num);
 }
 
+uint32_t ResDBConfig::GetTargetInputTps() const {
+  return config_data_.target_input_tps();
+}
+
 uint32_t ResDBConfig::GetWorkerNum() const { return config_data_.worker_num(); }
 
 uint32_t ResDBConfig::GetInputWorkerNum() const {

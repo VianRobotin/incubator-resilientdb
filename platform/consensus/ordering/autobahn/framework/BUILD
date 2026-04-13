@@ -3,7 +3,7 @@ package(default_visibility = ["//visibility:private"])
 cc_library(
     name = "consensus",
     srcs = ["consensus.cpp"],
-    hdrs = ["consensus.h"],
+    hdrs = ["consensus.h", "autobahn_performance_manager.h"],
     visibility = [
         "//visibility:public",
     ],

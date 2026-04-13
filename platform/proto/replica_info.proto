@@ -49,6 +49,7 @@ message ResConfigData{
   optional int32 block_size = 24;
   optional bool batch_order_fairness = 25;  // true = batch-order fairness, false/default = ordering linearizability
   optional float bof_gamma = 26;  // γ parameter for BOF edge threshold θ=⌈γ(f+1)⌉, default 1.0
+  optional int32 target_input_tps = 27;  // per-client target TPS; 0 = unlimited (max throughput)
 }
 
 message ReplicaStates {
