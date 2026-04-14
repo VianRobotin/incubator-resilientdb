@@ -173,7 +173,7 @@ def generate_certs(cert_dir: Path, replica_ips: List[str], client_ips: List[str]
 # ---------------------------------------------------------------------------
 
 def write_server_config(config_path: Path, node_ips: List[str], mode: str, block_size: int,
-                        target_input_tps_per_client: int = 0):
+                        target_input_tps_per_client: int = 0, runtime: int = 60):
     """Write server.config shared by all nodes (replicas and clients).
 
     target_input_tps_per_client: per-client TPS limit (0 = unlimited).
@@ -188,13 +188,17 @@ def write_server_config(config_path: Path, node_ips: List[str], mode: str, block
     # clientBatchNum=1 + target_input_tps gives precise TPS control.
     # Without rate control, use larger batches for max throughput.
     client_batch_num = 1 if target_input_tps_per_client > 0 else 400
+    # max_process_txn must be large enough so the client doesn't exhaust its
+    # transaction budget before the experiment ends.  At 15k TPS for 60s we
+    # need ~900k; use target * runtime * 3 with a floor of 2 000 000.
+    max_txn = max(target_input_tps_per_client * runtime * 3, 2_000_000)
     config = {
         "region": [{"replicaInfo": replica_info}],
         "clientBatchNum": client_batch_num,
         "enable_viewchange": False,
         "recovery_enabled": False,
         "max_client_complaint_num": 10,
-        "max_process_txn": 4096,
+        "max_process_txn": max_txn,
         "worker_num": 10,
         "input_worker_num": 1,
         "output_worker_num": 5,
@@ -249,23 +253,26 @@ def trimmed_mean(values: list, drop: int = 1) -> float:
     return sum(v) / len(v) if v else 0.0
 
 
-def parse_log(log_file: Path, warmup_secs: int, runtime: int) -> Tuple[float, float, float, int, int]:
+TXN_SIZE_BYTES = 128  # matches gsegalin's fixed 128-byte transaction size
+
+
+def parse_log(log_file: Path, warmup_secs: int, runtime: int) -> Tuple[float, float, float, float, int]:
     """
-    Returns (tps, consensus_tps, consensus_latency_s, slots_committed, txns_committed).
+    Returns (e2e_tps, e2e_bps, consensus_tps, consensus_latency_s, slots_committed).
 
     All metrics are derived from structured "consensus commit slot:N txns:M consensus_latency_us:X"
     lines that Autobahn emits once per committed slot.  Each such line carries a glog timestamp
     which we use to apply a time-based warmup filter (avoids the too-aggressive position-based
     skip that left only 1–5 samples for small n).
 
-    TPS              — sum(txns in measurement window) / measurement_duration
+    e2e_tps          — sum(txns in measurement window) / measurement_duration
+    e2e_bps          — e2e_tps * TXN_SIZE_BYTES
     Consensus TPS    — count(slots in measurement window) / measurement_duration
     Consensus latency — trimmed mean of per-slot consensus_latency_us (→ seconds)
-    txns_committed   — sum of txns across ALL committed slots (full run)
     slots_committed  — total number of committed slots (full run)
     """
     if not log_file.exists():
-        return 0.0, 0.0, 0.0, 0, 0
+        return 0.0, 0.0, 0.0, 0.0, 0
 
     text = log_file.read_text(errors="replace")
 
@@ -288,11 +295,9 @@ def parse_log(log_file: Path, warmup_secs: int, runtime: int) -> Tuple[float, fl
         commits.append((dt, slot, txns, lat_us))
 
     if not commits:
-        return 0.0, 0.0, 0.0, 0, 0
+        return 0.0, 0.0, 0.0, 0.0, 0
 
-    # Full-run totals (used for txns_committed / slots_committed)
     slots_committed = len(commits)
-    txns_committed  = sum(c[2] for c in commits)
 
     # Time-based warmup filter: skip slots committed within the first warmup_secs
     t0 = commits[0][0]
@@ -316,13 +321,14 @@ def parse_log(log_file: Path, warmup_secs: int, runtime: int) -> Tuple[float, fl
         # Single slot: estimate duration from its latency
         meas_duration = meas_commits[0][3] / 1_000_000 or 2.0
 
-    tps           = sum(c[2] for c in meas_commits) / meas_duration
+    e2e_tps       = sum(c[2] for c in meas_commits) / meas_duration
+    e2e_bps       = e2e_tps * TXN_SIZE_BYTES
     consensus_tps = len(meas_commits) / meas_duration
 
     lat_us_values    = [c[3] for c in meas_commits]
     consensus_latency_s = trimmed_mean(lat_us_values) / 1_000_000 if lat_us_values else 0.0
 
-    return round(tps, 1), round(consensus_tps, 3), round(consensus_latency_s, 4), slots_committed, txns_committed
+    return round(e2e_tps, 1), round(e2e_bps, 1), round(consensus_tps, 3), round(consensus_latency_s, 4), slots_committed
 
 
 
@@ -339,9 +345,9 @@ def run_experiment(
     dry_run: bool,
     num_clients: int = 1,
     target_tps: int = 0,
-) -> Tuple[float, float, float, int, int]:
+) -> Tuple[float, float, float, float, int]:
     """
-    Reserve machines, run one experiment, return (tps, con_tps, con_lat, slots, txns).
+    Reserve machines, run one experiment, return (e2e_tps, e2e_bps, con_tps, con_lat, slots).
     target_tps: total target TPS across all clients (0 = unlimited).
     Reservation is released after the run completes (or on error).
     """
@@ -365,7 +371,7 @@ def run_experiment(
         print(f"[DRY-RUN] target_tps={target_tps}  per_client_tps={per_client_tps}")
         print(f"[DRY-RUN] Would generate certs, write server.config, start replicas and clients")
         print(f"[DRY-RUN] Would wait {runtime}s, kill all nodes, parse logs")
-        return 0.0, 0.0, 0.0, 0, 0
+        return 0.0, 0.0, 0.0, 0.0, 0
 
     # ---- Reserve machines ----
     reservation_id = pm.create_reservation(total_machines, duration_str)
@@ -407,7 +413,7 @@ def run_experiment(
 
         # ---- Write server.config (replica topology only) ----
         config_path = runtime_dir / "server.config"
-        write_server_config(config_path, replica_ips, mode, block_size, per_client_tps)
+        write_server_config(config_path, replica_ips, mode, block_size, per_client_tps, runtime)
         print(f"Config written: {config_path}  (per_client_tps={per_client_tps})")
 
         # ---- Write per-client trigger configs for kv_service_tools ----
@@ -527,21 +533,21 @@ def run_experiment(
 
         # ---- Parse replica logs for throughput and consensus metrics ----
         print("Parsing logs...")
-        best_tps = 0.0
+        best_e2e_tps = 0.0
+        best_e2e_bps = 0.0
         best_con_tps = 0.0
         best_con_lat = 0.0
         best_slots = 0
-        best_txns = 0
         for i in range(1, num_replicas + 1):
             log_file = log_dir / f"server_{i}.log"
-            tps, con_tps, con_lat, slots, txns = parse_log(log_file, warmup, runtime)
-            print(f"  Replica {i}: TPS={tps}  con_TPS={con_tps}  con_lat={con_lat}s  slots={slots}  txns={txns}")
-            if tps > best_tps:
-                best_tps, best_con_tps, best_con_lat = tps, con_tps, con_lat
-                best_slots, best_txns = slots, txns
+            e2e_tps, e2e_bps, con_tps, con_lat, slots = parse_log(log_file, warmup, runtime)
+            print(f"  Replica {i}: e2e_TPS={e2e_tps}  e2e_BPS={e2e_bps}  con_TPS={con_tps}  con_lat={con_lat}s  slots={slots}")
+            if e2e_tps > best_e2e_tps:
+                best_e2e_tps, best_e2e_bps, best_con_tps, best_con_lat = e2e_tps, e2e_bps, con_tps, con_lat
+                best_slots = slots
 
-        print(f"=> Best: TPS={best_tps}  con_TPS={best_con_tps}  con_lat={best_con_lat}s")
-        return best_tps, best_con_tps, best_con_lat, best_slots, best_txns
+        print(f"=> Best: e2e_TPS={best_e2e_tps}  e2e_BPS={best_e2e_bps}  con_TPS={best_con_tps}  con_lat={best_con_lat}s")
+        return best_e2e_tps, best_e2e_bps, best_con_tps, best_con_lat, best_slots
 
     finally:
         try:
@@ -567,85 +573,104 @@ def append_csv(path: Path, row: str):
 
 
 # ---------------------------------------------------------------------------
-# Experiment suite
+# Experiment suite — mirrors gsegalin's Tilikum thesis experiments
 # ---------------------------------------------------------------------------
 
 BLOCK_SIZE = 100  # fixed block size for all runs
 
-def run_n_scaling(dry_run: bool):
-    """N-scaling: n=3/5/7 replicas, fixed block_size, modes=[ol,bof].
+# Per-N input rates from gsegalin's Tilikum n-scaling experiments.
+# These are the total tx/s sent by all clients combined.
+N_SCALING_INPUT_RATES = {
+    10: 15_000,
+    13: 13_000,
+    16: 10_000,
+    19:  8_018,
+    22:  7_018,
+    25:  5_000,
+}
 
-    Mirrors gsegalin's experiment structure:
-      - num_clients = num_replicas (one client machine per replica)
-      - target_tps fixed across all runs (split evenly across clients)
-      - repetitions per (n, mode) configuration for statistical validity
+RUNTIME     = 60   # matches gsegalin's ~60s execution time
+WARMUP      = 15
+REPETITIONS = 5    # matches gsegalin's >=5 runs per configuration
+NUM_CLIENTS = 1    # ResilientDB TPS is client-limited; target_input_tps controls rate
+
+
+def run_n_scaling(dry_run: bool):
+    """N-scaling: committee size N=10,13,16,19,22,25, modes=[ol,bof].
+
+    Mirrors gsegalin's experiment: local-0-1-0-1-{N}.txt
+      - Faults: 0
+      - Workers per node: 1 (collocated)
+      - Input rate: varies per N (see N_SCALING_INPUT_RATES)
+      - At least 5 runs per (N, mode) for statistical validity
     """
     csv_path = RESULTS_DIR / "n_scaling.csv"
-    init_csv(csv_path, "n,mode,rep,tps,consensus_tps,consensus_latency_s,slots_committed,txns_committed,target_tps,runtime_s")
+    init_csv(csv_path, "n,mode,rep,e2e_tps,e2e_bps,consensus_tps,consensus_latency_s,slots_committed")
     print("\n\n=== N-scaling experiment (OL vs BOF) ===")
 
-    runtime     = 60   # matches gsegalin's 60s runtime
-    warmup      = 15
-    repetitions = 5    # matches gsegalin's rs=5
-    target_tps  = 350  # matches gsegalin: 350 tx/s total, split across clients
-
-    for n in [3, 5, 7, 9, 11]:  # 2f+1 for f=1..5; gsegalin used 10,13,16,19,22,25
-        num_clients = n  # one client per replica, like gsegalin
+    for n in [10, 13, 16, 19, 22, 25]:
+        target_tps = N_SCALING_INPUT_RATES[n]
         for mode in ["ol", "bof"]:
-            for rep in range(1, repetitions + 1):
-                print(f"\n--- n={n}  mode={mode}  rep={rep}/{repetitions} ---")
-                tps, con_tps, con_lat, slots, txns = run_experiment(
+            for rep in range(1, REPETITIONS + 1):
+                print(f"\n--- n={n}  mode={mode}  rep={rep}/{REPETITIONS}  target_tps={target_tps} ---")
+                e2e_tps, e2e_bps, con_tps, con_lat, slots = run_experiment(
                     num_replicas=n,
                     mode=mode,
                     block_size=BLOCK_SIZE,
-                    runtime=runtime,
-                    warmup=warmup,
+                    runtime=RUNTIME,
+                    warmup=WARMUP,
                     dry_run=dry_run,
-                    num_clients=num_clients,
+                    num_clients=NUM_CLIENTS,
                     target_tps=target_tps,
                 )
                 append_csv(csv_path,
-                    f"{n},{mode},{rep},{tps},{con_tps},{con_lat},{slots},{txns},{target_tps},{runtime}")
+                    f"{n},{mode},{rep},{e2e_tps},{e2e_bps},{con_tps},{con_lat},{slots}")
                 if not dry_run:
                     time.sleep(10)
+
+
 
 
 # ---------------------------------------------------------------------------
 # Summary printer
 # ---------------------------------------------------------------------------
 
-def print_summary():
-    csv_path = RESULTS_DIR / "n_scaling.csv"
-    if not csv_path.exists():
-        return
-    import csv as csv_mod
-    print(f"\n=== N-scaling results ({csv_path}) ===")
-    rows = list(csv_mod.DictReader(csv_path.open()))
-    if not rows:
-        return
-    # Print per-repetition rows
-    print(f"\n{'n':>4}  {'mode':>6}  {'rep':>4}  {'tps':>8}  {'con_tps':>9}  {'con_lat_s':>10}")
-    for r in rows:
-        print(f"{r['n']:>4}  {r['mode']:>6}  {r['rep']:>4}  {r['tps']:>8}  {r['consensus_tps']:>9}  {r['consensus_latency_s']:>10}")
+def _tmean(xs: list) -> float:
+    """Trimmed mean: drop lowest and highest, then average."""
+    xs = sorted(x for x in xs if x > 0)
+    if len(xs) > 2:
+        xs = xs[1:-1]
+    return sum(xs) / len(xs) if xs else 0.0
 
-    # Aggregate: trimmed mean per (n, mode) across repetitions
+
+def print_summary():
+    import csv as csv_mod
     from collections import defaultdict
-    agg: dict = defaultdict(lambda: {"tps": [], "con_tps": [], "con_lat": []})
-    for r in rows:
-        key = (r["n"], r["mode"])
-        try:
-            agg[key]["tps"].append(float(r["tps"]))
-            agg[key]["con_tps"].append(float(r["consensus_tps"]))
-            agg[key]["con_lat"].append(float(r["consensus_latency_s"]))
-        except ValueError:
-            pass
-    print(f"\n{'n':>4}  {'mode':>6}  {'mean_tps':>10}  {'mean_con_tps':>14}  {'mean_con_lat_s':>16}")
-    for (n, mode), v in sorted(agg.items()):
-        def tmean(xs: list) -> float:
-            xs = sorted(x for x in xs if x > 0)
-            if len(xs) > 2: xs = xs[1:-1]
-            return sum(xs) / len(xs) if xs else 0.0
-        print(f"{n:>4}  {mode:>6}  {tmean(v['tps']):>10.1f}  {tmean(v['con_tps']):>14.3f}  {tmean(v['con_lat']):>16.4f}")
+
+    # --- N-scaling ---
+    csv_path = RESULTS_DIR / "n_scaling.csv"
+    if csv_path.exists():
+        print(f"\n=== N-scaling results ({csv_path}) ===")
+        rows = list(csv_mod.DictReader(csv_path.open()))
+        if rows:
+            print(f"\n{'n':>4}  {'mode':>6}  {'rep':>4}  {'e2e_tps':>9}  {'e2e_bps':>11}  {'con_tps':>9}  {'con_lat_s':>10}")
+            for r in rows:
+                print(f"{r['n']:>4}  {r['mode']:>6}  {r['rep']:>4}  {r['e2e_tps']:>9}  {r['e2e_bps']:>11}  {r['consensus_tps']:>9}  {r['consensus_latency_s']:>10}")
+
+            agg: dict = defaultdict(lambda: {"e2e_tps": [], "e2e_bps": [], "con_tps": [], "con_lat": []})
+            for r in rows:
+                key = (r["n"], r["mode"])
+                try:
+                    agg[key]["e2e_tps"].append(float(r["e2e_tps"]))
+                    agg[key]["e2e_bps"].append(float(r["e2e_bps"]))
+                    agg[key]["con_tps"].append(float(r["consensus_tps"]))
+                    agg[key]["con_lat"].append(float(r["consensus_latency_s"]))
+                except ValueError:
+                    pass
+            print(f"\n{'n':>4}  {'mode':>6}  {'mean_e2e_tps':>13}  {'mean_e2e_bps':>14}  {'mean_con_tps':>14}  {'mean_con_lat_s':>16}")
+            for (n, mode), v in sorted(agg.items()):
+                print(f"{n:>4}  {mode:>6}  {_tmean(v['e2e_tps']):>13.1f}  {_tmean(v['e2e_bps']):>14.1f}  {_tmean(v['con_tps']):>14.3f}  {_tmean(v['con_lat']):>16.4f}")
+
 
 
 # ---------------------------------------------------------------------------
