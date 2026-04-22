@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-plot.py — Generate OL vs BOF comparison plots from CSV.
+plot.py — Generate throughput-vs-latency L-curve from tput_latency.csv.
 
-Produces three figures:
-  1. End-to-End Throughput (tx/s) vs n
-  2. Consensus Throughput (slots/s) vs n
-  3. Consensus Latency (ms) vs n
+The classical BFT benchmark plot: throughput (x-axis) vs latency (y-axis).
+Points are obtained by varying the injection rate; the curve traces an L-shape
+(flat low-latency region → saturation knee → steep latency rise).
+
+One curve per (N, mode) combination.  Run plot.py after das.py completes.
+
+Usage:
+  python3 performance/plot.py                  # use default tput_latency.csv
+  python3 performance/plot.py --csv path.csv   # use a different CSV
+  python3 performance/plot.py --out-dir /tmp   # different output directory
 """
 
 import argparse
@@ -23,15 +29,22 @@ import numpy as np
 # Defaults
 # ---------------------------------------------------------------------------
 
-PROJ_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_CSV = PROJ_ROOT / "das_results" / "n_scaling.csv"
+PROJ_ROOT   = Path(__file__).resolve().parents[3]
+DEFAULT_CSV = PROJ_ROOT / "das_results" / "tput_latency.csv"
 DEFAULT_OUT = PROJ_ROOT / "das_results" / "plots"
 
-MODES = ["ol", "bof"]
-MODE_LABELS = {"ol": "OL", "bof": "BOF"}
-MODE_COLORS = {"ol": "#2196F3", "bof": "#F44336"}
-MODE_MARKERS = {"ol": "o", "bof": "s"}
-
+# Colours and markers: one style per (mode, metric)
+# "consensus" = block certification layer; "execution" = end-to-end commit
+STYLE = {
+    ("ol",  "execution"): dict(color="#1565C0", marker="o",
+                                label="OL (end-to-end)", linestyle="-"),
+    ("bof", "execution"): dict(color="#B71C1C", marker="s",
+                                label="BOF (end-to-end)", linestyle="-"),
+    ("ol",  "consensus"): dict(color="#42A5F5", marker="^",
+                                label="OL (consensus)", linestyle="--"),
+    ("bof", "consensus"): dict(color="#EF9A9A", marker="D",
+                                label="BOF (consensus)", linestyle="--"),
+}
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -39,33 +52,34 @@ MODE_MARKERS = {"ol": "o", "bof": "s"}
 
 def load_csv(path: Path) -> dict:
     """
-    data[mode][n] = {
-        "e2e_tps": [],
-        "con_tps": [],
-        "con_lat_ms": []
-    }
+    Returns data[(n, mode, metric)][input_rate] = {"tps": [...], "lat_ms": [...]}
+
+    CSV columns:
+      n, mode, input_rate, rep,
+      consensus_tps, consensus_latency_ms,
+      execution_tps, execution_latency_ms,
+      slots_committed
     """
-    data = defaultdict(lambda: defaultdict(lambda: {
-        "e2e_tps": [], "con_tps": [], "con_lat_ms": []
-    }))
+    data: dict = defaultdict(lambda: defaultdict(lambda: {"tps": [], "lat_ms": []}))
 
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             try:
+                n    = int(row["n"])
                 mode = row["mode"].strip()
-                n = int(row["n"])
-
-                e2e_tps = float(row["e2e_tps"])
-                con_tps = float(row["con_tps"])
-                con_lat = float(row["con_lat_s"]) * 1000.0  # → ms
-
+                rate = int(row["input_rate"])
+                con_tps = float(row["consensus_tps"])
+                con_lat = float(row["consensus_latency_ms"])
+                exe_tps = float(row["execution_tps"])
+                exe_lat = float(row["execution_latency_ms"])
             except (KeyError, ValueError):
                 continue
 
-            data[mode][n]["e2e_tps"].append(e2e_tps)
-            data[mode][n]["con_tps"].append(con_tps)
-            data[mode][n]["con_lat_ms"].append(con_lat)
+            data[(n, mode, "consensus")][rate]["tps"].append(con_tps)
+            data[(n, mode, "consensus")][rate]["lat_ms"].append(con_lat)
+            data[(n, mode, "execution")][rate]["tps"].append(exe_tps)
+            data[(n, mode, "execution")][rate]["lat_ms"].append(exe_lat)
 
     return data
 
@@ -74,8 +88,9 @@ def load_csv(path: Path) -> dict:
 # Statistics
 # ---------------------------------------------------------------------------
 
-def stats(values: list, drop: int = 1):
-    v = sorted(x for x in values if x >= 0)
+def trimmed_stats(values: list, drop: int = 1):
+    """(mean, std) after dropping `drop` lowest and highest values."""
+    v = sorted(x for x in values if x > 0)
     if len(v) > 2 * drop:
         v = v[drop:-drop]
     if not v:
@@ -84,59 +99,194 @@ def stats(values: list, drop: int = 1):
     return float(a.mean()), float(a.std(ddof=0))
 
 
-def extract_series(data: dict, mode: str, metric: str):
-    ns_raw = sorted(data[mode].keys())
-    ns, means, stds = [], [], []
+def series_for_key(data: dict, key: tuple):
+    """
+    For a given (n, mode, metric) key, return arrays sorted by input_rate:
+      (rates, mean_tps, std_tps, mean_lat, std_lat)
+    """
+    if key not in data:
+        return [np.array([])] * 5
 
-    for n in ns_raw:
-        m, s = stats(data[mode][n][metric])
-        if m > 0:
-            ns.append(n)
-            means.append(m)
-            stds.append(s)
-
-    return np.array(ns), np.array(means), np.array(stds)
+    rates_raw = sorted(data[key].keys())
+    rates, m_tps, s_tps, m_lat, s_lat = [], [], [], [], []
+    for rate in rates_raw:
+        d = data[key][rate]
+        mt, st = trimmed_stats(d["tps"])
+        ml, sl = trimmed_stats(d["lat_ms"])
+        if mt > 0 or ml > 0:   # skip empty rows
+            rates.append(rate)
+            m_tps.append(mt); s_tps.append(st)
+            m_lat.append(ml); s_lat.append(sl)
+    return (np.array(rates), np.array(m_tps), np.array(s_tps),
+            np.array(m_lat), np.array(s_lat))
 
 
 # ---------------------------------------------------------------------------
-# Plotting
+# Helpers
 # ---------------------------------------------------------------------------
 
 def style_ax(ax, xlabel, ylabel, title):
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+    ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=11)
     ax.set_title(title, fontweight="bold")
-    ax.legend()
-    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.legend(fontsize=8)
+    ax.grid(True, linestyle="--", alpha=0.4)
 
 
-def plot_metric(data, metric, ylabel, title, out_path):
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+def all_n_values(data: dict) -> list:
+    return sorted({k[0] for k in data})
 
-    for mode in MODES:
-        if mode not in data:
-            continue
 
-        ns, means, stds = extract_series(data, mode, metric)
-        if len(ns) == 0:
-            continue
+def all_modes(data: dict) -> list:
+    return sorted({k[1] for k in data})
 
-        ax.errorbar(
-            ns, means, yerr=stds,
-            label=MODE_LABELS[mode],
-            color=MODE_COLORS[mode],
-            marker=MODE_MARKERS[mode],
-            linewidth=2,
-            capsize=4,
-        )
 
-    style_ax(ax, "Number of replicas (n)", ylabel, title)
-    ax.set_xticks(sorted({n for m in MODES if m in data for n in data[m]}))
+# ---------------------------------------------------------------------------
+# Plot 1 — L-curve: Throughput (x) vs Latency (y)  [MAIN PLOT]
+#
+# Points trace the L-curve as injection rate increases:
+#   left-bottom = unsaturated (low rate, low latency, throughput ≈ rate)
+#   right-bottom = approaching saturation
+#   right-top    = saturated (throughput plateaus, latency explodes)
+# ---------------------------------------------------------------------------
 
+def plot_l_curve(data: dict, out_path: Path, metric: str = "execution"):
+    """
+    One curve per (N, mode).  Points sorted by injection rate.
+    metric: "execution" (end-to-end, default) or "consensus" (protocol layer).
+    """
+    ns    = all_n_values(data)
+    modes = all_modes(data)
+
+    # Assign a distinct colour per N; linestyle per mode
+    cmap   = plt.cm.get_cmap("tab10", max(len(ns), 1))
+    ls_map = {"ol": "-", "bof": "--"}
+    mk_map = {"ol": "o", "bof": "s"}
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    for n_idx, n in enumerate(ns):
+        color = cmap(n_idx)
+        for mode in modes:
+            key = (n, mode, metric)
+            rates, m_tps, s_tps, m_lat, s_lat = series_for_key(data, key)
+            if len(rates) == 0:
+                continue
+
+            label = f"N={n} {mode.upper()}"
+            ax.errorbar(
+                m_tps, m_lat,
+                xerr=s_tps, yerr=s_lat,
+                label=label,
+                color=color,
+                linestyle=ls_map.get(mode, "-"),
+                marker=mk_map.get(mode, "o"),
+                linewidth=1.8,
+                markersize=6,
+                capsize=3,
+            )
+            # Annotate each point with its injection rate (in k tx/s)
+            for rate, x, y in zip(rates, m_tps, m_lat):
+                ax.annotate(
+                    f"{rate//1000}k" if rate >= 1000 else str(rate),
+                    (x, y),
+                    textcoords="offset points",
+                    xytext=(5, 4),
+                    fontsize=6,
+                    color=color,
+                )
+
+    metric_label = "End-to-end" if metric == "execution" else "Consensus"
+    style_ax(ax, "Throughput (tx/s)", f"{metric_label} Latency (ms)",
+             f"Throughput vs Latency — OL vs BOF")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
+    print(f"Saved: {out_path}")
 
+
+# ---------------------------------------------------------------------------
+# Plot 2 — Throughput vs Injection Rate (saturation diagnostic)
+# ---------------------------------------------------------------------------
+
+def plot_tput_vs_rate(data: dict, out_path: Path, metric: str = "execution"):
+    ns    = all_n_values(data)
+    modes = all_modes(data)
+    cmap  = plt.cm.get_cmap("tab10", max(len(ns), 1))
+    ls_map = {"ol": "-", "bof": "--"}
+    mk_map = {"ol": "o", "bof": "s"}
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    all_rates: list = []
+    for n_idx, n in enumerate(ns):
+        color = cmap(n_idx)
+        for mode in modes:
+            key = (n, mode, metric)
+            rates, m_tps, s_tps, _, _ = series_for_key(data, key)
+            if len(rates) == 0:
+                continue
+            all_rates.extend(rates.tolist())
+            ax.errorbar(
+                rates, m_tps, yerr=s_tps,
+                label=f"N={n} {mode.upper()}",
+                color=color,
+                linestyle=ls_map.get(mode, "-"),
+                marker=mk_map.get(mode, "o"),
+                linewidth=1.5,
+                capsize=3,
+            )
+
+    if all_rates:
+        lim = max(all_rates) * 1.05
+        ax.plot([0, lim], [0, lim], "k--", linewidth=1, alpha=0.3,
+                label="y = x (perfect)")
+
+    metric_label = "End-to-end" if metric == "execution" else "Consensus"
+    style_ax(ax, "Injection Rate (tx/s)", f"{metric_label} Throughput (tx/s)",
+             "Throughput vs Injection Rate")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Plot 3 — Latency vs Injection Rate (latency diagnostic)
+# ---------------------------------------------------------------------------
+
+def plot_lat_vs_rate(data: dict, out_path: Path, metric: str = "execution"):
+    ns    = all_n_values(data)
+    modes = all_modes(data)
+    cmap  = plt.cm.get_cmap("tab10", max(len(ns), 1))
+    ls_map = {"ol": "-", "bof": "--"}
+    mk_map = {"ol": "o", "bof": "s"}
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    for n_idx, n in enumerate(ns):
+        color = cmap(n_idx)
+        for mode in modes:
+            key = (n, mode, metric)
+            rates, _, _, m_lat, s_lat = series_for_key(data, key)
+            if len(rates) == 0:
+                continue
+            ax.errorbar(
+                rates, m_lat, yerr=s_lat,
+                label=f"N={n} {mode.upper()}",
+                color=color,
+                linestyle=ls_map.get(mode, "-"),
+                marker=mk_map.get(mode, "o"),
+                linewidth=1.5,
+                capsize=3,
+            )
+
+    metric_label = "End-to-end" if metric == "execution" else "Consensus"
+    style_ax(ax, "Injection Rate (tx/s)", f"{metric_label} Latency (ms)",
+             "Latency vs Injection Rate")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
     print(f"Saved: {out_path}")
 
 
@@ -145,8 +295,10 @@ def plot_metric(data, metric, ylabel, title, out_path):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", type=Path, default=DEFAULT_CSV)
+    parser = argparse.ArgumentParser(
+        description="Generate L-curve throughput-vs-latency plot from tput_latency.csv"
+    )
+    parser.add_argument("--csv",     type=Path, default=DEFAULT_CSV)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
     args = parser.parse_args()
 
@@ -157,34 +309,22 @@ def main():
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     data = load_csv(args.csv)
-
     if not data:
-        print("ERROR: no data parsed", file=sys.stderr)
+        print("ERROR: no data parsed from CSV", file=sys.stderr)
         sys.exit(1)
 
-    # 1. End-to-end throughput
-    plot_metric(
-        data, "e2e_tps",
-        "Throughput (tx/s)",
-        "End-to-End Throughput vs n",
-        args.out_dir / "e2e_throughput.png",
-    )
+    # Main L-curve using end-to-end (execution) metrics
+    plot_l_curve(data, args.out_dir / "tput_vs_latency.png", metric="execution")
 
-    # 2. Consensus throughput
-    plot_metric(
-        data, "con_tps",
-        "Consensus throughput (slots/s)",
-        "Consensus Throughput vs n",
-        args.out_dir / "consensus_throughput.png",
-    )
+    # Same L-curve but for the consensus (block certification) layer
+    plot_l_curve(data, args.out_dir / "tput_vs_latency_consensus.png",
+                 metric="consensus")
 
-    # 3. Consensus latency
-    plot_metric(
-        data, "con_lat_ms",
-        "Consensus latency (ms)",
-        "Consensus Latency vs n",
-        args.out_dir / "consensus_latency.png",
-    )
+    # Diagnostic: throughput vs injection rate (shows saturation point)
+    plot_tput_vs_rate(data, args.out_dir / "tput_vs_rate.png", metric="execution")
+
+    # Diagnostic: latency vs injection rate (shows where latency spikes)
+    plot_lat_vs_rate(data, args.out_dir / "lat_vs_rate.png", metric="execution")
 
     print("\nAll plots saved in:", args.out_dir)
 

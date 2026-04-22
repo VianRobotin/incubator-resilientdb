@@ -27,6 +27,13 @@ typedef struct ms_ecall_sign_bytes_t {
 	uint8_t* ms_sig_out;
 } ms_ecall_sign_bytes_t;
 
+typedef struct ms_ecall_verify_bytes_t {
+	sgx_status_t ms_retval;
+	const uint8_t* ms_data;
+	uint32_t ms_data_len;
+	const uint8_t* ms_expected_mac;
+} ms_ecall_verify_bytes_t;
+
 typedef struct ms_ocall_get_time_t {
 	int64_t* ms_t;
 } ms_ocall_get_time_t;
@@ -163,6 +170,18 @@ sgx_status_t ecall_sign_bytes(sgx_enclave_id_t eid, sgx_status_t* retval, const 
 	ms.ms_data_len = data_len;
 	ms.ms_sig_out = sig_out;
 	status = sgx_ecall(eid, 3, &ocall_table_tee_enclave, &ms);
+	if (status == SGX_SUCCESS && retval) *retval = ms.ms_retval;
+	return status;
+}
+
+sgx_status_t ecall_verify_bytes(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* data, uint32_t data_len, const uint8_t* expected_mac)
+{
+	sgx_status_t status;
+	ms_ecall_verify_bytes_t ms;
+	ms.ms_data = data;
+	ms.ms_data_len = data_len;
+	ms.ms_expected_mac = expected_mac;
+	status = sgx_ecall(eid, 4, &ocall_table_tee_enclave, &ms);
 	if (status == SGX_SUCCESS && retval) *retval = ms.ms_retval;
 	return status;
 }

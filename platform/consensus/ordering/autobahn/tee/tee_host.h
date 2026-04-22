@@ -80,6 +80,12 @@ class TeeHost {
                           const std::string& sig64,
                           const std::string& pubkey64);
 
+  /* Verify an HMAC-SHA256 L⃗ signature using the enclave's secret key (ECALL).
+   * sig64: the 64-byte output of SignBytes(); only the first 32 bytes (the MAC)
+   * are used.  Requires IsOk() == true.
+   */
+  bool VerifyBytes(const std::string& data, const std::string& sig64) const;
+
  private:
   uint64_t    eid_  = 0;    /* sgx_enclave_id_t is typedef uint64_t */
   bool        ok_   = false;

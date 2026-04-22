@@ -19,6 +19,7 @@ sgx_status_t ecall_init_tee(uint8_t* pubkey_out);
 sgx_status_t ecall_timestamp_txn(const uint8_t* hash, int64_t* timestamp_out, uint8_t* sig_out);
 sgx_status_t ecall_assign_sequence_number(const uint8_t* hash, int64_t* seq_out, uint8_t* sig_out);
 sgx_status_t ecall_sign_bytes(const uint8_t* data, uint32_t data_len, uint8_t* sig_out);
+sgx_status_t ecall_verify_bytes(const uint8_t* data, uint32_t data_len, const uint8_t* expected_mac);
 
 sgx_status_t SGX_CDECL ocall_get_time(int64_t* t);
 sgx_status_t SGX_CDECL sgx_oc_cpuidex(int cpuinfo[4], int leaf, int subleaf);

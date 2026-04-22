@@ -127,6 +127,12 @@ class ProposalManager {
   // from a failed/skipped slot are not permanently lost.
   void MarkBofCommitted(const std::vector<std::string>& hashes);
 
+  // OL mode: remove committed transactions from ts_store_, local_ordering_keys_,
+  // and committed_keys_ so those maps don't grow without bound across slots.
+  // Without this, ComputeAllOrderingKeys() and GetTransactionsInWindow() iterate
+  // over every transaction ever received — O(total_ever_seen) per slot.
+  void PruneOlCommitted(const std::vector<std::string>& hashes);
+
   // Read-only variant: same computation as GetBatchOrderedTransactions but does
   // NOT mark transactions as committed. Used by replicas to validate a leader's
   // BOF proposal payload (Algorithm 3) without mutating state prematurely.

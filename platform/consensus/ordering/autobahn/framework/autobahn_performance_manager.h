@@ -21,8 +21,6 @@ class AutobahnPerformanceManager : public common::PerformanceManager {
  protected:
   void SendMessage(const Request& request) override {
     int target = (round_robin_idx_++ % replica_num_) + 1;
-    LOG(ERROR) << "AutobahnPM sending to replica " << target
-               << " (round-robin idx=" << round_robin_idx_.load() << ")";
     replica_communicator_->SendMessage(request, target);
   }
 

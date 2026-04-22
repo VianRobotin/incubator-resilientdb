@@ -53,6 +53,13 @@ typedef struct ms_ecall_sign_bytes_t {
 	uint8_t* ms_sig_out;
 } ms_ecall_sign_bytes_t;
 
+typedef struct ms_ecall_verify_bytes_t {
+	sgx_status_t ms_retval;
+	const uint8_t* ms_data;
+	uint32_t ms_data_len;
+	const uint8_t* ms_expected_mac;
+} ms_ecall_verify_bytes_t;
+
 typedef struct ms_ocall_get_time_t {
 	int64_t* ms_t;
 } ms_ocall_get_time_t;
@@ -423,16 +430,66 @@ err:
 	return status;
 }
 
+static sgx_status_t SGX_CDECL sgx_ecall_verify_bytes(void* pms)
+{
+	CHECK_REF_POINTER(pms, sizeof(ms_ecall_verify_bytes_t));
+	sgx_lfence();
+	ms_ecall_verify_bytes_t* ms = SGX_CAST(ms_ecall_verify_bytes_t*, pms);
+	ms_ecall_verify_bytes_t __in_ms;
+	if (memcpy_s(&__in_ms, sizeof(ms_ecall_verify_bytes_t), ms, sizeof(ms_ecall_verify_bytes_t))) {
+		return SGX_ERROR_UNEXPECTED;
+	}
+	sgx_status_t status = SGX_SUCCESS;
+	const uint8_t* _tmp_data = __in_ms.ms_data;
+	uint32_t _tmp_data_len = __in_ms.ms_data_len;
+	size_t _len_data = _tmp_data_len;
+	uint8_t* _in_data = NULL;
+	const uint8_t* _tmp_expected_mac = __in_ms.ms_expected_mac;
+	size_t _len_expected_mac = 32;
+	uint8_t* _in_expected_mac = NULL;
+	sgx_status_t _in_retval;
+
+	CHECK_UNIQUE_POINTER(_tmp_data, _len_data);
+	CHECK_UNIQUE_POINTER(_tmp_expected_mac, _len_expected_mac);
+
+	sgx_lfence();
+
+	if (_tmp_data != NULL && _len_data != 0) {
+		_in_data = (uint8_t*)malloc(_len_data);
+		if (_in_data == NULL) { status = SGX_ERROR_OUT_OF_MEMORY; goto err; }
+		if (memcpy_s(_in_data, _len_data, _tmp_data, _len_data)) {
+			status = SGX_ERROR_UNEXPECTED; goto err;
+		}
+	}
+	if (_tmp_expected_mac != NULL && _len_expected_mac != 0) {
+		_in_expected_mac = (uint8_t*)malloc(_len_expected_mac);
+		if (_in_expected_mac == NULL) { status = SGX_ERROR_OUT_OF_MEMORY; goto err; }
+		if (memcpy_s(_in_expected_mac, _len_expected_mac, _tmp_expected_mac, _len_expected_mac)) {
+			status = SGX_ERROR_UNEXPECTED; goto err;
+		}
+	}
+	_in_retval = ecall_verify_bytes((const uint8_t*)_in_data, _tmp_data_len, (const uint8_t*)_in_expected_mac);
+	if (memcpy_verw_s(&ms->ms_retval, sizeof(ms->ms_retval), &_in_retval, sizeof(_in_retval))) {
+		status = SGX_ERROR_UNEXPECTED; goto err;
+	}
+
+err:
+	if (_in_data) free(_in_data);
+	if (_in_expected_mac) free(_in_expected_mac);
+	return status;
+}
+
 SGX_EXTERNC const struct {
 	size_t nr_ecall;
-	struct {void* ecall_addr; uint8_t is_priv; uint8_t is_switchless;} ecall_table[4];
+	struct {void* ecall_addr; uint8_t is_priv; uint8_t is_switchless;} ecall_table[5];
 } g_ecall_table = {
-	4,
+	5,
 	{
 		{(void*)(uintptr_t)sgx_ecall_init_tee, 0, 0},
 		{(void*)(uintptr_t)sgx_ecall_timestamp_txn, 0, 0},
 		{(void*)(uintptr_t)sgx_ecall_assign_sequence_number, 0, 0},
 		{(void*)(uintptr_t)sgx_ecall_sign_bytes, 0, 0},
+		{(void*)(uintptr_t)sgx_ecall_verify_bytes, 0, 0},
 	}
 };
 

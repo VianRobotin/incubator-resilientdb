@@ -5,6 +5,7 @@
 #include <queue>
 #include <set>
 #include <thread>
+#include <unordered_map>
 
 #include "platform/common/queue/lock_free_queue.h"
 #include "platform/consensus/ordering/common/algorithm/protocol_base.h"
@@ -93,6 +94,11 @@ class AutoBahn: public common::ProtocolBase {
   std::thread block_thread_, dissemi_thread_, consensus_thread_, commit_thread_;
 
   std::mutex block_mutex_, bc_mutex_, view_mutex_, vote_mutex_, commit_mutex_, leader_mutex_;
+
+  // Block timing for consensus (certification) latency
+  std::unordered_map<int64_t, int64_t> block_disseminate_time_;  // block_id → disseminate time_us
+  std::unordered_map<int64_t, int> block_txn_count_;             // block_id → txn count
+  std::mutex block_time_mutex_;
   std::map<int, std::map<int, SignInfo>> block_ack_;
 
   // Sync HotStuff vote tracking
@@ -112,13 +118,34 @@ class AutoBahn: public common::ProtocolBase {
   std::set<int> equivocated_views_;
   std::mutex equivocation_mutex_;
 
-  // Pending proposals waiting for 2Δ timer
+  // Pending proposals waiting for 2Δ timer.
+  //
+  // Lifecycle:
+  //   1. ReceiveProposal inserts a placeholder with {proposal=nullptr,
+  //      validated=false, receive_time=now} as soon as the message arrives
+  //      (after equivocation check).  This tells AsyncCommitTimer that the
+  //      slot is in flight so its "slot missing" skip timer does NOT fire
+  //      while payload validation is still running.
+  //   2. When ReceiveProposal finishes validating + voting, it atomically
+  //      swaps in the proposal pointer and sets validated=true.
+  //   3. On validation failure, the placeholder is erased.
+  //   4. AsyncCommitTimer only proceeds to commit once validated=true.
+  //      It also enforces a bounded staleness so a never-validated entry
+  //      does not wedge the chain forever.
   struct PendingCommit {
     std::unique_ptr<Proposal> proposal;
-    int64_t receive_time;
+    int64_t receive_time = 0;
+    bool quorum_reached = false;  // true when 2f+1 replicas have voted
+    bool validated = false;       // true once ReceiveProposal finishes checks
   };
   std::map<int, PendingCommit> pending_commits_;
   std::mutex pending_commit_mutex_;
+
+  // Vote timing diagnostics: slot → time of first vote received (us)
+  std::map<int, int64_t> vote_first_time_;
+  // slot → time quorum (2f+1 votes) was reached (us)
+  std::map<int, int64_t> vote_quorum_time_;
+  std::mutex vote_timing_mutex_;
 };
 
 }  // namespace autobahn

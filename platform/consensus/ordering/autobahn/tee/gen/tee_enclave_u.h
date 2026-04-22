@@ -45,6 +45,7 @@ sgx_status_t ecall_init_tee(sgx_enclave_id_t eid, sgx_status_t* retval, uint8_t*
 sgx_status_t ecall_timestamp_txn(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* hash, int64_t* timestamp_out, uint8_t* sig_out);
 sgx_status_t ecall_assign_sequence_number(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* hash, int64_t* seq_out, uint8_t* sig_out);
 sgx_status_t ecall_sign_bytes(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* data, uint32_t data_len, uint8_t* sig_out);
+sgx_status_t ecall_verify_bytes(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* data, uint32_t data_len, const uint8_t* expected_mac);
 
 #ifdef __cplusplus
 }

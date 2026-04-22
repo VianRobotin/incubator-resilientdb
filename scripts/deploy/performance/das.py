@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-# DAS5 Benchmark Orchestrator for OL vs BOF thesis experiments.
+# DAS5 Benchmark Orchestrator — throughput vs latency sweep (L-curve).
 #
-# Runs n-scaling experiment: n=3/5/7 replicas, fixed block_size=100, modes=[ol,bof]
+# Runs a rate-sweep experiment: for each (N, mode), inject at increasing
+# rates from well below saturation to above saturation.  Each (rate, N, mode)
+# point gives one (throughput, latency) pair; together they trace the L-curve.
 #
 # Usage (from the scripts/deploy/ directory):
-#   python3 performance/das.py               # run experiment
-#   python3 performance/das.py --dry-run     # print plan without reserving or SSHing
-#
-# Assumes:
-#   - /var/scratch is NFS-shared across all DAS5 nodes (no SCP needed for binary)
-#   - SSH from headnode to compute nodes is passwordless (shared ~/.ssh via NFS home)
-#   - preserve command is available on PATH
+#   python3 performance/das.py               # run full sweep
+#   python3 performance/das.py --dry-run     # print plan without reserving
+#   python3 performance/das.py --nodes 10    # only sweep N=10
+#   python3 performance/das.py --skip-build  # skip bazel build
 
 import argparse
 import datetime
@@ -31,41 +30,58 @@ from preserve import PreserveManager
 # Paths and constants
 # ---------------------------------------------------------------------------
 
-# Resolve project root: this file lives at <root>/scripts/deploy/performance/das.py
 PROJ_ROOT = Path(__file__).resolve().parents[3]
+USERNAME  = os.environ.get("USER", "vrobotin")
 
-USERNAME = os.environ.get("USER", "vrobotin")
-
-SERVER_BIN  = PROJ_ROOT / "bazel-bin/benchmark/protocols/autobahn/kv_server_performance"
-CLIENT_BIN  = PROJ_ROOT / "bazel-bin/benchmark/protocols/autobahn/kv_service_tools"
-KEY_GEN     = PROJ_ROOT / "bazel-bin/tools/key_generator_tools"
-CERT_TOOL   = PROJ_ROOT / "bazel-bin/tools/certificate_tools"
+SERVER_BIN = PROJ_ROOT / "bazel-bin/benchmark/protocols/autobahn/kv_server_performance"
+CLIENT_BIN = PROJ_ROOT / "bazel-bin/benchmark/protocols/autobahn/kv_service_tools"
+KEY_GEN    = PROJ_ROOT / "bazel-bin/tools/key_generator_tools"
+CERT_TOOL  = PROJ_ROOT / "bazel-bin/tools/certificate_tools"
 
 BASE_PORT      = 10001
-STATS_INTERVAL = 5   # seconds between stats log lines (matches Stats default)
-READY_TIMEOUT  = 120 # seconds to wait for all replicas to connect
+READY_TIMEOUT  = 120   # seconds to wait for all replicas to connect
 
 RESULTS_DIR  = PROJ_ROOT / "das_results"
 RUNTIME_BASE = PROJ_ROOT / "das_runtime"
 
-# SGX paths — replicas fall back to software simulation if enclave is absent
 TEE_ENCLAVE_PATH = PROJ_ROOT / "platform/consensus/ordering/autobahn/tee/tee_enclave.signed.so"
 LD_LIBRARY_PATH  = "/var/scratch/vrobotin/sgxsdk/lib64"
+
+# ---------------------------------------------------------------------------
+# Experiment parameters
+# ---------------------------------------------------------------------------
+
+BLOCK_SIZE  = 100   # transactions per block
+RUNTIME     = 60    # seconds per run (matches Giulio)
+WARMUP      = 15    # seconds excluded from metrics
+REPETITIONS = 5     # runs per (N, mode, rate) point
+
+# For each N: injection rates (total tx/s across all clients) to sweep.
+# Must span from well below saturation to well above it so the L-curve knee
+# is visible.  Adjust after seeing where saturation falls.
+#
+# N values chosen for the 2f+1 committee claim:
+#   N=7  → f=3  (compare against Giulio's 3f+1 = N=10 at f=3)
+#   N=11 → f=5  (compare against Giulio's 3f+1 = N=16 at f=5)
+#   N=15 → f=7  (compare against Giulio's 3f+1 = N=22 at f=7)
+# Thesis claim: same fault tolerance f, but 28-32% fewer nodes.
+RATE_SWEEP: dict = {
+     7: [500, 1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000],
+    11: [500, 1000, 2000, 4000, 6000, 8000, 10000, 12000],
+    15: [300,  600, 1200, 2500, 4000, 6000,  8000, 10000],
+}
 
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
 
-# Search order for the bazel executable when it is not on $PATH.
 _BAZEL_SEARCH_PATHS = [
-    "/usr/local/bin/bazel",
-    "/usr/bin/bazel",
+    "/usr/local/bin/bazel", "/usr/bin/bazel",
     str(Path.home() / "bin" / "bazel"),
     str(Path.home() / ".local" / "bin" / "bazel"),
 ]
 
 def _find_bazel() -> str:
-    """Return the path to the bazel executable, or raise RuntimeError."""
     found = shutil.which("bazel")
     if found:
         return found
@@ -73,16 +89,13 @@ def _find_bazel() -> str:
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     raise RuntimeError(
-        "bazel not found on $PATH or in common locations.\n"
-        "Install bazel (https://bazel.build/install) or use --skip-build "
-        "if the binaries are already built."
+        "bazel not found. Install it or use --skip-build if binaries exist."
     )
 
 
 def build_binaries():
     print("\n=== Building binaries ===")
     bazel = _find_bazel()
-    print(f"Using bazel: {bazel}")
     subprocess.check_call([
         bazel, "build",
         "//benchmark/protocols/autobahn:kv_server_performance",
@@ -101,21 +114,11 @@ _REQUIRED_BINARIES = {
 }
 
 def check_binaries():
-    """Abort with a clear message if any required binary is missing."""
     missing = [name for name, path in _REQUIRED_BINARIES.items() if not path.exists()]
     if missing:
-        print("\nERROR: the following required binaries are missing:", file=sys.stderr)
+        print("ERROR: missing binaries:", file=sys.stderr)
         for name in missing:
             print(f"  {_REQUIRED_BINARIES[name]}", file=sys.stderr)
-        print(
-            "\nBuild them with:\n"
-            "  bazel build "
-            "//benchmark/protocols/autobahn:kv_server_performance "
-            "//benchmark/protocols/autobahn:kv_service_tools "
-            "//tools:key_generator_tools "
-            "//tools:certificate_tools",
-            file=sys.stderr,
-        )
         sys.exit(1)
 
 
@@ -124,47 +127,29 @@ def check_binaries():
 # ---------------------------------------------------------------------------
 
 def generate_certs(cert_dir: Path, replica_ips: List[str], client_ips: List[str]):
-    """Generate admin + per-node keypairs and certificates into cert_dir.
-
-    Replica nodes get IDs 1..n with 'replica' type certs.
-    Client nodes get IDs n+1..n+m with 'client' type certs.
-    """
     cert_dir.mkdir(parents=True, exist_ok=True)
-
     num_replicas = len(replica_ips)
     num_clients  = len(client_ips)
     total_nodes  = num_replicas + num_clients
 
-    # Admin keypair
     subprocess.check_call([str(KEY_GEN), str(cert_dir / "admin")])
-
-    # Per-node keypairs
     for i in range(1, total_nodes + 1):
         subprocess.check_call([str(KEY_GEN), str(cert_dir / f"node_{i}")])
 
-    # Replica certificates
     for i, ip in enumerate(replica_ips, 1):
-        port = str(BASE_PORT + i - 1)
         subprocess.check_call([
-            str(CERT_TOOL),
-            str(cert_dir),
-            str(cert_dir / "admin.key.pri"),
-            str(cert_dir / "admin.key.pub"),
+            str(CERT_TOOL), str(cert_dir),
+            str(cert_dir / "admin.key.pri"), str(cert_dir / "admin.key.pub"),
             str(cert_dir / f"node_{i}.key.pub"),
-            str(i), ip, port, "replica",
+            str(i), ip, str(BASE_PORT + i - 1), "replica",
         ])
-
-    # Client certificates
     for j, ip in enumerate(client_ips, 1):
         node_id = num_replicas + j
-        port = str(BASE_PORT + node_id - 1)
         subprocess.check_call([
-            str(CERT_TOOL),
-            str(cert_dir),
-            str(cert_dir / "admin.key.pri"),
-            str(cert_dir / "admin.key.pub"),
+            str(CERT_TOOL), str(cert_dir),
+            str(cert_dir / "admin.key.pri"), str(cert_dir / "admin.key.pub"),
             str(cert_dir / f"node_{node_id}.key.pub"),
-            str(node_id), ip, port, "client",
+            str(node_id), ip, str(BASE_PORT + node_id - 1), "client",
         ])
 
 
@@ -172,25 +157,15 @@ def generate_certs(cert_dir: Path, replica_ips: List[str], client_ips: List[str]
 # Config generation
 # ---------------------------------------------------------------------------
 
-def write_server_config(config_path: Path, node_ips: List[str], mode: str, block_size: int,
-                        target_input_tps_per_client: int = 0, runtime: int = 60):
-    """Write server.config shared by all nodes (replicas and clients).
-
-    target_input_tps_per_client: per-client TPS limit (0 = unlimited).
-    When non-zero, clientBatchNum is set to 1 so each send is exactly one
-    transaction, matching gsegalin's rate-control approach.
-    """
-    bof_flag = mode == "bof"
+def write_server_config(config_path: Path, node_ips: List[str], mode: str,
+                        block_size: int, target_input_tps_per_client: int,
+                        runtime: int):
+    bof_flag = (mode == "bof")
     replica_info = [
         {"id": i, "ip": ip, "port": BASE_PORT + i - 1}
         for i, ip in enumerate(node_ips, 1)
     ]
-    # clientBatchNum=1 + target_input_tps gives precise TPS control.
-    # Without rate control, use larger batches for max throughput.
     client_batch_num = 1 if target_input_tps_per_client > 0 else 400
-    # max_process_txn must be large enough so the client doesn't exhaust its
-    # transaction budget before the experiment ends.  At 15k TPS for 60s we
-    # need ~900k; use target * runtime * 3 with a floor of 2 000 000.
     max_txn = max(target_input_tps_per_client * runtime * 3, 2_000_000)
     config = {
         "region": [{"replicaInfo": replica_info}],
@@ -212,13 +187,6 @@ def write_server_config(config_path: Path, node_ips: List[str], mode: str, block
 
 
 def write_client_trigger_config(path: Path, node_id: int, ip: str):
-    """Write a plain-text config for kv_service_tools to trigger one client node.
-
-    Format expected by GenerateResDBConfig(config_file): one 'id ip port' line.
-    kv_service_tools connects to this address and sends a TYPE_CLIENT_REQUEST,
-    which causes the client node's PerformanceManager to call StartEval and
-    begin sending transactions to the replicas.
-    """
     port = BASE_PORT + node_id - 1
     path.write_text(f"{node_id} {ip} {port}\n")
 
@@ -227,109 +195,100 @@ def write_client_trigger_config(path: Path, node_id: int, ip: str):
 # SSH helpers
 # ---------------------------------------------------------------------------
 
-def ssh_cmd(hostname: str, remote_cmd: str, dry_run: bool = False) -> Optional[subprocess.Popen]:
-    cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", hostname, remote_cmd]
-    if dry_run:
-        print(f"  [DRY-RUN] ssh {hostname}: {remote_cmd}")
-        return None
+def ssh_cmd(hostname: str, remote_cmd: str) -> Optional[subprocess.Popen]:
+    cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+           hostname, remote_cmd]
     return subprocess.Popen(cmd)
 
 
-def ssh_output(hostname: str, remote_cmd: str) -> str:
-    cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", hostname, remote_cmd]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    return result.stdout
-
-
 # ---------------------------------------------------------------------------
-# Log parsing (Python translation of parse_log from benchmark_autobahn.sh)
+# Log parsing
 # ---------------------------------------------------------------------------
 
 def trimmed_mean(values: list, drop: int = 1) -> float:
-    """Mean after dropping `drop` lowest and highest values. Returns 0.0 if empty."""
     v = sorted(v for v in values if v > 0)
     if len(v) > 2 * drop:
         v = v[drop:-drop]
     return sum(v) / len(v) if v else 0.0
 
 
-TXN_SIZE_BYTES = 128  # matches gsegalin's fixed 128-byte transaction size
+_CERT_RE = re.compile(
+    r'^[EW](\d{8}) (\d{2}:\d{2}:\d{2}\.\d+).*?'
+    r'block_certified block_id:\d+ txns:(\d+) consensus_latency_us:(\d+)',
+    re.MULTILINE,
+)
+_EXEC_RE = re.compile(
+    r'^[EW](\d{8}) (\d{2}:\d{2}:\d{2}\.\d+).*?'
+    r'execution commit slot:\d+ txns:(\d+) execution_latency_us:(\d+)',
+    re.MULTILINE,
+)
 
 
-def parse_log(log_file: Path, warmup_secs: int, runtime: int) -> Tuple[float, float, float, float, int]:
-    """
-    Returns (e2e_tps, e2e_bps, consensus_tps, consensus_latency_s, slots_committed).
-
-    All metrics are derived from structured "consensus commit slot:N txns:M consensus_latency_us:X"
-    lines that Autobahn emits once per committed slot.  Each such line carries a glog timestamp
-    which we use to apply a time-based warmup filter (avoids the too-aggressive position-based
-    skip that left only 1–5 samples for small n).
-
-    e2e_tps          — sum(txns in measurement window) / measurement_duration
-    e2e_bps          — e2e_tps * TXN_SIZE_BYTES
-    Consensus TPS    — count(slots in measurement window) / measurement_duration
-    Consensus latency — trimmed mean of per-slot consensus_latency_us (→ seconds)
-    slots_committed  — total number of committed slots (full run)
-    """
-    if not log_file.exists():
-        return 0.0, 0.0, 0.0, 0.0, 0
-
-    text = log_file.read_text(errors="replace")
-
-    # Each committed slot produces a line like:
-    #   E20260413 22:51:27.281818 <tid> autobahn.cpp:969] consensus commit slot:1 txns:396 consensus_latency_us:2002282
-    commit_re = re.compile(
-        r'^[EW](\d{8}) (\d{2}:\d{2}:\d{2}\.\d+).*?'
-        r'consensus commit slot:(\d+) txns:(\d+) consensus_latency_us:(\d+)',
-        re.MULTILINE,
-    )
-
-    commits = []  # list of (datetime, slot_num, txns, latency_us)
-    for m in commit_re.finditer(text):
-        date_s, time_s = m.group(1), m.group(2)
-        slot, txns, lat_us = int(m.group(3)), int(m.group(4)), int(m.group(5))
+def _extract_entries(text: str, pattern) -> list:
+    entries = []
+    for m in pattern.finditer(text):
         try:
-            dt = datetime.datetime.strptime(f"{date_s} {time_s}", "%Y%m%d %H:%M:%S.%f")
+            dt = datetime.datetime.strptime(
+                f"{m.group(1)} {m.group(2)}", "%Y%m%d %H:%M:%S.%f"
+            )
         except ValueError:
             continue
-        commits.append((dt, slot, txns, lat_us))
+        entries.append((dt, int(m.group(3)), int(m.group(4))))
+    return entries
 
-    if not commits:
-        return 0.0, 0.0, 0.0, 0.0, 0
 
-    slots_committed = len(commits)
+def _apply_warmup(entries: list, experiment_start: datetime.datetime,
+                  warmup_secs: int, runtime: int) -> Tuple[list, bool]:
+    """
+    Return (selected_entries, fallback_used).
 
-    # Time-based warmup filter: skip slots committed within the first warmup_secs
-    t0 = commits[0][0]
-    warmup_td  = datetime.timedelta(seconds=warmup_secs)
-    runtime_td = datetime.timedelta(seconds=runtime)
+    Primary filter: entries in [experiment_start+warmup, experiment_start+runtime].
+    Fallback: if the primary window is empty but there are entries inside
+    [experiment_start, experiment_start+runtime], return those instead.
+    This salvages bursty runs where the entire commit activity fits inside
+    the warmup window — reporting a burst rate is strictly more informative
+    than reporting zero.
+    """
+    if not entries:
+        return [], False
+    warmup_cutoff = experiment_start + datetime.timedelta(seconds=warmup_secs)
+    end_cutoff    = experiment_start + datetime.timedelta(seconds=runtime)
+    strict = [e for e in entries if warmup_cutoff <= e[0] <= end_cutoff]
+    if strict:
+        return strict, False
+    fallback = [e for e in entries if experiment_start <= e[0] <= end_cutoff]
+    return fallback, bool(fallback)
 
-    meas_commits = [c for c in commits
-                    if warmup_td <= (c[0] - t0) <= runtime_td]
 
-    if not meas_commits:
-        # Nothing after warmup — fall back to all data (edge case for very short runs)
-        meas_commits = commits
+def parse_log_file(log_file: Path, experiment_start: datetime.datetime,
+                   warmup_secs: int, runtime: int):
+    """
+    Returns (cert_meas, exec_meas, cert_total, exec_total,
+             cert_fallback, exec_fallback).
+    """
+    if not log_file.exists():
+        return [], [], 0, 0, False, False
+    text = log_file.read_text(errors="replace")
+    cert_all = _extract_entries(text, _CERT_RE)
+    exec_all = _extract_entries(text, _EXEC_RE)
+    cert_meas, cert_fb = _apply_warmup(cert_all, experiment_start, warmup_secs, runtime)
+    exec_meas, exec_fb = _apply_warmup(exec_all, experiment_start, warmup_secs, runtime)
+    return cert_meas, exec_meas, len(cert_all), len(exec_all), cert_fb, exec_fb
 
-    # Measurement window duration: span of filtered commits + one slot's worth of time
-    # (the last slot's txns are committed at its timestamp but the slot itself took ~2s)
-    if len(meas_commits) >= 2:
-        span_s = (meas_commits[-1][0] - meas_commits[0][0]).total_seconds()
-        avg_slot_s = span_s / (len(meas_commits) - 1)
-        meas_duration = span_s + avg_slot_s
+
+def _compute_tps_latency(entries: list, fallback_duration: float):
+    if not entries:
+        return 0.0, 0.0
+    if len(entries) >= 2:
+        span_s = (entries[-1][0] - entries[0][0]).total_seconds()
+        avg_slot_s = span_s / (len(entries) - 1)
+        duration = span_s + avg_slot_s
     else:
-        # Single slot: estimate duration from its latency
-        meas_duration = meas_commits[0][3] / 1_000_000 or 2.0
-
-    e2e_tps       = sum(c[2] for c in meas_commits) / meas_duration
-    e2e_bps       = e2e_tps * TXN_SIZE_BYTES
-    consensus_tps = len(meas_commits) / meas_duration
-
-    lat_us_values    = [c[3] for c in meas_commits]
-    consensus_latency_s = trimmed_mean(lat_us_values) / 1_000_000 if lat_us_values else 0.0
-
-    return round(e2e_tps, 1), round(e2e_bps, 1), round(consensus_tps, 3), round(consensus_latency_s, 4), slots_committed
-
+        duration = max(1.0, fallback_duration)
+    tps = sum(e[1] for e in entries) / max(0.001, duration)
+    lat_us_vals = [e[2] for e in entries]
+    latency_s = trimmed_mean(lat_us_vals) / 1_000_000
+    return round(tps, 1), round(latency_s, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -347,41 +306,33 @@ def run_experiment(
     target_tps: int = 0,
 ) -> Tuple[float, float, float, float, int]:
     """
-    Reserve machines, run one experiment, return (e2e_tps, e2e_bps, con_tps, con_lat, slots).
-    target_tps: total target TPS across all clients (0 = unlimited).
-    Reservation is released after the run completes (or on error).
+    Reserve machines, run one experiment, return:
+      (consensus_tps, consensus_latency_s, execution_tps, execution_latency_s, slots)
     """
-    run_id = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_n{num_replicas}_{mode}_bs{block_size}"
+    run_id = (f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+              f"_n{num_replicas}_{mode}_r{target_tps}")
     print(f"\n{'='*60}")
-    print(f"  Experiment: {run_id}")
+    print(f"  {run_id}")
     print(f"{'='*60}")
 
-    # Extra time: startup + warmup + runtime + teardown buffer
     total_secs = runtime + 120
     duration_str = str(datetime.timedelta(seconds=total_secs))
-
     pm = PreserveManager(USERNAME)
-
     total_machines = num_replicas + num_clients
-
     per_client_tps = (target_tps // num_clients) if target_tps > 0 else 0
 
     if dry_run:
-        print(f"[DRY-RUN] Would reserve {total_machines} machines ({num_replicas} replicas + {num_clients} clients) for {duration_str}")
+        print(f"[DRY-RUN] Reserve {total_machines} machines for {duration_str}")
         print(f"[DRY-RUN] target_tps={target_tps}  per_client_tps={per_client_tps}")
-        print(f"[DRY-RUN] Would generate certs, write server.config, start replicas and clients")
-        print(f"[DRY-RUN] Would wait {runtime}s, kill all nodes, parse logs")
         return 0.0, 0.0, 0.0, 0.0, 0
 
-    # ---- Reserve machines ----
     reservation_id = pm.create_reservation(total_machines, duration_str)
-    print(f"Reservation ID: {reservation_id}")
+    print(f"Reservation: {reservation_id}")
     time.sleep(5)
 
     try:
-        # Wait for machines to be assigned
+        # Wait for machines
         hostnames = []
-        print("Waiting for machines to be assigned...")
         deadline = time.time() + 300
         while time.time() < deadline:
             reservations = pm.get_own_reservations()
@@ -398,54 +349,49 @@ def run_experiment(
         client_hosts  = hostnames[num_replicas:]
         replica_ips   = [socket.gethostbyname(h) for h in replica_hosts]
         client_ips    = [socket.gethostbyname(h) for h in client_hosts]
-        print(f"Replica hosts: {replica_hosts}  IPs: {replica_ips}")
-        print(f"Client hosts:  {client_hosts}  IPs: {client_ips}")
+        print(f"Replicas: {replica_hosts}")
+        print(f"Clients:  {client_hosts}")
 
-        # ---- Prepare runtime directory (on shared NFS path) ----
         runtime_dir = RUNTIME_BASE / run_id
-        cert_dir = runtime_dir / "cert"
-        log_dir = runtime_dir / "logs"
+        cert_dir    = runtime_dir / "cert"
+        log_dir     = runtime_dir / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
 
-        # ---- Generate certs with real IPs ----
         print("Generating certificates...")
         generate_certs(cert_dir, replica_ips, client_ips)
 
-        # ---- Write server.config (replica topology only) ----
         config_path = runtime_dir / "server.config"
-        write_server_config(config_path, replica_ips, mode, block_size, per_client_tps, runtime)
-        print(f"Config written: {config_path}  (per_client_tps={per_client_tps})")
+        write_server_config(config_path, replica_ips, mode, block_size,
+                            per_client_tps, runtime)
+        print(f"Config: {config_path}  (per_client_tps={per_client_tps})")
 
-        # ---- Write per-client trigger configs for kv_service_tools ----
         for j, ip in enumerate(client_ips, 1):
             node_id = num_replicas + j
-            write_client_trigger_config(runtime_dir / f"client_{node_id}.config", node_id, ip)
+            write_client_trigger_config(
+                runtime_dir / f"client_{node_id}.config", node_id, ip)
 
         env_prefix = (
             f"export TEE_ENCLAVE_PATH={TEE_ENCLAVE_PATH}; "
             f"export LD_LIBRARY_PATH={LD_LIBRARY_PATH}:$LD_LIBRARY_PATH; "
         )
 
-        # ---- Start replicas ----
+        # Start replicas
         print("Starting replicas...")
         procs = []
         for i, host in enumerate(replica_hosts, 1):
-            log_file = log_dir / f"server_{i}.log"
-            priv_key = cert_dir / f"node_{i}.key.pri"
+            log_file  = log_dir / f"server_{i}.log"
+            priv_key  = cert_dir / f"node_{i}.key.pri"
             cert_file = cert_dir / f"cert_{i}.cert"
-            remote_cmd = (
-                f"{env_prefix}"
-                f"nohup {SERVER_BIN} {config_path} {priv_key} {cert_file} "
-                f"> {log_file} 2>&1 &"
-            )
-            p = ssh_cmd(host, remote_cmd, dry_run=False)
+            p = ssh_cmd(host,
+                f"{env_prefix}nohup {SERVER_BIN} {config_path} {priv_key} "
+                f"{cert_file} > {log_file} 2>&1 &")
             if p:
                 procs.append(p)
         for p in procs:
             p.wait()
 
-        # ---- Wait for all replicas to connect ----
-        print(f"Waiting for {num_replicas} replicas to connect (timeout={READY_TIMEOUT}s)...")
+        # Wait for all replicas to connect
+        print(f"Waiting for {num_replicas} replicas (timeout={READY_TIMEOUT}s)...")
         ready_pattern = f"receive public size:{num_replicas}"
         deadline = time.time() + READY_TIMEOUT
         ready = [False] * num_replicas
@@ -453,75 +399,75 @@ def run_experiment(
             for i in range(num_replicas):
                 if ready[i]:
                     continue
-                log_file = log_dir / f"server_{i+1}.log"
-                if log_file.exists() and ready_pattern in log_file.read_text(errors="replace"):
+                lf = log_dir / f"server_{i+1}.log"
+                if lf.exists() and ready_pattern in lf.read_text(errors="replace"):
                     ready[i] = True
                     print(f"  Replica {i+1} ready")
             if not all(ready):
                 time.sleep(2)
-
         if not all(ready):
             not_ready = [i+1 for i, r in enumerate(ready) if not r]
-            print(f"WARNING: replicas {not_ready} did not signal ready — continuing anyway")
+            print(f"WARNING: replicas {not_ready} not ready — continuing anyway")
 
-        # ---- Start client nodes ----
+        # Start client nodes
         print("Starting client nodes...")
         client_procs = []
         for j, host in enumerate(client_hosts, 1):
-            node_id = num_replicas + j
-            log_file = log_dir / f"client_{node_id}.log"
-            priv_key = cert_dir / f"node_{node_id}.key.pri"
+            node_id   = num_replicas + j
+            log_file  = log_dir / f"client_{node_id}.log"
+            priv_key  = cert_dir / f"node_{node_id}.key.pri"
             cert_file = cert_dir / f"cert_{node_id}.cert"
-            remote_cmd = (
-                f"{env_prefix}"
-                f"nohup {SERVER_BIN} {config_path} {priv_key} {cert_file} "
-                f"> {log_file} 2>&1 &"
-            )
-            p = ssh_cmd(host, remote_cmd, dry_run=False)
+            p = ssh_cmd(host,
+                f"{env_prefix}nohup {SERVER_BIN} {config_path} {priv_key} "
+                f"{cert_file} > {log_file} 2>&1 &")
             if p:
                 client_procs.append(p)
         for p in client_procs:
             p.wait()
 
-        # ---- Wait for each client node to be listening on its port ----
-        print("Waiting for client nodes to be ready (port open)...")
-        client_ready_timeout = 60  # seconds
+        # Wait for client ports to open
+        print("Waiting for client nodes to be ready...")
         for j, (host, ip) in enumerate(zip(client_hosts, client_ips), 1):
             node_id = num_replicas + j
-            port = BASE_PORT + node_id - 1
-            deadline_c = time.time() + client_ready_timeout
-            ready = False
+            port    = BASE_PORT + node_id - 1
+            deadline_c = time.time() + 60
+            ok = False
             while time.time() < deadline_c:
                 try:
                     s = socket.create_connection((ip, port), timeout=1)
                     s.close()
-                    ready = True
+                    ok = True
                     print(f"  Client {node_id} ({ip}:{port}) ready")
                     break
                 except OSError:
                     time.sleep(1)
-            if not ready:
-                print(f"  WARNING: client {node_id} ({ip}:{port}) not listening after "
-                      f"{client_ready_timeout}s — triggering anyway")
+            if not ok:
+                print(f"  WARNING: client {node_id} not listening — triggering anyway")
 
-        # ---- Trigger each client node via kv_service_tools (runs on headnode) ----
-        # kv_service_tools sends a TYPE_CLIENT_REQUEST to the client node, which
-        # calls PerformanceManager::StartEval() and starts BatchProposeMsg.
-        print("Triggering client nodes...")
+        # Trigger clients.
+        # experiment_start is captured BEFORE the trigger subprocess is
+        # spawned: the trigger is just a kv_client.Set("start", ...) call,
+        # but on an overloaded / misconfigured client it can block for
+        # seconds waiting for an ACK.  Anchoring to now() before the Set
+        # guarantees the measurement window starts at-or-before the first
+        # commit.  (It is fine that the window begins very slightly before
+        # the trigger actually arrives — no activity can have happened yet,
+        # so no extra entries get included.)
+        print("Triggering clients...")
+        experiment_start = datetime.datetime.now()
         trigger_procs = []
         for j in range(1, num_clients + 1):
-            node_id = num_replicas + j
+            node_id    = num_replicas + j
             client_cfg = runtime_dir / f"client_{node_id}.config"
             trigger_procs.append(subprocess.Popen([str(CLIENT_BIN), str(client_cfg)]))
         for p in trigger_procs:
             p.wait()
 
-        # ---- Run for experiment duration ----
         print(f"Running for {runtime}s...")
         time.sleep(runtime)
 
-        # ---- Kill replicas and clients ----
-        print("Killing replicas and clients...")
+        # Kill all
+        print("Killing nodes...")
         kill_procs = []
         for host in replica_hosts + client_hosts:
             p = ssh_cmd(host, "killall -9 kv_server_performance 2>/dev/null || true")
@@ -531,30 +477,76 @@ def run_experiment(
             p.wait()
         time.sleep(2)
 
-        # ---- Parse replica logs for throughput and consensus metrics ----
+        # Parse logs
         print("Parsing logs...")
-        best_e2e_tps = 0.0
-        best_e2e_bps = 0.0
-        best_con_tps = 0.0
-        best_con_lat = 0.0
-        best_slots = 0
-        for i in range(1, num_replicas + 1):
-            log_file = log_dir / f"server_{i}.log"
-            e2e_tps, e2e_bps, con_tps, con_lat, slots = parse_log(log_file, warmup, runtime)
-            print(f"  Replica {i}: e2e_TPS={e2e_tps}  e2e_BPS={e2e_bps}  con_TPS={con_tps}  con_lat={con_lat}s  slots={slots}")
-            if e2e_tps > best_e2e_tps:
-                best_e2e_tps, best_e2e_bps, best_con_tps, best_con_lat = e2e_tps, e2e_bps, con_tps, con_lat
-                best_slots = slots
+        fallback_dur = max(1.0, runtime - warmup)
+        per_replica_con_tps: list = []
+        per_replica_con_lat: list = []
+        per_replica_exec_tps: list = []
+        per_replica_exec_lat: list = []
+        slots_committed = 0
+        any_cert_fallback = False
+        any_exec_fallback = False
 
-        print(f"=> Best: e2e_TPS={best_e2e_tps}  e2e_BPS={best_e2e_bps}  con_TPS={best_con_tps}  con_lat={best_con_lat}s")
-        return best_e2e_tps, best_e2e_bps, best_con_tps, best_con_lat, best_slots
+        for i in range(1, num_replicas + 1):
+            lf = log_dir / f"server_{i}.log"
+            cert_meas, exec_meas, cert_total, exec_total, cert_fb, exec_fb = parse_log_file(
+                lf, experiment_start, warmup, runtime)
+            slots_committed = max(slots_committed, exec_total)
+            any_cert_fallback = any_cert_fallback or cert_fb
+            any_exec_fallback = any_exec_fallback or exec_fb
+            con_tps_i, con_lat_i = _compute_tps_latency(cert_meas, fallback_dur)
+            exec_tps_i, exec_lat_i = _compute_tps_latency(exec_meas, fallback_dur)
+            flag = ""
+            if cert_fb or exec_fb:
+                flag = f"  [fallback:{('c' if cert_fb else '')}{('e' if exec_fb else '')}]"
+            print(f"  Replica {i}: con={con_tps_i:.0f}tps/{con_lat_i*1000:.0f}ms"
+                  f"  exec={exec_tps_i:.0f}tps/{exec_lat_i*1000:.0f}ms"
+                  f"  cert_blocks={cert_total}  slots={exec_total}{flag}")
+            if con_tps_i > 0:
+                per_replica_con_tps.append(con_tps_i)
+                per_replica_con_lat.append(con_lat_i)
+            if exec_tps_i > 0:
+                per_replica_exec_tps.append(exec_tps_i)
+                per_replica_exec_lat.append(exec_lat_i)
+
+        if any_cert_fallback or any_exec_fallback:
+            which = []
+            if any_cert_fallback: which.append("cert")
+            if any_exec_fallback: which.append("exec")
+            print(f"  NOTE: bursty run — {'/'.join(which)} activity fell inside "
+                  f"the {warmup}s warmup window; using full [start, start+runtime] "
+                  f"window as fallback.")
+
+        # Both metrics: median across replicas.
+        # consensus_tps: each replica logs only its OWN block certifications
+        #   (block_certified fires only on the originating replica), so one
+        #   replica's cert rate = that replica's share ≈ total/N.
+        # execution_tps: every replica commits every slot (Commit() runs on all),
+        #   so each replica's exec rate = the full system throughput.  Taking the
+        #   median (vs the old "best replica") avoids inflating with outliers and
+        #   is more robust to lagging replicas.
+        def _median(xs):
+            s = sorted(xs)
+            n = len(s)
+            return (s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2) if s else 0.0
+
+        consensus_tps   = round(_median(per_replica_con_tps), 1)
+        consensus_lat_s = _median(per_replica_con_lat)
+        execution_tps   = round(_median(per_replica_exec_tps), 1)
+        execution_lat_s = _median(per_replica_exec_lat)
+
+        print(f"=> con_TPS={consensus_tps}  con_lat={consensus_lat_s*1000:.0f}ms"
+              f"  exec_TPS={execution_tps}  exec_lat={execution_lat_s*1000:.0f}ms"
+              f"  slots={slots_committed}")
+        return consensus_tps, consensus_lat_s, execution_tps, execution_lat_s, slots_committed
 
     finally:
         try:
             pm.kill_reservation(reservation_id)
             print(f"Reservation {reservation_id} released.")
         except Exception as e:
-            print(f"Warning: could not release reservation {reservation_id}: {e}")
+            print(f"Warning: could not release reservation: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +557,10 @@ def init_csv(path: Path, header: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         path.write_text(header + "\n")
+        return
+    content = path.read_text()
+    if not content.startswith(header):
+        path.write_text(header + "\n" + content)
 
 
 def append_csv(path: Path, row: str):
@@ -572,105 +568,136 @@ def append_csv(path: Path, row: str):
         f.write(row + "\n")
 
 
-# ---------------------------------------------------------------------------
-# Experiment suite — mirrors gsegalin's Tilikum thesis experiments
-# ---------------------------------------------------------------------------
-
-BLOCK_SIZE = 100  # fixed block size for all runs
-
-# Per-N input rates from gsegalin's Tilikum n-scaling experiments.
-# These are the total tx/s sent by all clients combined.
-N_SCALING_INPUT_RATES = {
-    10: 15_000,
-    13: 13_000,
-    16: 10_000,
-    19:  8_018,
-    22:  7_018,
-    25:  5_000,
-}
-
-RUNTIME     = 60   # matches gsegalin's ~60s execution time
-WARMUP      = 15
-REPETITIONS = 5    # matches gsegalin's >=5 runs per configuration
-NUM_CLIENTS = 1    # ResilientDB TPS is client-limited; target_input_tps controls rate
-
-
-def run_n_scaling(dry_run: bool):
-    """N-scaling: committee size N=10,13,16,19,22,25, modes=[ol,bof].
-
-    Mirrors gsegalin's experiment: local-0-1-0-1-{N}.txt
-      - Faults: 0
-      - Workers per node: 1 (collocated)
-      - Input rate: varies per N (see N_SCALING_INPUT_RATES)
-      - At least 5 runs per (N, mode) for statistical validity
+def _load_completed_runs(csv_path: Path) -> set:
     """
-    csv_path = RESULTS_DIR / "n_scaling.csv"
-    init_csv(csv_path, "n,mode,rep,e2e_tps,e2e_bps,consensus_tps,consensus_latency_s,slots_committed")
-    print("\n\n=== N-scaling experiment (OL vs BOF) ===")
+    Return set of (n, mode, rate, rep) tuples that already have a successful
+    result (consensus_tps > 0) in the CSV.  Zero-result rows are NOT counted
+    as completed so they get re-run.
+    """
+    completed: set = set()
+    if not csv_path.exists():
+        return completed
+    with open(csv_path) as f:
+        for line in f:
+            parts = line.strip().split(',')
+            if len(parts) < 5:
+                continue
+            try:
+                n, mode, rate, rep = int(parts[0]), parts[1], int(parts[2]), int(parts[3])
+                if float(parts[4]) > 0:
+                    completed.add((n, mode, rate, rep))
+            except (ValueError, IndexError):
+                continue
+    return completed
 
-    for n in [10, 13, 16, 19, 22, 25]:
-        target_tps = N_SCALING_INPUT_RATES[n]
+
+# ---------------------------------------------------------------------------
+# Rate-sweep experiment  (produces the L-curve data)
+# ---------------------------------------------------------------------------
+
+def run_rate_sweep(dry_run: bool, nodes_filter: Optional[List[int]] = None):
+    """
+    For each N (committee size) and mode (ol/bof), sweep injection rates
+    from below saturation to above.  Each (N, mode, rate) → 5 repetitions.
+
+    Produces tput_latency.csv with columns:
+      n, mode, input_rate, rep,
+      consensus_tps, consensus_latency_ms,
+      execution_tps, execution_latency_ms,
+      slots_committed
+
+    Resume behaviour: any (n, mode, rate, rep) already present in the CSV
+    with consensus_tps > 0 is skipped.  Zero-result rows are re-run.
+    """
+    csv_path = RESULTS_DIR / "tput_latency.csv"
+    init_csv(csv_path,
+             "n,mode,input_rate,rep,"
+             "consensus_tps,consensus_latency_ms,"
+             "execution_tps,execution_latency_ms,"
+             "slots_committed")
+
+    completed = _load_completed_runs(csv_path)
+    if completed:
+        print(f"Resuming: {len(completed)} run(s) already complete, will skip them.")
+
+    n_values = sorted(RATE_SWEEP.keys())
+    if nodes_filter:
+        n_values = [n for n in n_values if n in nodes_filter]
+
+    print(f"\n=== Throughput-Latency rate sweep  (N={n_values}) ===")
+
+    for n in n_values:
+        rates = RATE_SWEEP[n]
         for mode in ["ol", "bof"]:
-            for rep in range(1, REPETITIONS + 1):
-                print(f"\n--- n={n}  mode={mode}  rep={rep}/{REPETITIONS}  target_tps={target_tps} ---")
-                e2e_tps, e2e_bps, con_tps, con_lat, slots = run_experiment(
-                    num_replicas=n,
-                    mode=mode,
-                    block_size=BLOCK_SIZE,
-                    runtime=RUNTIME,
-                    warmup=WARMUP,
-                    dry_run=dry_run,
-                    num_clients=NUM_CLIENTS,
-                    target_tps=target_tps,
-                )
-                append_csv(csv_path,
-                    f"{n},{mode},{rep},{e2e_tps},{e2e_bps},{con_tps},{con_lat},{slots}")
-                if not dry_run:
-                    time.sleep(10)
-
-
+            for rate in rates:
+                for rep in range(1, REPETITIONS + 1):
+                    if (n, mode, rate, rep) in completed:
+                        print(f"  skip n={n} mode={mode} rate={rate} rep={rep} (done)")
+                        continue
+                    print(f"\n--- n={n}  mode={mode}  rate={rate}  rep={rep}/{REPETITIONS} ---")
+                    con_tps, con_lat_s, exec_tps, exec_lat_s, slots = run_experiment(
+                        num_replicas=n,
+                        mode=mode,
+                        block_size=BLOCK_SIZE,
+                        runtime=RUNTIME,
+                        warmup=WARMUP,
+                        dry_run=dry_run,
+                        num_clients=n,   # one client per replica
+                        target_tps=rate,
+                    )
+                    append_csv(csv_path,
+                        f"{n},{mode},{rate},{rep},"
+                        f"{con_tps},{round(con_lat_s * 1000, 2)},"
+                        f"{exec_tps},{round(exec_lat_s * 1000, 2)},"
+                        f"{slots}")
+                    if not dry_run:
+                        time.sleep(10)
 
 
 # ---------------------------------------------------------------------------
 # Summary printer
 # ---------------------------------------------------------------------------
 
-def _tmean(xs: list) -> float:
-    """Trimmed mean: drop lowest and highest, then average."""
-    xs = sorted(x for x in xs if x > 0)
-    if len(xs) > 2:
-        xs = xs[1:-1]
-    return sum(xs) / len(xs) if xs else 0.0
-
-
 def print_summary():
     import csv as csv_mod
     from collections import defaultdict
 
-    # --- N-scaling ---
-    csv_path = RESULTS_DIR / "n_scaling.csv"
-    if csv_path.exists():
-        print(f"\n=== N-scaling results ({csv_path}) ===")
-        rows = list(csv_mod.DictReader(csv_path.open()))
-        if rows:
-            print(f"\n{'n':>4}  {'mode':>6}  {'rep':>4}  {'e2e_tps':>9}  {'e2e_bps':>11}  {'con_tps':>9}  {'con_lat_s':>10}")
-            for r in rows:
-                print(f"{r['n']:>4}  {r['mode']:>6}  {r['rep']:>4}  {r['e2e_tps']:>9}  {r['e2e_bps']:>11}  {r['consensus_tps']:>9}  {r['consensus_latency_s']:>10}")
+    csv_path = RESULTS_DIR / "tput_latency.csv"
+    if not csv_path.exists():
+        return
 
-            agg: dict = defaultdict(lambda: {"e2e_tps": [], "e2e_bps": [], "con_tps": [], "con_lat": []})
-            for r in rows:
-                key = (r["n"], r["mode"])
-                try:
-                    agg[key]["e2e_tps"].append(float(r["e2e_tps"]))
-                    agg[key]["e2e_bps"].append(float(r["e2e_bps"]))
-                    agg[key]["con_tps"].append(float(r["consensus_tps"]))
-                    agg[key]["con_lat"].append(float(r["consensus_latency_s"]))
-                except ValueError:
-                    pass
-            print(f"\n{'n':>4}  {'mode':>6}  {'mean_e2e_tps':>13}  {'mean_e2e_bps':>14}  {'mean_con_tps':>14}  {'mean_con_lat_s':>16}")
-            for (n, mode), v in sorted(agg.items()):
-                print(f"{n:>4}  {mode:>6}  {_tmean(v['e2e_tps']):>13.1f}  {_tmean(v['e2e_bps']):>14.1f}  {_tmean(v['con_tps']):>14.3f}  {_tmean(v['con_lat']):>16.4f}")
+    print(f"\n=== Rate-sweep results ({csv_path}) ===")
+    rows = list(csv_mod.DictReader(csv_path.open()))
+    if not rows:
+        return
 
+    # Aggregate per (n, mode, input_rate)
+    agg: dict = defaultdict(lambda: {
+        "con_tps": [], "con_lat": [], "exec_tps": [], "exec_lat": []
+    })
+    for r in rows:
+        key = (r["n"], r["mode"], r["input_rate"])
+        try:
+            agg[key]["con_tps"].append(float(r["consensus_tps"]))
+            agg[key]["con_lat"].append(float(r["consensus_latency_ms"]))
+            agg[key]["exec_tps"].append(float(r["execution_tps"]))
+            agg[key]["exec_lat"].append(float(r["execution_latency_ms"]))
+        except (ValueError, KeyError):
+            pass
+
+    def tmean(xs):
+        xs = sorted(x for x in xs if x > 0)
+        if len(xs) > 2:
+            xs = xs[1:-1]
+        return sum(xs) / len(xs) if xs else 0.0
+
+    print(f"\n{'n':>4}  {'mode':>5}  {'rate':>6}"
+          f"  {'exec_tps':>9}  {'exec_lat_ms':>12}"
+          f"  {'con_tps':>9}  {'con_lat_ms':>10}")
+    for (n, mode, rate), v in sorted(agg.items()):
+        print(f"{n:>4}  {mode:>5}  {rate:>6}"
+              f"  {tmean(v['exec_tps']):>9.1f}  {tmean(v['exec_lat']):>12.1f}"
+              f"  {tmean(v['con_tps']):>9.1f}  {tmean(v['con_lat']):>10.1f}")
 
 
 # ---------------------------------------------------------------------------
@@ -678,11 +705,15 @@ def print_summary():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="DAS5 benchmark orchestrator for OL vs BOF thesis")
+    parser = argparse.ArgumentParser(
+        description="DAS5 throughput-latency rate sweep (L-curve experiment)"
+    )
     parser.add_argument("--dry-run", action="store_true",
-                        help="Print what would be done without reserving machines or running SSH")
+                        help="Print plan without reserving machines or running SSH")
     parser.add_argument("--skip-build", action="store_true",
-                        help="Skip the bazel build step (use pre-built binaries in bazel-bin/)")
+                        help="Skip bazel build (use pre-built binaries)")
+    parser.add_argument("--nodes", type=int, nargs="+",
+                        help="Only sweep these N values (e.g. --nodes 10 16)")
     args = parser.parse_args()
 
     if not args.dry_run:
@@ -693,7 +724,7 @@ if __name__ == "__main__":
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     RUNTIME_BASE.mkdir(parents=True, exist_ok=True)
 
-    run_n_scaling(dry_run=args.dry_run)
+    run_rate_sweep(dry_run=args.dry_run, nodes_filter=args.nodes)
 
     print_summary()
     print("\nDone. Results in:", RESULTS_DIR)

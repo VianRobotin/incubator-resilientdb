@@ -9,7 +9,7 @@
 #   cd platform/consensus/ordering/autobahn/tee && make
 #   Then: bazel build //benchmark/protocols/autobahn:kv_server_performance
 
-SGX_SDK    ?= /opt/intel/sgxsdk
+SGX_SDK    ?= /var/scratch/vrobotin/sgxsdk
 SGX_MODE   := SIM      # Simulation mode — no hardware driver needed
 SGX_ARCH   := x64
 SGX_DEBUG  := 1
@@ -79,10 +79,16 @@ gen_stubs: $(GEN_DIR)/tee_enclave_t.h $(GEN_DIR)/tee_enclave_u.h
 
 $(GEN_DIR)/tee_enclave_t.h $(GEN_DIR)/tee_enclave_u.h: tee_enclave.edl
 	@mkdir -p $(GEN_DIR)
-	$(SGX_EDGER8R) --trusted   tee_enclave.edl --search-path $(SGX_SDK)/include \
-	                                            --trusted-dir  $(GEN_DIR)
-	$(SGX_EDGER8R) --untrusted tee_enclave.edl --search-path $(SGX_SDK)/include \
-	                                            --untrusted-dir $(GEN_DIR)
+	@if $(SGX_EDGER8R) --version > /dev/null 2>&1; then \
+	    $(SGX_EDGER8R) --trusted   tee_enclave.edl --search-path $(SGX_SDK)/include \
+	                                                --trusted-dir  $(GEN_DIR); \
+	    $(SGX_EDGER8R) --untrusted tee_enclave.edl --search-path $(SGX_SDK)/include \
+	                                                --untrusted-dir $(GEN_DIR); \
+	else \
+	    echo "[TEE] sgx_edger8r unavailable (GLIBC too old) — using pre-updated gen/ files"; \
+	    touch $(GEN_DIR)/tee_enclave_t.h $(GEN_DIR)/tee_enclave_t.c \
+	          $(GEN_DIR)/tee_enclave_u.h $(GEN_DIR)/tee_enclave_u.c; \
+	fi
 
 # ---- Step 2: Build enclave .so ----
 enclave: $(Signed_Enclave_So)

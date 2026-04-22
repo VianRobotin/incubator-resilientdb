@@ -176,6 +176,26 @@ bool TeeHost::SignBytes(const std::string& data, std::string* sig64_out) {
     return true;
 }
 
+/* ---- VerifyBytes ECALL (HMAC verification inside enclave) ---- */
+
+bool TeeHost::VerifyBytes(const std::string& data, const std::string& sig64) const {
+    if (!ok_) return false;
+    if (data.empty() || data.size() > 1024) return false;
+    if (sig64.size() < 32) return false;
+
+    sgx_status_t ecall_ret;
+    std::unique_lock<std::mutex> lk(const_cast<std::mutex&>(mu_));
+    sgx_status_t ret = ecall_verify_bytes(
+            static_cast<sgx_enclave_id_t>(eid_),
+            &ecall_ret,
+            reinterpret_cast<const uint8_t*>(data.data()),
+            static_cast<uint32_t>(data.size()),
+            reinterpret_cast<const uint8_t*>(sig64.data()));
+    lk.unlock();
+
+    return ret == SGX_SUCCESS && ecall_ret == SGX_SUCCESS;
+}
+
 /* ---- Signature verification (OpenSSL, untrusted side) ---- */
 
 /* Reverse 32 bytes: SGX little-endian → OpenSSL big-endian. */

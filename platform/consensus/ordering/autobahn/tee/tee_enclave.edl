@@ -56,6 +56,17 @@ enclave {
             uint32_t                            data_len,
             [out, size=64]      uint8_t*        sig_out
         );
+
+        /* Verify a previously-signed L⃗ HMAC inside the enclave.
+         * Returns SGX_SUCCESS if the first 32 bytes of expected_mac match
+         * HMAC-SHA256(g_hmac_key, data).  Returns SGX_ERROR_INVALID_PARAMETER
+         * if the MAC does not match.  Requires ecall_init_tee to have run.
+         */
+        public sgx_status_t ecall_verify_bytes(
+            [in, size=data_len] const uint8_t* data,
+            uint32_t                            data_len,
+            [in, size=32]       const uint8_t* expected_mac
+        );
     };
 
     untrusted {
