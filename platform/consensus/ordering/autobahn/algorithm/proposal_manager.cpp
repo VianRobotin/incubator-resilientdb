@@ -644,9 +644,16 @@ RelativeOrdering ProposalManager::RecordLocalReceiveOrder(const Block& block) {
 }
 
 // Record a replica's relative ordering of transactions.
-// Updates pairwise precedence counts for the dependency graph.
-// Algorithm 5: only counts the first f+1 block-orderings per pair,
-// matching the paper's "first f+1 blocks in B with attestations for both ta and tb".
+//
+// Stores the ordering as a list under its (block_sender, block_id) key rather
+// than expanding it into O(k²) pair entries here.  Pair counts are derived
+// lazily at proposal/validation time over candidates only (see
+// ComputeBatchOrderingImpl), which keeps this ingest path at O(k) per message
+// and bounds the lock hold-time by block_size rather than block_size².
+//
+// Algorithm 5 cap ("first f+1 blocks with attestations for both ta and tb")
+// is enforced by storing at most f+1 orderings per block, from distinct
+// ordering-senders.
 void ProposalManager::AddRelativeOrdering(const RelativeOrdering& ordering) {
   std::unique_lock<std::mutex> lk(bof_mutex_);
 
@@ -658,26 +665,22 @@ void ProposalManager::AddRelativeOrdering(const RelativeOrdering& ordering) {
     return;  // already processed this block's ordering from this sender
   }
 
-  // Collect the txn hashes in order
+  auto block_key = std::make_pair(ordering.block_sender_id(),
+                                  ordering.block_local_id());
+  auto& entry = block_orderings_[block_key];
+  // Cap orderings per block at f+1 (Algorithm 5).
+  if (entry.orderings.size() >= static_cast<size_t>(f_ + 1)) return;
+  if (!entry.contributors.insert(ordering.sender_id()).second) return;
+
   std::vector<std::string> txn_list;
+  txn_list.reserve(ordering.txn_hashes_size());
   for (const auto& h : ordering.txn_hashes()) {
     txn_list.push_back(h);
-    bof_known_txns_.insert(h);
+    // First ordering for the block seeds the txn-to-block reverse index.
+    // Subsequent orderings hit the existing entry (map::emplace is O(1) avg).
+    txn_to_block_.emplace(h, block_key);
   }
-
-  // Update pairwise precedence counts (Algorithm 5).
-  // For pair (a, b) where a precedes b in this ordering, increment the count
-  // only if fewer than f+1 block-orderings have been counted for this pair.
-  // This matches "first f+1 blocks with attestations for both ta and tb".
-  for (size_t i = 0; i < txn_list.size(); ++i) {
-    for (size_t j = i + 1; j < txn_list.size(); ++j) {
-      auto key_ab = std::make_pair(txn_list[i], txn_list[j]);
-      if (pair_contribution_count_[key_ab] < f_ + 1) {
-        precedes_count_[key_ab]++;
-        pair_contribution_count_[key_ab]++;
-      }
-    }
-  }
+  entry.orderings.push_back(std::move(txn_list));
 }
 
 // ============================================================
@@ -685,16 +688,28 @@ void ProposalManager::AddRelativeOrdering(const RelativeOrdering& ordering) {
 // and ComputeBatchOrderingReadOnly)
 // ============================================================
 
-// Ordered-map copy of pairwise precedence counts.  std::map<pair<string,string>>
-// works without a custom hasher and avoids exposing the private PairHash type.
-using PairMap = std::map<std::pair<std::string, std::string>, int>;
-
 // ComputeBatchOrderingImpl: pure dependency-graph computation with no side
 // effects.  Candidates must already be filtered for the desired window and
 // must not include already-committed transactions.
+//
+// Edges are derived lazily from per-block stored orderings: for each block
+// that contributes candidates, we count (positional) precedence agreements
+// across that block's ≤ f+1 orderings and add an edge when the count meets
+// the threshold θ = ⌈γ(f+1)⌉.
+//
+// Since txns from distinct blocks never co-occur in a single ordering, there
+// are no cross-block edges — the graph is the disjoint union of per-block
+// subgraphs.  Work is O(Σ_block b_i² · f) where b_i is the number of
+// candidates in block i, bounded by O(|candidates|² · f) in the worst case
+// but typically far smaller because candidates are spread across blocks.
+//
+// This replaces the previous O(k²)-per-ingest + whole-map-copy approach, whose
+// state grew unboundedly with history and caused the BOF saturation cliff.
 static std::vector<std::vector<std::string>> ComputeBatchOrderingImpl(
     const std::vector<std::string>& candidates,
-    const PairMap& precedes_count,
+    const std::unordered_map<std::string, std::pair<int, int64_t>>& txn_to_block,
+    const std::map<std::pair<int, int64_t>,
+                   ProposalManager::BlockOrderings>& block_orderings,
     float bof_gamma, int f) {
 
   if (candidates.empty()) return {};
@@ -703,24 +718,65 @@ static std::vector<std::vector<std::string>> ComputeBatchOrderingImpl(
   std::vector<std::vector<int>> adj(n), radj(n);
   int theta = static_cast<int>(std::ceil(bof_gamma * (f + 1)));
 
-  // Iterate the precedence edges directly rather than scanning all O(n²)
-  // candidate pairs: in practice precedes_count is sparse (it only contains
-  // pairs that were ever observed in an ordering indicator), so edge
-  // iteration is O(|edges| · log n) vs the previous O(n² · log |edges|).
   std::unordered_map<std::string, int> cand_idx;
   cand_idx.reserve(n);
   for (int i = 0; i < n; ++i) cand_idx[candidates[i]] = i;
 
-  for (const auto& kv : precedes_count) {
-    if (kv.second < theta) continue;
-    auto ita = cand_idx.find(kv.first.first);
-    if (ita == cand_idx.end()) continue;
-    auto itb = cand_idx.find(kv.first.second);
-    if (itb == cand_idx.end()) continue;
-    int i = ita->second, j = itb->second;
-    if (i == j) continue;
-    adj[i].push_back(j);
-    radj[j].push_back(i);
+  // Group candidates by their originating block.
+  std::map<std::pair<int, int64_t>, std::vector<int>> cand_by_block;
+  for (int i = 0; i < n; ++i) {
+    auto it = txn_to_block.find(candidates[i]);
+    if (it == txn_to_block.end()) continue;  // ordering not yet received
+    cand_by_block[it->second].push_back(i);
+  }
+
+  // For each block with candidates, count per-ordering positional precedence
+  // only among this block's candidates and add edges that meet the threshold.
+  for (const auto& [block_key, cand_ids] : cand_by_block) {
+    auto bit = block_orderings.find(block_key);
+    if (bit == block_orderings.end()) continue;
+    const auto& orderings = bit->second.orderings;
+    if (orderings.empty()) continue;
+
+    // For each ordering, build a position map: candidate-global-index → rank
+    // within that ordering (0-based, only among candidates in this block).
+    // Walking each ordering once is O(|ordering|); rank lookup is O(1).
+    int num_orderings = static_cast<int>(orderings.size());
+    std::vector<std::unordered_map<int, int>> rank(num_orderings);
+    for (int o = 0; o < num_orderings; ++o) {
+      rank[o].reserve(cand_ids.size());
+      int r = 0;
+      for (const auto& h : orderings[o]) {
+        auto it = cand_idx.find(h);
+        if (it == cand_idx.end()) continue;  // not a candidate in this block
+        rank[o].emplace(it->second, r++);
+      }
+    }
+
+    // For each candidate pair (a, b) in this block, count orderings where
+    // rank[a] < rank[b].  O(b² · num_orderings) with O(1) rank lookups.
+    int b = static_cast<int>(cand_ids.size());
+    for (int i = 0; i < b; ++i) {
+      for (int j = i + 1; j < b; ++j) {
+        int ca = cand_ids[i], cb = cand_ids[j];
+        int ab = 0, ba = 0;
+        for (int o = 0; o < num_orderings; ++o) {
+          auto ita = rank[o].find(ca);
+          auto itb = rank[o].find(cb);
+          if (ita == rank[o].end() || itb == rank[o].end()) continue;
+          if (ita->second < itb->second) ab++;
+          else if (itb->second < ita->second) ba++;
+        }
+        if (ab >= theta) {
+          adj[ca].push_back(cb);
+          radj[cb].push_back(ca);
+        }
+        if (ba >= theta) {
+          adj[cb].push_back(ca);
+          radj[ca].push_back(cb);
+        }
+      }
+    }
   }
 
   // Kosaraju's SCC (Algorithm 6)
@@ -814,43 +870,57 @@ std::vector<std::vector<std::string>> ProposalManager::GetBatchOrderedTransactio
   auto candidates = CollectBofCandidates(tau_prev, tau_current);
   if (candidates.empty()) return {};
 
-  PairMap counts_copy;
+  // Snapshot the per-block orderings and the txn→block index under
+  // bof_mutex_.  Snapshot cost is O(Σ block_orderings | ordering |) across
+  // blocks whose candidates we'll touch; in practice ≈ O(|pending txns|)
+  // because each txn appears in at most f+1 orderings.
+  std::unordered_map<std::string, std::pair<int, int64_t>> txn_to_block_copy;
+  std::map<std::pair<int, int64_t>, BlockOrderings> block_orderings_copy;
   {
     std::unique_lock<std::mutex> lk(bof_mutex_);
-    for (const auto& kv : precedes_count_) counts_copy[kv.first] = kv.second;
+    txn_to_block_copy = txn_to_block_;
+    block_orderings_copy = block_orderings_;
   }
 
-  return ComputeBatchOrderingImpl(candidates, counts_copy, bof_gamma_, f_);
+  return ComputeBatchOrderingImpl(candidates, txn_to_block_copy,
+                                  block_orderings_copy, bof_gamma_, f_);
 }
 
 // Mark a set of transactions as BOF-committed so CollectBofCandidates
 // excludes them from future proposals.  Called from Commit() only.
-// Also prunes bof_seq_ and ts_store_ to keep them O(pending) rather than
-// O(total_ever_received) — without pruning, CollectBofCandidates iterates
-// every transaction ever seen, causing latency to grow with run duration.
+// Also prunes per-block orderings, bof_seq_, and ts_store_ so hot-path
+// snapshots stay O(pending) rather than O(total_ever_received).
 void ProposalManager::MarkBofCommitted(const std::vector<std::string>& hashes) {
   {
     std::unique_lock<std::mutex> lk(bof_mutex_);
-    for (const auto& h : hashes) bof_committed_txns_.insert(h);
-    // Prune precedes_count_ / pair_contribution_count_ entries involving any
-    // now-committed txn.  A committed txn can never appear again as a BOF
-    // candidate, so its edges are dead weight — leaving them would grow the
-    // map monotonically with run duration and slow every subsequent
-    // ComputeBatchOrderingImpl call (we copy the whole map under bof_mutex_).
-    std::set<std::string> removed(hashes.begin(), hashes.end());
-    for (auto it = precedes_count_.begin(); it != precedes_count_.end();) {
-      if (removed.count(it->first.first) || removed.count(it->first.second)) {
-        it = precedes_count_.erase(it);
-      } else {
-        ++it;
+    // Collect the set of block keys touched by the committed txns so we can
+    // decide per-block whether any uncommitted txn still references it.
+    std::set<std::pair<int, int64_t>> touched_blocks;
+    for (const auto& h : hashes) {
+      bof_committed_txns_.insert(h);
+      auto it = txn_to_block_.find(h);
+      if (it != txn_to_block_.end()) {
+        touched_blocks.insert(it->second);
+        txn_to_block_.erase(it);
       }
     }
-    for (auto it = pair_contribution_count_.begin(); it != pair_contribution_count_.end();) {
-      if (removed.count(it->first.first) || removed.count(it->first.second)) {
-        it = pair_contribution_count_.erase(it);
-      } else {
-        ++it;
+
+    // For each touched block, check whether any of its txns are still
+    // uncommitted (i.e. present in txn_to_block_).  If not, drop the entire
+    // entry — its orderings are dead weight.  Otherwise keep it intact; the
+    // pair-count computation at proposal time already restricts work to the
+    // candidates still in txn_to_block_.
+    for (const auto& bk : touched_blocks) {
+      auto it = block_orderings_.find(bk);
+      if (it == block_orderings_.end()) continue;
+      bool any_pending = false;
+      for (const auto& ord : it->second.orderings) {
+        for (const auto& h : ord) {
+          if (txn_to_block_.count(h)) { any_pending = true; break; }
+        }
+        if (any_pending) break;
       }
+      if (!any_pending) block_orderings_.erase(it);
     }
   }
   {
@@ -885,13 +955,16 @@ std::vector<std::vector<std::string>> ProposalManager::ComputeBatchOrderingReadO
   auto candidates = CollectBofCandidates(tau_prev, tau_current);
   if (candidates.empty()) return {};
 
-  PairMap counts_copy;
+  std::unordered_map<std::string, std::pair<int, int64_t>> txn_to_block_copy;
+  std::map<std::pair<int, int64_t>, BlockOrderings> block_orderings_copy;
   {
     std::unique_lock<std::mutex> lk(bof_mutex_);
-    for (const auto& kv : precedes_count_) counts_copy[kv.first] = kv.second;
+    txn_to_block_copy = txn_to_block_;
+    block_orderings_copy = block_orderings_;
   }
 
-  return ComputeBatchOrderingImpl(candidates, counts_copy, bof_gamma_, f_);
+  return ComputeBatchOrderingImpl(candidates, txn_to_block_copy,
+                                  block_orderings_copy, bof_gamma_, f_);
 }
 
 }  // namespace autobahn

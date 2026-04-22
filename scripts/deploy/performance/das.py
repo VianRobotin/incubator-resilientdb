@@ -595,7 +595,8 @@ def _load_completed_runs(csv_path: Path) -> set:
 # Rate-sweep experiment  (produces the L-curve data)
 # ---------------------------------------------------------------------------
 
-def run_rate_sweep(dry_run: bool, nodes_filter: Optional[List[int]] = None):
+def run_rate_sweep(dry_run: bool, nodes_filter: Optional[List[int]] = None,
+                   modes_filter: Optional[List[str]] = None):
     """
     For each N (committee size) and mode (ol/bof), sweep injection rates
     from below saturation to above.  Each (N, mode, rate) → 5 repetitions.
@@ -624,11 +625,13 @@ def run_rate_sweep(dry_run: bool, nodes_filter: Optional[List[int]] = None):
     if nodes_filter:
         n_values = [n for n in n_values if n in nodes_filter]
 
-    print(f"\n=== Throughput-Latency rate sweep  (N={n_values}) ===")
+    modes = modes_filter if modes_filter else ["ol", "bof"]
+
+    print(f"\n=== Throughput-Latency rate sweep  (N={n_values}, modes={modes}) ===")
 
     for n in n_values:
         rates = RATE_SWEEP[n]
-        for mode in ["ol", "bof"]:
+        for mode in modes:
             for rate in rates:
                 for rep in range(1, REPETITIONS + 1):
                     if (n, mode, rate, rep) in completed:
@@ -714,6 +717,8 @@ if __name__ == "__main__":
                         help="Skip bazel build (use pre-built binaries)")
     parser.add_argument("--nodes", type=int, nargs="+",
                         help="Only sweep these N values (e.g. --nodes 10 16)")
+    parser.add_argument("--mode", choices=["ol", "bof"], nargs="+",
+                        help="Only sweep these modes (e.g. --mode bof)")
     args = parser.parse_args()
 
     if not args.dry_run:
@@ -724,7 +729,8 @@ if __name__ == "__main__":
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     RUNTIME_BASE.mkdir(parents=True, exist_ok=True)
 
-    run_rate_sweep(dry_run=args.dry_run, nodes_filter=args.nodes)
+    run_rate_sweep(dry_run=args.dry_run, nodes_filter=args.nodes,
+                   modes_filter=args.mode)
 
     print_summary()
     print("\nDone. Results in:", RESULTS_DIR)

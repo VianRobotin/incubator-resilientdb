@@ -190,7 +190,9 @@ void AutoBahn::AsyncDissemination() {
         proposal_manager_->TimestampTransactions(*block);
 
     // Batch-order fairness: broadcast our local receive order for this block.
-    // Called AFTER TimestampTransactions so ts_store_ has our TEE timestamps.
+    // Must run after TimestampTransactions so ts_store_ has our TEE timestamps;
+    // otherwise RecordLocalReceiveOrder returns an empty ordering and the
+    // per-block entry in block_orderings_ is never populated.
     if (batch_order_fairness_) {
       RelativeOrdering rel_order = proposal_manager_->RecordLocalReceiveOrder(*block);
       if (rel_order.txn_hashes_size() > 0) {
@@ -250,11 +252,10 @@ void AutoBahn::ReceiveBlock(std::unique_ptr<Block> block) {
   proposal_manager_->UpdateView(block_ack.sender_id(), block_ack.local_id());
 
   // Step 3: TEE-timestamp each transaction (Algorithm 1, lines 6-13).
-  // MUST happen before RecordLocalReceiveOrder: RecordLocalReceiveOrder reads
-  // ts_store_ looking for sender_id == id_, which is only populated after
-  // TimestampTransactions runs.  If called first, ts_store_ has no entry for
-  // this replica yet and every relative ordering broadcast is empty, leaving
-  // precedes_count_ unpopulated and BOF producing 0 transactions per proposal.
+  // Must run before RecordLocalReceiveOrder: the latter reads ts_store_ looking
+  // for sender_id == id_, which is only populated after TimestampTransactions.
+  // Swapping the order yields empty RelativeOrderings, an unpopulated
+  // block_orderings_, and BOF proposals containing zero transactions.
   std::vector<SignedTimestamp> new_timestamps =
       proposal_manager_->TimestampTransactions(*block_ptr);
 

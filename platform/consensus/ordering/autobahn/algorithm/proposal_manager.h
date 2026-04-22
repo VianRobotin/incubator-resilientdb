@@ -147,6 +147,15 @@ class ProposalManager {
   // γ ∈ (0.5, 1.0]; default 1.0 (= f+1, strictest, works for n=2f+1).
   void SetBofGamma(float gamma) { bof_gamma_ = gamma; }
 
+  // Public so the free-function helper ComputeBatchOrderingImpl (defined in
+  // the .cpp) can reference it.  Holds up to f+1 orderings for a given block,
+  // each ordering being the list of txn hashes in one replica's observed
+  // receive order.  See block_orderings_ below for the storage container.
+  struct BlockOrderings {
+    std::vector<std::vector<std::string>> orderings;
+    std::unordered_set<int> contributors;
+  };
+
   // ===========================================================
   // Δ-wait and timing parameters
   // ===========================================================
@@ -249,39 +258,26 @@ class ProposalManager {
   bool batch_order_fairness_ = false;
   float bof_gamma_ = 1.0f;  // γ ∈ (0.5, 1.0]; edge threshold θ = ⌈γ(f+1)⌉
 
-  // Per-replica receive orderings: receive_orders_[replica_id] is a list of
-  // txn hashes in the order that replica observed them.
-  std::map<int, std::vector<std::string>> receive_orders_;
   std::mutex bof_mutex_;
 
-  // Hash function for string pairs used in the BOF maps below.
-  struct PairHash {
-    size_t operator()(const std::pair<std::string, std::string>& p) const {
-      size_t h1 = std::hash<std::string>{}(p.first);
-      size_t h2 = std::hash<std::string>{}(p.second);
-      // Asymmetric mix so (a,b) and (b,a) hash differently.
-      return h1 ^ (h2 * 2654435761ULL);
-    }
-  };
+  // Per-block stored orderings.  Each ordering is the list of txn hashes in
+  // one replica's local receive order for a particular block.  Keyed by
+  // (block_sender_id, block_local_id); each entry holds at most f+1 orderings
+  // (the cap enforced by Algorithm 5's "first f+1 blocks with attestations").
+  // Storing orderings as lists avoids the O(k²) pair expansion previously
+  // performed on every incoming BOF_RelativeOrder message under bof_mutex_,
+  // which starved the network-message thread pool and caused BlockACK
+  // processing to stall at moderate input rates.
+  std::map<std::pair<int, int64_t>, BlockOrderings> block_orderings_;
 
-  // Pairwise precedence counts: precedes_count_[{a,b}] = number of blocks
-  // (up to f+1) where replica observed a before b.
-  // Uses unordered_map for O(1) amortized lookup (vs O(log n) for std::map),
-  // critical for large transaction sets (Algorithm 5 is O(|T|²)).
-  std::unordered_map<std::pair<std::string, std::string>, int, PairHash>
-      precedes_count_;
-
-  // Per-pair contribution count: how many block-orderings have been counted
-  // toward this pair so far. Capped at f+1 (Algorithm 5 "first f+1 blocks").
-  std::unordered_map<std::pair<std::string, std::string>, int, PairHash>
-      pair_contribution_count_;
+  // Reverse index: txn_hash → the (block_sender, block_id) where it appears.
+  // Txns never migrate between blocks; populated on first AddRelativeOrdering
+  // for a given block and pruned when the txn is committed.
+  std::unordered_map<std::string, std::pair<int, int64_t>> txn_to_block_;
 
   // Deduplication: blocks for which we have already recorded a relative
   // ordering (keyed by "sender_id_block_sender_id_block_local_id").
   std::unordered_set<std::string> bof_seen_blocks_;
-
-  // Set of all transaction hashes known to the BOF system.
-  std::set<std::string> bof_known_txns_;
 
   // Track which transactions have already been committed via BOF.
   std::set<std::string> bof_committed_txns_;
