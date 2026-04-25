@@ -146,6 +146,32 @@ class AutoBahn: public common::ProtocolBase {
   // slot → time quorum (2f+1 votes) was reached (us)
   std::map<int, int64_t> vote_quorum_time_;
   std::mutex vote_timing_mutex_;
+
+  // Own-originated txn create_time tracking, used to compute execution
+  // latency (create → actual execution) without cross-node clock skew.
+  // Populated in ReceiveTransaction for txns we originated, consulted at
+  // execution time, and erased only when the tx actually executes (not at
+  // commit — a committed-but-not-yet-eligible tx still needs its create_time
+  // preserved until τ eventually passes its ordering indicator).
+  std::unordered_map<std::string, int64_t> own_create_times_;
+  std::mutex own_create_times_mutex_;
+
+  // Post-commit execution eligibility (matches thesis Sections V-B / VI).
+  //
+  // A transaction is only safe to execute once the execution threshold τ
+  // has advanced past its ordering indicator: K(t) in OL, bof_seq in BOF.
+  // This replaces the (incorrect) Propose-time filter that collapsed
+  // eligibility into batch membership.
+  //
+  // tau_committed_: monotonic floor on the committed execution threshold
+  //   across all committed slots. Updated from each slot's threshold field.
+  // pending_exec_: transactions that have been committed by Sync HotStuff
+  //   but whose ordering indicator is either not yet finalized or is still
+  //   above tau_committed_. Each Commit() re-scans this buffer; a tx leaves
+  //   the buffer the first time its indicator ≤ tau_committed_.
+  int64_t tau_committed_ = 0;
+  std::unordered_map<std::string, Transaction> pending_exec_;
+  std::mutex pending_exec_mutex_;
 };
 
 }  // namespace autobahn

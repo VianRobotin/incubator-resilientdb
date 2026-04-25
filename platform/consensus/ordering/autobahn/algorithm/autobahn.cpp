@@ -85,6 +85,10 @@ bool AutoBahn::IsStop() {
 
 bool AutoBahn::ReceiveTransaction(std::unique_ptr<Transaction> txn) {
   txn->set_create_time(GetCurrentTime());
+  {
+    std::lock_guard<std::mutex> lk(own_create_times_mutex_);
+    own_create_times_[txn->hash()] = txn->create_time();
+  }
   txns_.Push(std::move(txn));
   return true;
 }
@@ -494,12 +498,14 @@ void AutoBahn::AsyncConsensus() {
     // Two modes:
     //   - Ordering Linearizability: sort by K(t) (ascending, ties by hash)
     //   - Batch-Order Fairness: group into batches via dependency graph
+    //
+    // Note: the (τ_prev, τ_current] window here is a leader heuristic for
+    // which txns the proposal should carry ordering metadata for.  Actual
+    // execution eligibility is re-checked post-commit in Commit() against
+    // the finalized τ, so a tx included in a proposal may still be buffered
+    // post-commit if its final K(t)/bof_seq has not been confirmed ≤ τ.
     int total_fair_txns = 0;
     if (batch_order_fairness_) {
-      // BOF mode: build dependency graph and extract batches.
-      // BOF uses TEE sequence numbers (small counter values), not wall-clock
-      // timestamps, so the τ-window doesn't apply.  Pass the full range so
-      // GetBatchOrderedTransactions returns all pending uncommitted transactions.
       auto batches = proposal_manager_->GetBatchOrderedTransactions(
           -1, std::numeric_limits<int64_t>::max());
       for (const auto& batch : batches) {
@@ -510,7 +516,6 @@ void AutoBahn::AsyncConsensus() {
         }
       }
     } else {
-      // OL mode: sort by ordering key K(t)
       auto ordered_txns = proposal_manager_->GetTransactionsInWindow(tau_prev, tau_current);
       for (const auto& entry : ordered_txns) {
         OrderingKeyEntry* oke = proposal->add_ordering_keys();
@@ -1057,12 +1062,14 @@ void AutoBahn::Commit(std::unique_ptr<Proposal> proposal) {
     proposal_manager_->UpdateLastSeenFromBlock(i + 1, raw_proposal->last_seen_vector(i));
   }
 
-  // Collect all transactions from committed blocks into a map for lookup.
-  // Also track the earliest create_time from OWN blocks only — these were
-  // created on this replica so create_time and commit_time share the same clock,
-  // avoiding cross-node skew that made execution_latency < consensus_latency.
-  std::map<std::string, Transaction*> txn_by_hash;
-  int64_t earliest_own_create_us = INT64_MAX;
+  // Collect txns freshly committed by this slot and compute consensus latency.
+  // Only sample create_time from txns whose originating replica is this one,
+  // because create_time is set in ReceiveTransaction on the originator's clock.
+  // Using OWN-originated txns means create_time and commit_time share the same
+  // physical clock (no cross-node skew).
+  std::map<std::string, Transaction> newly_committed;
+  int64_t own_sum_create_us = 0;
+  int own_create_samples = 0;
   for(const auto& block : raw_proposal->block()) {
     int block_owner = block.sender_id();
     int block_id = block.local_id();
@@ -1079,115 +1086,147 @@ void AutoBahn::Commit(std::unique_ptr<Proposal> proposal) {
       }
       assert(data_block != nullptr);
 
-      for (Transaction& txn :
-          *data_block->mutable_data()->mutable_transaction()) {
-        txn_by_hash[txn.hash()] = &txn;
-        // Only sample create_time from transactions originated on this replica.
-        // create_time is set in GenerateBlocks() on the same clock as commit_time.
+      for (const Transaction& txn :
+          data_block->data().transaction()) {
+        newly_committed[txn.hash()] = txn;
         if (block_owner == id_ && txn.create_time() > 0) {
-          earliest_own_create_us = std::min(earliest_own_create_us, txn.create_time());
+          own_sum_create_us += txn.create_time();
+          own_create_samples++;
         }
       }
     }
     commit_block_[block_owner] = block_id;
   }
 
-  if (batch_order_fairness_ && raw_proposal->batch_groups_size() > 0) {
-    // BOF mode: execute transactions in batch order.
-    // Batches are ordered (batch 0 before batch 1, etc.).
-    // Within each batch, transactions can be in any order — we use the
-    // deterministic hash order from the proposal.
-    std::set<std::string> committed_in_batches;
-    for (const auto& bg : raw_proposal->batch_groups()) {
-      for (const auto& txn_hash : bg.txn_hashes()) {
-        auto it = txn_by_hash.find(txn_hash);
-        if (it != txn_by_hash.end()) {
-          Transaction& txn = *it->second;
-          txn.set_id(execute_id_++);
-          commit_(txn);
-          committed_in_batches.insert(txn_hash);
-        }
-      }
+  // slot_committed: consensus latency = slot_commit_time − avg(create_time)
+  // over own-originated txns in this slot.  Emitted BEFORE eligibility check,
+  // because "committed by Sync HotStuff" is strictly earlier than "eligible
+  // for execution" — a committed tx still has to wait until τ advances past
+  // its ordering indicator (Section V-B, Lemma 5).
+  {
+    int64_t now_commit_us = GetCurrentTime();
+    uint64_t consensus_latency_us = 0;
+    if (own_create_samples > 0) {
+      int64_t avg_create_us = own_sum_create_us / own_create_samples;
+      consensus_latency_us = static_cast<uint64_t>(
+          std::max<int64_t>(0, now_commit_us - avg_create_us));
     }
-    // Execute any remaining transactions not covered by batch groups
-    // (e.g., transactions without enough relative ordering data)
-    for (auto& entry : txn_by_hash) {
-      if (committed_in_batches.count(entry.first) == 0) {
-        Transaction& txn = *entry.second;
-        txn.set_id(execute_id_++);
-        commit_(txn);
-      }
+    LOG(ERROR) << "slot_committed slot:" << slot_id
+               << " txns:" << newly_committed.size()
+               << " consensus_latency_us:" << consensus_latency_us;
+  }
+
+  // ============================================================
+  // Post-commit execution eligibility (thesis Section V-B / VI).
+  //
+  // Advance tau_committed_ from the committed slot's threshold.  Merge
+  // newly_committed into pending_exec_; then re-scan pending_exec_ and move
+  // txns whose ordering indicator (K(t) for OL, bof_seq for BOF) is finalized
+  // and ≤ tau_committed_ into the eligible set.  Everything else stays
+  // buffered until a future commit further advances τ.
+  // ============================================================
+
+  tau_committed_ = std::max(tau_committed_, raw_proposal->threshold());
+
+  {
+    std::lock_guard<std::mutex> lk(pending_exec_mutex_);
+    for (auto& entry : newly_committed) {
+      pending_exec_.emplace(entry.first, entry.second);
     }
-    // Mark all executed transactions as BOF-committed NOW (post-commit),
-    // not at proposal time — transactions from a failed slot must remain
-    // available for the next proposal.
-    {
-      std::vector<std::string> all_hashes;
-      all_hashes.reserve(txn_by_hash.size());
-      for (const auto& entry : txn_by_hash) all_hashes.push_back(entry.first);
-      proposal_manager_->MarkBofCommitted(all_hashes);
+  }
+
+  // Build the list of now-eligible (hash, indicator) pairs.
+  std::vector<std::pair<int64_t, std::string>> eligible;
+  {
+    std::lock_guard<std::mutex> lk(pending_exec_mutex_);
+    for (const auto& entry : pending_exec_) {
+      const std::string& h = entry.first;
+      int64_t indicator = batch_order_fairness_
+                              ? proposal_manager_->GetBofSeq(h)
+                              : proposal_manager_->GetFinalOrderingKey(h);
+      if (indicator <= 0) continue;  // not finalized yet
+      if (indicator > tau_committed_) continue;  // not yet safe
+      eligible.push_back({indicator, h});
     }
-  } else {
-    // OL mode: execute in final ordering key order.
-    // K(t) = min over first f+1 committed K_r(t) values (Section V-A).
-    // Ties broken deterministically by txn hash (per paper Section V-B).
-    std::vector<std::pair<int64_t, Transaction*>> sorted_txns;
-    sorted_txns.reserve(txn_by_hash.size());
-    for (auto& entry : txn_by_hash) {
-      int64_t final_key = proposal_manager_->GetFinalOrderingKey(entry.first);
-      if (final_key < 0) {
-        // No committed key yet; fall back to local key and put at end.
-        final_key = INT64_MAX;
-      }
-      sorted_txns.push_back({final_key, entry.second});
-    }
-    std::sort(sorted_txns.begin(), sorted_txns.end(),
-        [](const std::pair<int64_t, Transaction*>& a,
-           const std::pair<int64_t, Transaction*>& b) {
-          if (a.first != b.first) return a.first < b.first;
-          return a.second->hash() < b.second->hash();  // deterministic tie-break
-        });
-    for (auto& kv : sorted_txns) {
-      Transaction& txn = *kv.second;
+  }
+  // Sort by indicator ascending with hash tiebreak — deterministic across
+  // replicas.  In OL this is K(t) order (Section V-A); in BOF this is
+  // sequence-number order, which matches the thesis's "sequence numbers fall
+  // below τ" ordering of stable batches.
+  std::sort(eligible.begin(), eligible.end(),
+            [](const std::pair<int64_t, std::string>& a,
+               const std::pair<int64_t, std::string>& b) {
+              if (a.first != b.first) return a.first < b.first;
+              return a.second < b.second;
+            });
+
+  // Execute eligible txns and emit per-slot execution-latency aggregate.
+  int64_t exec_own_sum_create_us = 0;
+  int exec_own_samples = 0;
+  int64_t exec_own_max_latency_us = 0;
+  int64_t now_exec_us = GetCurrentTime();
+  std::vector<std::string> executed_hashes;
+  executed_hashes.reserve(eligible.size());
+  {
+    std::lock_guard<std::mutex> lk(pending_exec_mutex_);
+    for (auto& kv : eligible) {
+      auto pit = pending_exec_.find(kv.second);
+      if (pit == pending_exec_.end()) continue;
+      Transaction& txn = pit->second;
       txn.set_ordering_key(kv.first);
       txn.set_id(execute_id_++);
       commit_(txn);
-    }
+      executed_hashes.push_back(kv.second);
 
-    // Prune committed transactions from ts_store_ and local_ordering_keys_ so
-    // ComputeAllOrderingKeys() and GetTransactionsInWindow() stay O(pending)
-    // rather than O(total_ever_received).  Without this, both functions iterate
-    // over every transaction ever seen, slowing each slot by ~350ms at load.
-    {
-      std::vector<std::string> committed_hashes;
-      committed_hashes.reserve(txn_by_hash.size());
-      for (const auto& entry : txn_by_hash) committed_hashes.push_back(entry.first);
-      proposal_manager_->PruneOlCommitted(committed_hashes);
+      // Clock-consistent execution latency sample (own-originated only).
+      int64_t create_us = -1;
+      {
+        std::lock_guard<std::mutex> olk(own_create_times_mutex_);
+        auto oit = own_create_times_.find(kv.second);
+        if (oit != own_create_times_.end()) {
+          create_us = oit->second;
+          own_create_times_.erase(oit);
+        }
+      }
+      if (create_us > 0) {
+        int64_t lat = std::max<int64_t>(0, now_exec_us - create_us);
+        exec_own_sum_create_us += lat;
+        if (lat > exec_own_max_latency_us) exec_own_max_latency_us = lat;
+        exec_own_samples++;
+      }
+      pending_exec_.erase(pit);
     }
   }
 
-  // Update throughput stats so the monitoring system tracks committed txns.
-  if (!txn_by_hash.empty()) {
-    global_stats_->ConsumeTransactions(static_cast<int>(txn_by_hash.size()));
-  }
-
-  // Execution latency: time from when the client first submitted a transaction
-  // to when this replica commits it.  We use create_time from OWN transactions
-  // only (block_owner == id_), because create_time is set in GenerateBlocks()
-  // on this replica — same clock as commit_time, so no cross-node skew.
-  // This measures the full pipeline: tx arrival → block certified → slot committed.
-  // Guaranteed: create_time ≤ dissem_time ≤ cert_time ≤ commit_time, so
-  // execution_latency ≥ consensus_latency always holds.
   {
-    int64_t now_us = GetCurrentTime();
-    uint64_t execution_latency_us = 0;
-    if (earliest_own_create_us != INT64_MAX) {
-      execution_latency_us = static_cast<uint64_t>(
-          std::max(static_cast<int64_t>(0), now_us - earliest_own_create_us));
+    int64_t avg_exec_latency_us =
+        exec_own_samples > 0 ? exec_own_sum_create_us / exec_own_samples : 0;
+    size_t pending_size;
+    {
+      std::lock_guard<std::mutex> lk(pending_exec_mutex_);
+      pending_size = pending_exec_.size();
     }
-    LOG(ERROR) << "execution commit slot:" << slot_id
-               << " txns:" << txn_by_hash.size()
-               << " execution_latency_us:" << execution_latency_us;
+    LOG(ERROR) << "executed_batch slot:" << slot_id
+               << " count:" << executed_hashes.size()
+               << " avg_latency_us:" << avg_exec_latency_us
+               << " max_latency_us:" << exec_own_max_latency_us
+               << " pending:" << pending_size;
+  }
+
+  // Prune proposal_manager_ state for txns that actually executed (not merely
+  // committed) — buffered txns still need their ordering data for the τ check.
+  if (!executed_hashes.empty()) {
+    if (batch_order_fairness_) {
+      proposal_manager_->MarkBofCommitted(executed_hashes);
+    } else {
+      proposal_manager_->PruneOlCommitted(executed_hashes);
+    }
+  }
+
+  // Update throughput stats — count executed txns, matching execution_tps
+  // semantics.  Pending-but-buffered txns will be counted when they execute.
+  if (!executed_hashes.empty()) {
+    global_stats_->ConsumeTransactions(static_cast<int>(executed_hashes.size()));
   }
 
   // Rotate leader (round-robin, as in Sync HotStuff)

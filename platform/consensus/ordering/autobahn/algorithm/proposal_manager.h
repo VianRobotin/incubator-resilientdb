@@ -96,6 +96,13 @@ class ProposalManager {
   // K(t) = min K_r(t) over the first f+1 committed ordering keys for t.
   int64_t GetFinalOrderingKey(const std::string& txn_hash);
 
+  // BOF analogue of GetFinalOrderingKey: the TEE-assigned sequence number
+  // for a transaction.  Used to compare against τ for post-commit execution
+  // eligibility in BOF mode.  Returns -1 if the sequence number is not yet
+  // recorded locally (e.g., the tx was committed via a cut but this replica
+  // hasn't assigned a seq number to it yet).
+  int64_t GetBofSeq(const std::string& txn_hash);
+
   // Record a committed ordering key for a transaction from a committed block.
   void AddCommittedOrderingKey(const std::string& txn_hash, int64_t key);
 

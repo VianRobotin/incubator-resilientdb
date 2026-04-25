@@ -334,9 +334,12 @@ std::vector<SignedTimestamp> ProposalManager::TimestampTransactions(const Block&
           }
         }
         ts_store_[txn_hash].push_back(st);
-        if (!batch_order_fairness_) {
-          last_seen_[id_] = std::max(last_seen_[id_], st.timestamp());
-        }
+        // last_seen tracks the highest ordering indicator this replica has
+        // emitted: a TEE wall-clock timestamp in OL, a TEE sequence number
+        // in BOF. Both feed ComputeExecutionThreshold so τ advances in both
+        // modes (thesis: "τ is computed identically … using the last-seen
+        // vectors from committed blocks").
+        last_seen_[id_] = std::max(last_seen_[id_], st.timestamp());
       }
 
       new_timestamps.push_back(st);
@@ -378,9 +381,8 @@ std::vector<SignedTimestamp> ProposalManager::TimestampTransactions(const Block&
       ts_store_[txn_hash].push_back(st);
       new_timestamps.push_back(st);
 
-      if (!batch_order_fairness_) {
-        last_seen_[id_] = std::max(last_seen_[id_], st.timestamp());
-      }
+      // See comment above: last_seen advances in both modes.
+      last_seen_[id_] = std::max(last_seen_[id_], st.timestamp());
     }
   }
 
@@ -595,6 +597,13 @@ int64_t ProposalManager::GetFinalOrderingKey(const std::string& txn_hash) {
 
 bool ProposalManager::HasSeenTransaction(const std::string& txn_hash) const {
   return tee_seen_set_.count(txn_hash) > 0;
+}
+
+int64_t ProposalManager::GetBofSeq(const std::string& txn_hash) {
+  std::unique_lock<std::mutex> lk(ts_mutex_);
+  auto it = bof_seq_.find(txn_hash);
+  if (it == bof_seq_.end()) return -1;
+  return it->second;
 }
 
 // ============================================================

@@ -67,8 +67,8 @@ REPETITIONS = 5     # runs per (N, mode, rate) point
 # Thesis claim: same fault tolerance f, but 28-32% fewer nodes.
 RATE_SWEEP: dict = {
      7: [500, 1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000],
-    11: [500, 1000, 2000, 4000, 6000, 8000, 10000, 12000],
-    15: [300,  600, 1200, 2500, 4000, 6000,  8000, 10000],
+    11: [500, 1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000],
+    15: [500, 1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000],
 }
 
 # ---------------------------------------------------------------------------
@@ -166,14 +166,13 @@ def write_server_config(config_path: Path, node_ips: List[str], mode: str,
         for i, ip in enumerate(node_ips, 1)
     ]
     client_batch_num = 1 if target_input_tps_per_client > 0 else 400
-    max_txn = max(target_input_tps_per_client * runtime * 3, 2_000_000)
     config = {
         "region": [{"replicaInfo": replica_info}],
         "clientBatchNum": client_batch_num,
         "enable_viewchange": False,
         "recovery_enabled": False,
         "max_client_complaint_num": 10,
-        "max_process_txn": max_txn,
+        "max_process_txn": 4096,
         "worker_num": 10,
         "input_worker_num": 1,
         "output_worker_num": 5,
@@ -212,14 +211,26 @@ def trimmed_mean(values: list, drop: int = 1) -> float:
     return sum(v) / len(v) if v else 0.0
 
 
-_CERT_RE = re.compile(
+# slot_committed: every replica emits one line per committed slot.
+#   txns = transactions newly committed by Sync HotStuff in this slot.
+#   consensus_latency_us = commit_time − avg(create_time) over own-originated
+#   txns (clock-consistent: create_time and commit_time share one local clock).
+#   TPS per replica ≈ system-wide (every replica commits every slot); take
+#   the median across replicas.
+_COMMIT_RE = re.compile(
     r'^[EW](\d{8}) (\d{2}:\d{2}:\d{2}\.\d+).*?'
-    r'block_certified block_id:\d+ txns:(\d+) consensus_latency_us:(\d+)',
+    r'slot_committed slot:\d+ txns:(\d+) consensus_latency_us:(\d+)',
     re.MULTILINE,
 )
+# executed_batch: every replica emits one per slot, counting txns for which the
+# execution threshold τ passed the ordering indicator in this slot (either
+# newly committed or drained from the pending buffer). avg_latency_us =
+# execute_time − avg(create_time) over own-originated executed txns.  Every
+# replica executes every eligible tx, so per-replica ≈ system-wide — take the
+# median across replicas (same treatment as consensus).
 _EXEC_RE = re.compile(
     r'^[EW](\d{8}) (\d{2}:\d{2}:\d{2}\.\d+).*?'
-    r'execution commit slot:\d+ txns:(\d+) execution_latency_us:(\d+)',
+    r'executed_batch slot:\d+ count:(\d+) avg_latency_us:(\d+) max_latency_us:\d+ pending:\d+',
     re.MULTILINE,
 )
 
@@ -263,17 +274,20 @@ def _apply_warmup(entries: list, experiment_start: datetime.datetime,
 def parse_log_file(log_file: Path, experiment_start: datetime.datetime,
                    warmup_secs: int, runtime: int):
     """
-    Returns (cert_meas, exec_meas, cert_total, exec_total,
-             cert_fallback, exec_fallback).
+    Returns (commit_meas, exec_meas, commit_total, exec_total,
+             commit_fallback, exec_fallback).
+
+    commit_meas entries: (dt, txns_in_slot, consensus_latency_us)
+    exec_meas   entries: (dt, executed_count, avg_latency_us)
     """
     if not log_file.exists():
         return [], [], 0, 0, False, False
     text = log_file.read_text(errors="replace")
-    cert_all = _extract_entries(text, _CERT_RE)
-    exec_all = _extract_entries(text, _EXEC_RE)
-    cert_meas, cert_fb = _apply_warmup(cert_all, experiment_start, warmup_secs, runtime)
-    exec_meas, exec_fb = _apply_warmup(exec_all, experiment_start, warmup_secs, runtime)
-    return cert_meas, exec_meas, len(cert_all), len(exec_all), cert_fb, exec_fb
+    commit_all = _extract_entries(text, _COMMIT_RE)
+    exec_all   = _extract_entries(text, _EXEC_RE)
+    commit_meas, commit_fb = _apply_warmup(commit_all, experiment_start, warmup_secs, runtime)
+    exec_meas,   exec_fb   = _apply_warmup(exec_all,   experiment_start, warmup_secs, runtime)
+    return commit_meas, exec_meas, len(commit_all), len(exec_all), commit_fb, exec_fb
 
 
 def _compute_tps_latency(entries: list, fallback_duration: float):
@@ -477,7 +491,25 @@ def run_experiment(
             p.wait()
         time.sleep(2)
 
-        # Parse logs
+        # Parse logs.
+        #
+        # Metric definitions (see CLAUDE.md and the thesis for details):
+        #   consensus_tps / consensus_latency
+        #     Source: slot_committed log line, emitted by EVERY replica on
+        #     Commit().  consensus_latency_us = slot_commit_time − avg(create_time)
+        #     over own-originated txns in the slot (clock-consistent).  Every
+        #     replica commits every slot, so per-replica ≈ system-wide; take
+        #     the median across replicas.
+        #
+        #   execution_tps / execution_latency
+        #     Source: executed_batch log line, emitted by EVERY replica on
+        #     Commit() AFTER the post-commit τ-eligibility check.  count is
+        #     the number of txns that actually executed this slot (newly
+        #     committed txns whose K(t)/bof_seq ≤ τ, plus drained buffer
+        #     entries).  avg_latency_us = execute_time − avg(create_time) over
+        #     own-originated executed txns.  Every replica executes every
+        #     eligible tx, so per-replica ≈ system-wide; take the median across
+        #     replicas (matching the consensus aggregation).
         print("Parsing logs...")
         fallback_dur = max(1.0, runtime - warmup)
         per_replica_con_tps: list = []
@@ -485,24 +517,24 @@ def run_experiment(
         per_replica_exec_tps: list = []
         per_replica_exec_lat: list = []
         slots_committed = 0
-        any_cert_fallback = False
+        any_commit_fallback = False
         any_exec_fallback = False
 
         for i in range(1, num_replicas + 1):
             lf = log_dir / f"server_{i}.log"
-            cert_meas, exec_meas, cert_total, exec_total, cert_fb, exec_fb = parse_log_file(
+            commit_meas, exec_meas, commit_total, exec_total, commit_fb, exec_fb = parse_log_file(
                 lf, experiment_start, warmup, runtime)
-            slots_committed = max(slots_committed, exec_total)
-            any_cert_fallback = any_cert_fallback or cert_fb
-            any_exec_fallback = any_exec_fallback or exec_fb
-            con_tps_i, con_lat_i = _compute_tps_latency(cert_meas, fallback_dur)
+            slots_committed = max(slots_committed, commit_total)
+            any_commit_fallback = any_commit_fallback or commit_fb
+            any_exec_fallback   = any_exec_fallback   or exec_fb
+            con_tps_i, con_lat_i = _compute_tps_latency(commit_meas, fallback_dur)
             exec_tps_i, exec_lat_i = _compute_tps_latency(exec_meas, fallback_dur)
             flag = ""
-            if cert_fb or exec_fb:
-                flag = f"  [fallback:{('c' if cert_fb else '')}{('e' if exec_fb else '')}]"
+            if commit_fb or exec_fb:
+                flag = f"  [fallback:{('c' if commit_fb else '')}{('x' if exec_fb else '')}]"
             print(f"  Replica {i}: con={con_tps_i:.0f}tps/{con_lat_i*1000:.0f}ms"
                   f"  exec={exec_tps_i:.0f}tps/{exec_lat_i*1000:.0f}ms"
-                  f"  cert_blocks={cert_total}  slots={exec_total}{flag}")
+                  f"  slots={commit_total}  exec_slots={exec_total}{flag}")
             if con_tps_i > 0:
                 per_replica_con_tps.append(con_tps_i)
                 per_replica_con_lat.append(con_lat_i)
@@ -510,22 +542,14 @@ def run_experiment(
                 per_replica_exec_tps.append(exec_tps_i)
                 per_replica_exec_lat.append(exec_lat_i)
 
-        if any_cert_fallback or any_exec_fallback:
+        if any_commit_fallback or any_exec_fallback:
             which = []
-            if any_cert_fallback: which.append("cert")
-            if any_exec_fallback: which.append("exec")
+            if any_commit_fallback: which.append("commit")
+            if any_exec_fallback:   which.append("exec")
             print(f"  NOTE: bursty run — {'/'.join(which)} activity fell inside "
                   f"the {warmup}s warmup window; using full [start, start+runtime] "
                   f"window as fallback.")
 
-        # Both metrics: median across replicas.
-        # consensus_tps: each replica logs only its OWN block certifications
-        #   (block_certified fires only on the originating replica), so one
-        #   replica's cert rate = that replica's share ≈ total/N.
-        # execution_tps: every replica commits every slot (Commit() runs on all),
-        #   so each replica's exec rate = the full system throughput.  Taking the
-        #   median (vs the old "best replica") avoids inflating with outliers and
-        #   is more robust to lagging replicas.
         def _median(xs):
             s = sorted(xs)
             n = len(s)

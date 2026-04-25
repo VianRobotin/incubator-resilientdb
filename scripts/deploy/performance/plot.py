@@ -34,16 +34,24 @@ DEFAULT_CSV = PROJ_ROOT / "das_results" / "tput_latency.csv"
 DEFAULT_OUT = PROJ_ROOT / "das_results" / "plots"
 
 # Colours and markers: one style per (mode, metric)
-# "consensus" = block certification layer; "execution" = end-to-end commit
+# "consensus" = Sync HotStuff propose→commit (slot_committed events)
+# "execution" = time until eligible for execution (eligible_batch events)
 STYLE = {
     ("ol",  "execution"): dict(color="#1565C0", marker="o",
-                                label="OL (end-to-end)", linestyle="-"),
+                                label="OL (execution)", linestyle="-"),
     ("bof", "execution"): dict(color="#B71C1C", marker="s",
-                                label="BOF (end-to-end)", linestyle="-"),
+                                label="BOF (execution)", linestyle="-"),
     ("ol",  "consensus"): dict(color="#42A5F5", marker="^",
                                 label="OL (consensus)", linestyle="--"),
     ("bof", "consensus"): dict(color="#EF9A9A", marker="D",
                                 label="BOF (consensus)", linestyle="--"),
+}
+
+
+# Human-readable labels/titles for each metric type.
+METRIC_LABEL = {
+    "consensus": "Consensus",
+    "execution": "Execution",
 }
 
 # ---------------------------------------------------------------------------
@@ -196,10 +204,61 @@ def plot_l_curve(data: dict, out_path: Path, metric: str = "execution"):
                     color=color,
                 )
 
-    metric_label = "End-to-end" if metric == "execution" else "Consensus"
-    style_ax(ax, "Throughput (tx/s)", f"{metric_label} Latency (ms)",
-             f"Throughput vs Latency — OL vs BOF")
+    metric_label = METRIC_LABEL.get(metric, metric.title())
+    style_ax(ax, f"{metric_label} Throughput (tx/s)",
+             f"{metric_label} Latency (ms)",
+             f"Throughput vs Latency — {metric_label}")
     fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Plot 1b — Side-by-side L-curve: consensus and execution on one figure
+# ---------------------------------------------------------------------------
+
+def plot_l_curve_combined(nn:int, data: dict, out_path: Path):
+    """Two L-curve subplots: consensus (propose→commit) and execution (tx→eligible)."""
+    ns    = all_n_values(data)
+    modes = all_modes(data)
+    cmap  = plt.cm.get_cmap("tab10", max(len(ns), 1))
+    ls_map = {"ol": "-", "bof": "--"}
+    mk_map = {"ol": "o", "bof": "s"}
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+
+    for ax, metric in zip(axes, ("consensus", "execution")):
+        for n_idx, n in enumerate(ns):
+            if n == nn:
+                color = cmap(n_idx)
+                for mode in modes:
+                    rates, m_tps, s_tps, m_lat, s_lat = series_for_key(
+                        data, (n, mode, metric))
+                    if len(rates) == 0:
+                        continue
+                    ax.errorbar(
+                        m_tps, m_lat, xerr=s_tps, yerr=s_lat,
+                        label=f"N={n} {mode.upper()}",
+                        color=color,
+                        linestyle=ls_map.get(mode, "-"),
+                        marker=mk_map.get(mode, "o"),
+                        linewidth=1.8, markersize=6, capsize=3,
+                    )
+                    for rate, x, y in zip(rates, m_tps, m_lat):
+                        ax.annotate(
+                            f"{rate//1000}k" if rate >= 1000 else str(rate),
+                            (x, y), textcoords="offset points",
+                            xytext=(5, 4), fontsize=6, color=color,
+                        )
+        metric_label = METRIC_LABEL[metric]
+        style_ax(ax, f"Throughput (tx/s)", f"Latency (ms)", metric_label)
+
+    fig.suptitle(
+        "Autobahn throughput–latency L-curves (N ∈ {7, 11, 15}, modes {OL, BOF})",
+        fontsize=13, fontweight="bold",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"Saved: {out_path}")
@@ -242,9 +301,9 @@ def plot_tput_vs_rate(data: dict, out_path: Path, metric: str = "execution"):
         ax.plot([0, lim], [0, lim], "k--", linewidth=1, alpha=0.3,
                 label="y = x (perfect)")
 
-    metric_label = "End-to-end" if metric == "execution" else "Consensus"
+    metric_label = METRIC_LABEL.get(metric, metric.title())
     style_ax(ax, "Injection Rate (tx/s)", f"{metric_label} Throughput (tx/s)",
-             "Throughput vs Injection Rate")
+             f"Throughput vs Injection Rate — {metric_label}")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -281,9 +340,9 @@ def plot_lat_vs_rate(data: dict, out_path: Path, metric: str = "execution"):
                 capsize=3,
             )
 
-    metric_label = "End-to-end" if metric == "execution" else "Consensus"
+    metric_label = METRIC_LABEL.get(metric, metric.title())
     style_ax(ax, "Injection Rate (tx/s)", f"{metric_label} Latency (ms)",
-             "Latency vs Injection Rate")
+             f"Latency vs Injection Rate — {metric_label}")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -313,18 +372,28 @@ def main():
         print("ERROR: no data parsed from CSV", file=sys.stderr)
         sys.exit(1)
 
-    # Main L-curve using end-to-end (execution) metrics
-    plot_l_curve(data, args.out_dir / "tput_vs_latency.png", metric="execution")
+    # Side-by-side: consensus (propose→commit) and execution (tx→eligible).
+    plot_l_curve_combined(7, data, args.out_dir / "tput_vs_latency_7.png")
+    plot_l_curve_combined(11, data, args.out_dir / "tput_vs_latency_11.png")
+    plot_l_curve_combined(15, data, args.out_dir / "tput_vs_latency_15.png")
 
-    # Same L-curve but for the consensus (block certification) layer
+    # Individual L-curves, one per metric.
+    plot_l_curve(data, args.out_dir / "tput_vs_latency_execution.png",
+                 metric="execution")
     plot_l_curve(data, args.out_dir / "tput_vs_latency_consensus.png",
                  metric="consensus")
 
     # Diagnostic: throughput vs injection rate (shows saturation point)
-    plot_tput_vs_rate(data, args.out_dir / "tput_vs_rate.png", metric="execution")
+    plot_tput_vs_rate(data, args.out_dir / "tput_vs_rate_execution.png",
+                      metric="execution")
+    plot_tput_vs_rate(data, args.out_dir / "tput_vs_rate_consensus.png",
+                      metric="consensus")
 
     # Diagnostic: latency vs injection rate (shows where latency spikes)
-    plot_lat_vs_rate(data, args.out_dir / "lat_vs_rate.png", metric="execution")
+    plot_lat_vs_rate(data, args.out_dir / "lat_vs_rate_execution.png",
+                     metric="execution")
+    plot_lat_vs_rate(data, args.out_dir / "lat_vs_rate_consensus.png",
+                     metric="consensus")
 
     print("\nAll plots saved in:", args.out_dir)
 
