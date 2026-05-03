@@ -114,18 +114,18 @@ python3 performance/das.py --skip-build  # skip bazel build
 | Runtime | 60 s |
 | Warmup | 15 s |
 | Repetitions | 5 per config |
-| Clients | 1 (rate-controlled via `target_input_tps`) |
+| Clients | n (rate-controlled via `target_input_tps`) |
 
 ### Rate-sweep experiment (L-curve)
 
-For each N ∈ {10, 16, 22} and each mode ∈ {ol, bof}: vary injection rate from well below
+For each N ∈ {7, 11, 15} and each mode ∈ {ol, bof}: vary injection rate from well below
 saturation to above it. Each (N, mode, rate) point → 5 repetitions.
 
 | N | Injection rates swept (tx/s) |
 |---|------------------------------|
-| 10 | 500, 1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000 |
-| 16 | 500, 1000, 2000, 4000, 6000, 8000, 10000, 12000 |
-| 22 | 300, 600, 1200, 2500, 4000, 6000, 8000, 10000 |
+| 7 | 500, 1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000 |
+| 11 | 500, 1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000 |
+| 15 | 500, 1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000 |
 
 Results saved to: `das_results/tput_latency.csv`
 
@@ -207,21 +207,6 @@ cert_latency should drop to ~5–10ms → ~10,000–20,000 TPS at N=10.
 - Block certification latency: ~5–10ms (was 270–2100ms before Issue 4 fix)
 - Commit latency: 2Δ = 100ms (vs Giulio's 500-636ms — should be better)
 - Throughput: target > 9,935 TPS at N=10
-
----
-
-## Metrics
-
-See `scripts/deploy/performance/METRICS.md` for full definitions. Key metrics:
-
-| Metric | Source | Meaning |
-|--------|--------|---------|
-| `e2e_tps` | Replica log `consensus commit slot` lines | Transactions committed/s (measurement window) |
-| `e2e_bps` | e2e_tps × 128 bytes | Bytes committed/s |
-| `consensus_tps` | Slots committed / measurement window | Protocol round rate |
-| `consensus_latency_s` | `consensus_latency_us` field in logs | Propose→commit wall time per slot |
-
-Log parsing: `parse_log()` in `das.py` extracts structured `consensus commit slot:N txns:M consensus_latency_us:X` lines with glog timestamps. Warmup filter: skip first 15s of log entries.
 
 ---
 
