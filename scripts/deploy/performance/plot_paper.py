@@ -62,8 +62,8 @@ SERIES_STYLE = {
     "pearl-bof":   dict(color=PEARL_BOF_COLOR, marker="s", linestyle="-",  label="Pearl (BOF)"),
     "pompe":       dict(color="#2E7D32",       marker="D", linestyle="-",  label="Pompe"),
     "themis":      dict(color="#FBC02D",       marker="^", linestyle="-",  label="Themis"),
-    "fairdag-ol":  dict(color="#6A1B9A",       marker="v", linestyle="-",  label="FairDAG-OL"),
-    "fairdag-bof": dict(color="#C2185B",       marker="P", linestyle="-",  label="FairDAG-BOF"),
+    "fairdag-ol":  dict(color="#6A1B9A",       marker="v", linestyle="-",  label="FairDAG-AB"),
+    "fairdag-bof": dict(color="#C2185B",       marker="P", linestyle="-",  label="FairDAG-RL"),
 }
 
 # Bigger sizes than IEEE-minimum so individual elements are easy to read.
@@ -263,9 +263,60 @@ def _draw_overlay_panel(ax, sources, fault, show_legend=False):
                     color=st["color"], marker=st["marker"],
                     linestyle=st["linestyle"], label=st["label"],
                     capsize=2.5)
+    ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_title(f"f = {fault}")
-    ax.set_xlabel("Throughput (tx/s)")
+    ax.set_xlabel("Throughput (tx/s, log)")
+    ax.set_ylabel("Latency (ms, log)")
+    if show_legend:
+        ax.legend(loc="upper right", framealpha=0.9, ncol=1)
+
+
+def _draw_overlay_tput_vs_rate_panel(ax, sources, fault, show_legend=False):
+    """Throughput vs injection rate, all sources for a given f, log axes.
+    Log y-axis because Pompe collapses to <10 tx/s at f >= 5 while Pearl
+    sustains ~10k tx/s at the same point."""
+    for key in ("pearl-ol", "pearl-bof",
+                "pompe", "themis", "fairdag-ol", "fairdag-bof"):
+        per_rate = sources.get(key, {}).get(fault)
+        if not per_rate:
+            continue
+        rates, m_tps, s_tps, _, _ = _series_sorted_by_rate(per_rate)
+        if len(rates) == 0:
+            continue
+        st = SERIES_STYLE[key]
+        ax.errorbar(rates, m_tps, yerr=s_tps,
+                    color=st["color"], marker=st["marker"],
+                    linestyle=st["linestyle"], label=st["label"],
+                    capsize=2.5)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_title(f"f = {fault}")
+    ax.set_xlabel("Injection rate (tx/s)")
+    ax.set_ylabel("Throughput (tx/s, log)")
+    if show_legend:
+        ax.legend(loc="lower right", framealpha=0.9, ncol=1)
+
+
+def _draw_overlay_lat_vs_rate_panel(ax, sources, fault, show_legend=False):
+    """Latency vs injection rate, all sources for a given f, log y."""
+    for key in ("pearl-ol", "pearl-bof",
+                "pompe", "themis", "fairdag-ol", "fairdag-bof"):
+        per_rate = sources.get(key, {}).get(fault)
+        if not per_rate:
+            continue
+        rates, _, _, m_lat, s_lat = _series_sorted_by_rate(per_rate)
+        if len(rates) == 0:
+            continue
+        st = SERIES_STYLE[key]
+        ax.errorbar(rates, m_lat, yerr=s_lat,
+                    color=st["color"], marker=st["marker"],
+                    linestyle=st["linestyle"], label=st["label"],
+                    capsize=2.5)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_title(f"f = {fault}")
+    ax.set_xlabel("Injection rate (tx/s)")
     ax.set_ylabel("Latency (ms, log)")
     if show_legend:
         ax.legend(loc="upper right", framealpha=0.9, ncol=1)
@@ -305,6 +356,32 @@ def fig_overlay(sources, out_stem):
     fig, axes = plt.subplots(1, 3, figsize=(FULL_W, PANEL_H + 0.7), sharey=True)
     for ax, fault in zip(axes, (3, 5, 7)):
         _draw_overlay_panel(ax, sources, fault, show_legend=False)
+    axes[1].set_ylabel("")
+    axes[2].set_ylabel("")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=len(labels),
+               frameon=False, bbox_to_anchor=(0.5, 1.0))
+    fig.tight_layout(rect=[0, 0, 1, 0.90])
+    _save(fig, out_stem)
+
+
+def fig_overlay_tput_vs_rate(sources, out_stem):
+    fig, axes = plt.subplots(1, 3, figsize=(FULL_W, PANEL_H + 0.7), sharey=True)
+    for ax, fault in zip(axes, (3, 5, 7)):
+        _draw_overlay_tput_vs_rate_panel(ax, sources, fault, show_legend=False)
+    axes[1].set_ylabel("")
+    axes[2].set_ylabel("")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=len(labels),
+               frameon=False, bbox_to_anchor=(0.5, 1.0))
+    fig.tight_layout(rect=[0, 0, 1, 0.90])
+    _save(fig, out_stem)
+
+
+def fig_overlay_lat_vs_rate(sources, out_stem):
+    fig, axes = plt.subplots(1, 3, figsize=(FULL_W, PANEL_H + 0.7), sharey=True)
+    for ax, fault in zip(axes, (3, 5, 7)):
+        _draw_overlay_lat_vs_rate_panel(ax, sources, fault, show_legend=False)
     axes[1].set_ylabel("")
     axes[2].set_ylabel("")
     handles, labels = axes[0].get_legend_handles_labels()
@@ -369,6 +446,8 @@ def main():
     fig_lat_vs_rate(pearl_by_n, OUT_DIR / "pearl_lat_vs_rate")
     fig_overlay(sources, OUT_DIR / "pearl_vs_baselines")
     fig_saturation(pearl_by_n, OUT_DIR / "pearl_saturation")
+    fig_overlay_tput_vs_rate(sources, OUT_DIR / "pearl_vs_baselines_tput_rate")
+    fig_overlay_lat_vs_rate(sources, OUT_DIR / "pearl_vs_baselines_lat_rate")
 
     print("Done.")
 
