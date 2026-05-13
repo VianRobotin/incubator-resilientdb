@@ -318,13 +318,25 @@ def run_experiment(
     dry_run: bool,
     num_clients: int = 1,
     target_tps: int = 0,
+    silent_faults: int = 0,
 ) -> Tuple[float, float, float, float, int]:
     """
     Reserve machines, run one experiment, return:
       (consensus_tps, consensus_latency_s, execution_tps, execution_latency_s, slots)
+
+    silent_faults: number of replicas to leave unstarted (silent-crash model).
+    Certs/config are still generated for all N (committee size), but only the
+    first (N - silent_faults) replicas are ssh-launched.  The honest replicas
+    must still form quorum (f+1 of 2f+1) — caller is responsible for choosing
+    a tolerable silent_faults value.
     """
+    if silent_faults < 0 or silent_faults >= num_replicas:
+        raise ValueError(
+            f"silent_faults={silent_faults} must be in [0, {num_replicas})")
+    live_replicas = num_replicas - silent_faults
+    fault_tag = f"_f{silent_faults}" if silent_faults else ""
     run_id = (f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-              f"_n{num_replicas}_{mode}_r{target_tps}")
+              f"_n{num_replicas}{fault_tag}_{mode}_r{target_tps}")
     print(f"\n{'='*60}")
     print(f"  {run_id}")
     print(f"{'='*60}")
@@ -389,8 +401,14 @@ def run_experiment(
             f"export LD_LIBRARY_PATH={LD_LIBRARY_PATH}:$LD_LIBRARY_PATH; "
         )
 
-        # Start replicas
-        print("Starting replicas...")
+        # Start ALL N replicas — silent faults are induced AFTER the cluster
+        # forms, by killing the last `silent_faults` replicas just before
+        # client trigger.  Don't-start was broken for Pearl: live replicas
+        # and client nodes block on connect-refused to silent peers and
+        # never reach `is ready`.  Killing after handshake completes
+        # avoids that and matches the standard BFT silent-crash model.
+        print(f"Starting {num_replicas} replicas "
+              f"(silent_faults={silent_faults} will be killed post-ready)...")
         procs = []
         for i, host in enumerate(replica_hosts, 1):
             log_file  = log_dir / f"server_{i}.log"
@@ -404,7 +422,7 @@ def run_experiment(
         for p in procs:
             p.wait()
 
-        # Wait for all replicas to connect
+        # Wait for all N replicas to connect.
         print(f"Waiting for {num_replicas} replicas (timeout={READY_TIMEOUT}s)...")
         ready_pattern = f"receive public size:{num_replicas}"
         deadline = time.time() + READY_TIMEOUT
@@ -458,15 +476,24 @@ def run_experiment(
             if not ok:
                 print(f"  WARNING: client {node_id} not listening — triggering anyway")
 
-        # Trigger clients.
-        # experiment_start is captured BEFORE the trigger subprocess is
-        # spawned: the trigger is just a kv_client.Set("start", ...) call,
-        # but on an overloaded / misconfigured client it can block for
-        # seconds waiting for an ACK.  Anchoring to now() before the Set
-        # guarantees the measurement window starts at-or-before the first
-        # commit.  (It is fine that the window begins very slightly before
-        # the trigger actually arrives — no activity can have happened yet,
-        # so no extra entries get included.)
+        # Induce silent faults AFTER all TCP handshakes complete: kill the
+        # last `silent_faults` replicas before triggering txn injection so
+        # the run actually models "f peers crashed silently" rather than
+        # "f peers were never reachable" (the latter blocks Pearl).
+        if silent_faults:
+            silent_hosts = replica_hosts[live_replicas:]
+            print(f"Inducing silent faults: killing replicas "
+                  f"{list(range(live_replicas+1, num_replicas+1))} "
+                  f"on {silent_hosts}")
+            kill_silent = []
+            for host in silent_hosts:
+                p = ssh_cmd(host, "killall -9 kv_server_performance 2>/dev/null || true")
+                if p:
+                    kill_silent.append(p)
+            for p in kill_silent:
+                p.wait()
+            time.sleep(1)
+
         print("Triggering clients...")
         experiment_start = datetime.datetime.now()
         trigger_procs = []
@@ -480,10 +507,10 @@ def run_experiment(
         print(f"Running for {runtime}s...")
         time.sleep(runtime)
 
-        # Kill all
+        # Kill all (skip silent replicas — they were never started)
         print("Killing nodes...")
         kill_procs = []
-        for host in replica_hosts + client_hosts:
+        for host in replica_hosts[:live_replicas] + client_hosts:
             p = ssh_cmd(host, "killall -9 kv_server_performance 2>/dev/null || true")
             if p:
                 kill_procs.append(p)
@@ -491,25 +518,6 @@ def run_experiment(
             p.wait()
         time.sleep(2)
 
-        # Parse logs.
-        #
-        # Metric definitions (see CLAUDE.md and the thesis for details):
-        #   consensus_tps / consensus_latency
-        #     Source: slot_committed log line, emitted by EVERY replica on
-        #     Commit().  consensus_latency_us = slot_commit_time − avg(create_time)
-        #     over own-originated txns in the slot (clock-consistent).  Every
-        #     replica commits every slot, so per-replica ≈ system-wide; take
-        #     the median across replicas.
-        #
-        #   execution_tps / execution_latency
-        #     Source: executed_batch log line, emitted by EVERY replica on
-        #     Commit() AFTER the post-commit τ-eligibility check.  count is
-        #     the number of txns that actually executed this slot (newly
-        #     committed txns whose K(t)/bof_seq ≤ τ, plus drained buffer
-        #     entries).  avg_latency_us = execute_time − avg(create_time) over
-        #     own-originated executed txns.  Every replica executes every
-        #     eligible tx, so per-replica ≈ system-wide; take the median across
-        #     replicas (matching the consensus aggregation).
         print("Parsing logs...")
         fallback_dur = max(1.0, runtime - warmup)
         per_replica_con_tps: list = []
@@ -520,7 +528,7 @@ def run_experiment(
         any_commit_fallback = False
         any_exec_fallback = False
 
-        for i in range(1, num_replicas + 1):
+        for i in range(1, live_replicas + 1):
             lf = log_dir / f"server_{i}.log"
             commit_meas, exec_meas, commit_total, exec_total, commit_fb, exec_fb = parse_log_file(
                 lf, experiment_start, warmup, runtime)

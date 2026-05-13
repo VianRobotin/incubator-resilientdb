@@ -1,0 +1,17 @@
+baseline,n,f,mode,input_rate,rep,consensus_tps,consensus_latency_ms,execution_tps,execution_latency_ms,slots_committed,silent_faults
+fairdag-bof,16,5,bof,500,1,149.53,0.00,36.71,31483.35,0,1
+fairdag-bof,16,5,bof,500,1,100.00,0.00,32.00,26001.75,0,2
+fairdag-bof,16,5,bof,500,1,100.69,0.00,32.50,24496.72,0,3
+fairdag-bof,16,5,bof,500,1,113.28,0.00,36.37,16055.40,0,4
+fairdag-bof,16,5,bof,500,1,132.86,0.00,183.96,7523.82,0,5
+
+fairdag-bof,16,5,bof,500,2,152.69,0.00,26.93,18761.83,0,1
+fairdag-bof,16,5,bof,500,3,86.27,0.00,25.68,23764.64,0,1
+fairdag-bof,16,5,bof,500,2,94.50,0.00,40.41,27876.64,0,2
+fairdag-bof,16,5,bof,500,3,126.76,0.00,147.25,25103.37,0,2
+fairdag-bof,16,5,bof,500,2,101.79,0.00,33.62,25985.74,0,3
+fairdag-bof,16,5,bof,500,3,87.77,0.00,32.84,22942.36,0,3
+fairdag-bof,16,5,bof,500,2,0.00,0.00,0.00,0.00,0,4
+fairdag-bof,16,5,bof,500,3,91.81,0.00,53.56,32019.31,0,4
+fairdag-bof,16,5,bof,500,2,83.34,0.00,53.68,27704.75,0,5
+fairdag-bof,16,5,bof,500,3,120.26,0.00,140.39,11559.62,0,5

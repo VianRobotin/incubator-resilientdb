@@ -84,152 +84,80 @@ SGX SDK libs: `/var/scratch/vrobotin/sgxsdk/lib64`
 
 ---
 
-## Running Experiments (DAS5)
+## Reproducing the Final Paper Results
 
-Main script: `scripts/deploy/performance/das.py`
+Each system has a CSV in `das_results/` (or `das_results/baselines/`). The paper plots
+are generated from these CSVs by `scripts/deploy/performance/plot_paper.py`.
 
+### Rate-sweep CSVs (n × input_rate)
+
+| System              | Mode | Result CSV                                |
+| ------------------- | ---- | ----------------------------------------- |
+| **Pearl** (ours)    | —    | `das_results/tput_latency.csv`            |
+| **FairDAG**         | OL   | `das_results/baselines/fairdag-ol.csv`    |
+| **FairDAG**         | BOF  | `das_results/baselines/fairdag-bof.csv`   |
+| **Pompe**           | —    | `das_results/baselines/pompe.csv`         |
+| **Themis**          | —    | `das_results/baselines/themis.csv`        |
+
+**Pearl** is reproducible from source via `scripts/deploy/performance/das.py`.
+
+**FairDAG (OL/BOF)** CSVs were produced on 2026-04-25 by a now-deleted orchestrator at
+`scripts/deploy/baselines/run_baselines.py` that wrapped
+`/var/scratch/vrobotin/baselines-fairdag/scripts/deploy/performance/das.py` (OL, `rl=False`)
+and `das_rl.py` (BOF, `rl=True`), reading `results.log` after each run and appending rows
+directly to the CSV. The wrapper was never committed; the underlying single-run scripts
+write to `baselines-fairdag/scripts/deploy/results/fairdag-{N}.txt` and `fairdagrl-{N}.txt`,
+not to the CSVs. To reproduce the rate-sweep CSVs from scratch you would have to recreate
+that wrapper.
+
+**Pompe** and **Themis** were produced via `fab of --flavor=<pompe|themis>` in the conda
+`workenv` environment, from `/var/scratch/vrobotin/narwhal/benchmark/`. The fabric task
+writes to `narwhal/benchmark/results/local-{att}-{arb}-{faults}-{wks}-{nodes}.txt`.
+
+Pompe and Themis runs require the conda `workenv` environment first (`conda activate workenv`).
+
+**Pompe TPS caveat**: throughput reported by `narwhal/benchmark` for the `pompe` flavor is
+inflated 100× and must be divided by 100. The CSV at `das_results/baselines/pompe.csv` should
+contain the corrected (divided) values; `pompe-rate/run_pompe.py` output does not need this
+correction.
+
+### Faulty-node sweep (silent_faults × system)
+
+A single orchestrator at `scripts/deploy/performance/das_faulty.py` drives the
+faulty-node sweep across all five systems. For each `(system, silent_faults)` it shells
+into the underlying single-run mechanism:
+- Pearl: `from das import run_experiment` (in-process)
+- FairDAG-OL/BOF: `python3 baselines-fairdag/scripts/deploy/performance/das_faulty.py --rl {0,1}` (a thin wrapper around `das.run` that injects a `FAULTS` env var consumed by `fair_performance.sh` / `fairrl_performance.sh`)
+- Pompe/Themis: `fab of-faulty --flavor=<pompe|themis>` (note hyphen — fabric converts the underscore in `def of_faulty` to a hyphen on the command line)
+
+Per-system rows are appended to `das_results/faulty/{system}.csv`. Rows with `tps>0` are
+auto-skipped on re-run. Plots: `scripts/deploy/performance/plot_paper_faulty_curated.py`.
+Pearl can be run in either OL or BOF via `--pearl-mode {ol,bof}`; both modes share the
+same `pearl.csv` and the dedup key includes `mode` so they don't shadow each other.
+
+### Batch-size sweep (block_size × system)
+
+Mirrors the faulty sweep. Orchestrator at `scripts/deploy/performance/das_batch.py`.
+Holds n fixed per protocol (same as the faulty sweep), no induced faults, rate=500 tx/s,
+sweeps batch_size in {25, 50, 100, 200, 400}.
+
+"Batch size" is a different physical knob per system — the closest comparable parameter:
+- Pearl: `block_size` JSON config (# txns per block). Directly settable.
+- FairDAG-OL/BOF: `FAIRDAG_BLOCK_SIZE` env var, read by patched `tusk.cpp` constructors
+  in `baselines-fairdag/platform/consensus/ordering/{fairdag,fairdag_rl}/algorithm/tusk.cpp`.
+  Falls back to the original defaults (`total_num` for OL, `15` for BOF) when unset, so
+  pre-existing scripts that don't set the var keep their old behavior. Env var is
+  propagated to remote replicas via `deploy.sh` prefixing the `nohup` launch.
+- Pompe/Themis: narwhal's worker accumulates batches by bytes; converted via
+  `node_params['batch_size'] = batch * tx_size` (tx_size=128). New fab task `of-batch`.
+
+Per-system rows are appended to `das_results/batch/{system}.csv` with a `batch_size`
+column in place of `silent_faults`. Plots: `plot_paper_batch_curated.py`.
+
+Final paper plots are produced by:
 ```bash
-# From scripts/deploy/ directory:
-python3 performance/das.py              # run full experiment suite
-python3 performance/das.py --dry-run   # print plan only (no machines reserved)
-python3 performance/das.py --skip-build  # skip bazel build
+python /var/scratch/vrobotin/incubator-resilientdb/scripts/deploy/performance/plot_paper.py
+python /var/scratch/vrobotin/incubator-resilientdb/scripts/deploy/performance/plot_paper_faulty_curated.py
+python /var/scratch/vrobotin/incubator-resilientdb/scripts/deploy/performance/plot_paper_batch_curated.py
 ```
 
-### What das.py does
-
-1. Reserves DAS5 machines via `preserve` (NFS-shared `/var/scratch`)
-2. Generates certificates and `server.config` with real IPs
-3. SSH-starts replica nodes (server binary) on reserved machines
-4. Waits for all replicas to connect (`receive public size:N` in logs)
-5. SSH-starts client nodes, waits for port to open, triggers via `kv_service_tools`
-6. Runs for `RUNTIME` seconds, kills all nodes, parses logs, releases reservation
-7. Appends results to CSV in `das_results/`
-
-### Experiment Parameters (matching Giulio's setup)
-
-| Parameter | Value |
-|-----------|-------|
-| Block size | 100 |
-| Transaction size | 128 bytes |
-| Runtime | 60 s |
-| Warmup | 15 s |
-| Repetitions | 5 per config |
-| Clients | n (rate-controlled via `target_input_tps`) |
-
-### Rate-sweep experiment (L-curve)
-
-For each N ∈ {7, 11, 15} and each mode ∈ {ol, bof}: vary injection rate from well below
-saturation to above it. Each (N, mode, rate) point → 5 repetitions.
-
-| N | Injection rates swept (tx/s) |
-|---|------------------------------|
-| 7 | 500, 1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000 |
-| 11 | 500, 1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000 |
-| 15 | 500, 1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000 |
-
-Results saved to: `das_results/tput_latency.csv`
-
-Plot: `scripts/deploy/performance/plot.py` → `das_results/plots/tput_vs_latency.png`
-(throughput x-axis, latency y-axis, one L-curve per (N, mode))
-
----
-
-## Benchmarks (Giulio's work — trusted reference)
-
-Giulio Segalin's thesis implementation is at `/var/scratch/gsegalin/giulio-msc-thesis/`.
-It uses **Narwhal/DAG-Rider** with 3f+1 committee size. His results are the baseline
-that Autobahn (2f+1) should beat.
-
-### Giulio's result files
-
-```
-/var/scratch/gsegalin/giulio-msc-thesis/results/
-├── our-work/          # Giulio's main system (OL baseline, Narwhal-based, 3f+1)
-│   └── local-0-1-0-1-{N}.txt   # N ∈ {10,13,16,19,22,25}
-├── themis/            # Themis benchmark results
-├── pompe/             # Pompe benchmark results
-├── fairdag/           # FairDAG benchmark results
-├── fairdag-comparison/
-├── our-work-preccs/   # PRECCS variants
-└── ...
-```
-
-### Giulio's result format
-
-Each `.txt` file contains 5+ runs with this structure:
-```
-Committee size: N node(s)
-Input rate: X tx/s
-Transaction size: 128 B
-Consensus TPS: X tx/s
-End-to-end TPS: X tx/s
-End-to-end latency: X ms
-```
-
-### Baseline numbers at N=16 (Giulio's system, 3f+1)
-
-- Input rate: 10,000 tx/s
-- Consensus TPS: ~9,400–9,950 tx/s
-- End-to-end TPS: ~9,370–9,935 tx/s
-- End-to-end latency: ~514–636 ms
-
----
-
-## Known Performance Issues (diagnosed 2026-04-15, updated 2026-04-19)
-
-### Root causes of low throughput / high latency
-
-**Issue 1 — ACK sent after O(block_size) signing work (FIXED)**
-`ReceiveBlock()` was computing 100 Ed25519 timestamp signatures *before* sending the BlockACK.
-Fix: moved `Broadcast(BlockACK)` to before `TimestampTransactions()` in `ReceiveBlock`.
-
-**Issue 2 — Δ = 1000ms (FIXED, now 50ms)**
-`delta_ms_ = 1000` caused 2Δ = 2000ms commit latency.
-Fix: changed to `delta_ms_ = 50` (DAS5 LAN RTT < 1ms; 50ms is very conservative).
-
-**Issue 3 — Excessive LOG(ERROR) in hot paths (FIXED)**
-Downgraded chatty log lines in hot paths from `LOG(ERROR)` to `LOG(INFO)`.
-
-**Issue 4 — BlockACK broadcast to all N nodes instead of point-to-point (FIXED)**
-`ReceiveBlock()` was calling `Broadcast(CMD_BlockACK)` which sends the ACK to ALL N nodes.
-Since every receiver discards ACKs for other nodes' blocks, this produced O(N³) wasted ACK
-messages per round (N senders × N ACKs each × N receivers). At N=22 this was ~10,000 msgs/round
-vs ~500 with point-to-point, causing severe network congestion and 270–2100ms cert latency.
-Fix: changed to `SendMessage(CMD_BlockACK, ..., block->sender_id())` — point-to-point to
-the block sender only. ACK traffic is now O(N²) for the whole system.
-
-**Issue 5 — Sequential block dissemination (fundamental, inherent to PoA chain)**
-The PoA chain requires block N's f+1 ACKs before block N+1 can be sent. This is protocol-
-correct and limits throughput to `(1/cert_latency) × block_size` per replica. Post all fixes,
-cert_latency should drop to ~5–10ms → ~10,000–20,000 TPS at N=10.
-
-### Performance after all fixes (expected)
-- Block certification latency: ~5–10ms (was 270–2100ms before Issue 4 fix)
-- Commit latency: 2Δ = 100ms (vs Giulio's 500-636ms — should be better)
-- Throughput: target > 9,935 TPS at N=10
-
----
-
-## Key Paths
-
-| What | Path |
-|------|------|
-| Main implementation | `/var/scratch/vrobotin/incubator-resilientdb/platform/consensus/ordering/autobahn/` |
-| Experiment script | `/var/scratch/vrobotin/incubator-resilientdb/scripts/deploy/performance/das.py` |
-| Experiment results | `/var/scratch/vrobotin/incubator-resilientdb/das_results/` |
-| Runtime artifacts | `/var/scratch/vrobotin/incubator-resilientdb/das_runtime/` |
-| SGX SDK | `/var/scratch/vrobotin/sgxsdk/lib64` |
-| Giulio's implementation | `/var/scratch/gsegalin/giulio-msc-thesis/` |
-| Giulio's results | `/var/scratch/gsegalin/giulio-msc-thesis/results/our-work/` |
-| Giulio's benchmarks | `/var/scratch/gsegalin/giulio-msc-thesis/results/{themis,pompe,fairdag}/` |
-| Thesis PDF | `/var/scratch/vrobotin/bin/Fair_Ordering_with_TEEs (4).pdf` |
-| Giulio's thesis PDF | `/var/scratch/vrobotin/bin/Giulio___Fair_ordering_MSc_thesis.pdf` |
-
----
-
-## DAS5 Assumptions
-
-- `/var/scratch` is NFS-shared across all DAS5 nodes — no SCP needed for binaries or configs
-- SSH from headnode to compute nodes is passwordless (shared `~/.ssh` via NFS home)
-- `preserve` command is on PATH (DAS5 reservation system)
-- Machines are referenced by hostname; IPs resolved via `socket.gethostbyname()`
