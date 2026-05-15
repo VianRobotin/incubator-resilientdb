@@ -30,6 +30,7 @@ broader plot set in das_results/plots/ and das_results/baselines/plots/.
 """
 
 import csv
+import os
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -43,10 +44,17 @@ import numpy as np
 # Paths -- resolved relative to this script so it runs on WSL and DAS5 alike.
 # ---------------------------------------------------------------------------
 
+LINEAR = os.environ.get("PLOT_LINEAR") == "1"
+_OUT_SUBDIR = "curated_linear" if LINEAR else "curated"
+
 PROJ_ROOT      = Path(__file__).resolve().parents[3]
 PEARL_CSV      = PROJ_ROOT / "das_results" / "tput_latency.csv"
 BASELINES_DIR  = PROJ_ROOT / "das_results" / "baselines"
-OUT_DIR        = PROJ_ROOT / "das_results" / "paper_plots" / "curated"
+OUT_DIR        = PROJ_ROOT / "das_results" / "paper_plots" / _OUT_SUBDIR
+
+
+def _log_label(text):
+    return text if not LINEAR else text.replace(", log", "").replace(" (log)", "")
 
 # ---------------------------------------------------------------------------
 # Visual identity for the paper. One palette, used consistently across figs.
@@ -212,7 +220,8 @@ def _draw_lat_vs_rate_panel(ax, pearl_data, n, show_legend=True):
         ax.errorbar(rates, m_lat, yerr=s_lat,
                     color=color, marker=st["marker"], linestyle=st["linestyle"],
                     label=st["label"], capsize=3)
-    ax.set_xscale("log")
+    if not LINEAR:
+        ax.set_xscale("log")
     ax.set_title(f"N = {n}  (f = {(n - 1) // 2})")
     ax.set_xlabel("Injection rate (tx/s)")
     ax.set_ylabel("Latency (ms)")
@@ -263,11 +272,13 @@ def _draw_overlay_panel(ax, sources, fault, show_legend=False):
                     color=st["color"], marker=st["marker"],
                     linestyle=st["linestyle"], label=st["label"],
                     capsize=2.5)
-    ax.set_xscale("log")
-    ax.set_yscale("log")
+    if not LINEAR:
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_ylim(1e2, 1e5)
     ax.set_title(f"f = {fault}")
-    ax.set_xlabel("Throughput (tx/s, log)")
-    ax.set_ylabel("Latency (ms, log)")
+    ax.set_xlabel(_log_label("Throughput (tx/s, log)"))
+    ax.set_ylabel(_log_label("Latency (ms, log)"))
     if show_legend:
         ax.legend(loc="upper right", framealpha=0.9, ncol=1)
 
@@ -289,11 +300,13 @@ def _draw_overlay_tput_vs_rate_panel(ax, sources, fault, show_legend=False):
                     color=st["color"], marker=st["marker"],
                     linestyle=st["linestyle"], label=st["label"],
                     capsize=2.5)
-    ax.set_xscale("log")
-    ax.set_yscale("log")
+    if not LINEAR:
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_ylim(1e0, 2e4)
     ax.set_title(f"f = {fault}")
     ax.set_xlabel("Injection rate (tx/s)")
-    ax.set_ylabel("Throughput (tx/s, log)")
+    ax.set_ylabel(_log_label("Throughput (tx/s, log)"))
     if show_legend:
         ax.legend(loc="lower right", framealpha=0.9, ncol=1)
 
@@ -313,11 +326,13 @@ def _draw_overlay_lat_vs_rate_panel(ax, sources, fault, show_legend=False):
                     color=st["color"], marker=st["marker"],
                     linestyle=st["linestyle"], label=st["label"],
                     capsize=2.5)
-    ax.set_xscale("log")
-    ax.set_yscale("log")
+    if not LINEAR:
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_ylim(1e2, 1e5)
     ax.set_title(f"f = {fault}")
     ax.set_xlabel("Injection rate (tx/s)")
-    ax.set_ylabel("Latency (ms, log)")
+    ax.set_ylabel(_log_label("Latency (ms, log)"))
     if show_legend:
         ax.legend(loc="upper right", framealpha=0.9, ncol=1)
 
@@ -409,10 +424,10 @@ def fig_saturation(pearl_data, out_stem):
 # ---------------------------------------------------------------------------
 
 def _save(fig, stem):
-    png = Path(f"{stem}.png")
-    fig.savefig(png)
+    pdf = Path(f"{stem}.pdf")
+    fig.savefig(pdf)
     plt.close(fig)
-    print(f"  wrote {png.name}")
+    print(f"  wrote {pdf.name}")
 
 
 def main():

@@ -16,6 +16,7 @@ display labels (Pearl, Pompe, Themis, FairDAG-AB, FairDAG-RL).
 """
 
 import csv
+import os
 from collections import defaultdict
 from pathlib import Path
 
@@ -31,9 +32,16 @@ import matplotlib.pyplot as plt
 # Paths
 # ---------------------------------------------------------------------------
 
+LINEAR = os.environ.get("PLOT_LINEAR") == "1"
+_OUT_SUBDIR = "curated_linear" if LINEAR else "curated"
+
 PROJ_ROOT  = Path(__file__).resolve().parents[3]
 FAULTY_DIR = PROJ_ROOT / "das_results" / "faulty"
-OUT_DIR    = PROJ_ROOT / "das_results" / "paper_plots" / "curated"
+OUT_DIR    = PROJ_ROOT / "das_results" / "paper_plots" / _OUT_SUBDIR
+
+
+def _log_label(text):
+    return text if not LINEAR else text.replace(", log", "").replace(" (log)", "")
 
 # ---------------------------------------------------------------------------
 # Visual identity — kept identical to plot_paper.py
@@ -127,10 +135,10 @@ def aggregate(points):
 
 def _save(fig, stem):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    png = OUT_DIR / f"{stem}.png"
-    fig.savefig(png)
+    pdf = OUT_DIR / f"{stem}.pdf"
+    fig.savefig(pdf)
     plt.close(fig)
-    print(f"  wrote {png}")
+    print(f"  wrote {pdf}")
 
 
 def plot_metric(metric: str, ylabel: str, out_stem: str):
@@ -162,9 +170,10 @@ def plot_metric(metric: str, ylabel: str, out_stem: str):
         return
 
     ax.set_xlabel("Number of silent faulty replicas")
-    ax.set_ylabel(ylabel)
+    ax.set_ylabel(_log_label(ylabel))
     ax.set_xticks([1, 2, 3, 4, 5])
-    ax.set_yscale("log")
+    if not LINEAR:
+        ax.set_yscale("log")
     ax.legend(loc="best", framealpha=0.9)
     # Manual margins — avoid tight_layout/get_tightbbox which trips the
     # np.Inf removal in newer numpy on this env's matplotlib 3.3.
