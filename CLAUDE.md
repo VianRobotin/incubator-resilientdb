@@ -89,7 +89,7 @@ SGX SDK libs: `/var/scratch/vrobotin/sgxsdk/lib64`
 Each system has a CSV in `das_results/` (or `das_results/baselines/`). The paper plots
 are generated from these CSVs by `scripts/deploy/performance/plot_paper.py`.
 
-### Rate-sweep CSVs (n × input_rate)
+### Rate-sweep CSVs (n × input_rate × rep)
 
 | System              | Mode | Result CSV                                |
 | ------------------- | ---- | ----------------------------------------- |
@@ -101,25 +101,28 @@ are generated from these CSVs by `scripts/deploy/performance/plot_paper.py`.
 
 **Pearl** is reproducible from source via `scripts/deploy/performance/das.py`.
 
-**FairDAG (OL/BOF)** CSVs were produced on 2026-04-25 by a now-deleted orchestrator at
-`scripts/deploy/baselines/run_baselines.py` that wrapped
-`/var/scratch/vrobotin/baselines-fairdag/scripts/deploy/performance/das.py` (OL, `rl=False`)
-and `das_rl.py` (BOF, `rl=True`), reading `results.log` after each run and appending rows
-directly to the CSV. The wrapper was never committed; the underlying single-run scripts
-write to `baselines-fairdag/scripts/deploy/results/fairdag-{N}.txt` and `fairdagrl-{N}.txt`,
-not to the CSVs. To reproduce the rate-sweep CSVs from scratch you would have to recreate
-that wrapper.
+**Baselines (FairDAG OL/BOF, Pompe, Themis)**: a single orchestrator at
+`scripts/deploy/performance/das_baselines_reps.py` sweeps `(n × input_rate × rep)`
+across the four baseline systems with no induced faults and appends rows to the
+existing baseline CSVs. For each `(system, n, input_rate, rep)` it shells into the
+per-point single-run mechanism:
+- FairDAG-OL/BOF: `python3 baselines-fairdag/scripts/deploy/performance/das_rate.py --n N --rate R --rl {0,1}` (thin CLI around `das.run(faults=0)`; sibling of the existing `das_faulty.py` / `das_batch.py` shims)
+- Pompe/Themis: `fab of-rate --flavor=<pompe|themis> -n=N --rate=R --runs=1` (single-point no-fault task added in `narwhal/benchmark/fabfile.py`; mirrors the inner body of `fab of`, writes to the same `narwhal/benchmark/results/local-0-0-0-{wks}-{nodes}.txt` so reps land in the same file as the original rep=1)
 
-**Pompe** and **Themis** were produced via `fab of --flavor=<pompe|themis>` in the conda
-`workenv` environment, from `/var/scratch/vrobotin/narwhal/benchmark/`. The fabric task
-writes to `narwhal/benchmark/results/local-{att}-{arb}-{faults}-{wks}-{nodes}.txt`.
+Per-system rows are appended in the existing 11-column baseline schema. Rows with
+`tps>0` are auto-skipped on re-run, so resuming after an interruption is safe.
+Default reps: `{2,3,4,5}` — rep=1 was produced earlier (FairDAG via a now-deleted
+local wrapper around `das.py`/`das_rl.py`; Pompe/Themis via `fab of --flavor=...`),
+both pre-existing pathways share the same `das.run(faults=0)` / `OFBench(...).run()`
+codepath as the reps 2..5 entry points, so rep=1 and reps 2..5 are comparable.
 
-Pompe and Themis runs require the conda `workenv` environment first (`conda activate workenv`).
+Pompe/Themis runs require the conda `workenv` environment, which the orchestrator
+activates in its narwhal subshell.
 
 **Pompe TPS caveat**: throughput reported by `narwhal/benchmark` for the `pompe` flavor is
 inflated 100× and must be divided by 100. The CSV at `das_results/baselines/pompe.csv` should
 contain the corrected (divided) values; `pompe-rate/run_pompe.py` output does not need this
-correction.
+correction. (`das_baselines_reps.py`'s narwhal runner divides automatically.)
 
 ### Faulty-node sweep (silent_faults × system)
 
