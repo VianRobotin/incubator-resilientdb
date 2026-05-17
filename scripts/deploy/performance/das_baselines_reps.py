@@ -75,7 +75,7 @@ SYSTEM_MODE = {
     "themis":      "bof",
 }
 
-RATE_GRID = [500, 1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000]
+RATE_GRID = [500, 1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000, 20000, 25000, 30000, 40000, 50000]
 
 # Existing baseline CSV schema (verbatim).  Trailing slots_committed column
 # is left empty per the existing files' convention.
