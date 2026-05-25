@@ -75,6 +75,11 @@ SERIES_SOURCE = {
 FULL_W  = 7.0
 PANEL_H = 4.5
 
+# Combined 1x2 panel (throughput | latency) sized for an IEEE full-width
+# figure*: one shared legend on top, both panels rendered at \textwidth.
+COMBINED_W = 11.5
+COMBINED_H = 4.8
+
 plt.rcParams.update({
     "font.size":        11.0,
     "axes.titlesize":   13.0,
@@ -179,8 +184,55 @@ def plot_metric(metric: str, ylabel: str, out_stem: str):
     _save(fig, out_stem)
 
 
+def plot_combined(out_stem: str):
+    """Throughput | latency side by side in a single full-width figure with
+    one shared legend on top — the version that goes in the paper."""
+    fig, (ax_t, ax_l) = plt.subplots(1, 2, figsize=(COMBINED_W, COMBINED_H))
+    any_data = False
+    for ax, metric, ylabel in ((ax_t, "tps", "Throughput (tx/s, log)"),
+                               (ax_l, "lat", "Latency (ms, log)")):
+        for system in SERIES_ORDER:
+            fname, mode = SERIES_SOURCE[system]
+            agg = aggregate(load_csv(BATCH_DIR / fname, mode_filter=mode))
+            if not agg:
+                continue
+            xs = [t[0] for t in agg]
+            if metric == "tps":
+                ys, errs = [t[1] for t in agg], [t[2] for t in agg]
+            else:
+                ys, errs = [t[3] for t in agg], [t[4] for t in agg]
+            st = SERIES_STYLE[system]
+            ax.errorbar(xs, ys, yerr=errs,
+                        color=st["color"], marker=st["marker"],
+                        linestyle=st["linestyle"], label=st["label"], capsize=3)
+            any_data = True
+        ax.set_xlabel(_log_label("Configured batch size (# txns, log)"))
+        ax.set_ylabel(_log_label(ylabel))
+        if not LINEAR:
+            ax.set_xscale("log")
+        ax.set_xticks([25, 50, 100, 200, 400])
+        ax.get_xaxis().set_major_formatter(matplotlib.ticker.ScalarFormatter())
+        if not LINEAR:
+            ax.set_yscale("log")
+
+    if not any_data:
+        print(f"  no data for {out_stem}; skipping")
+        plt.close(fig)
+        return
+
+    handles, labels = ax_t.get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=len(labels),
+               framealpha=0.9, bbox_to_anchor=(0.5, 1.0),
+               columnspacing=1.1, handletextpad=0.4)
+    fig.subplots_adjust(left=0.07, right=0.99, bottom=0.13, top=0.83, wspace=0.20)
+    _save(fig, out_stem)
+
+
 def main():
     print("Plotting curated batch-size figures...")
+    # Combined figure used in the paper (throughput | latency, shared legend).
+    plot_combined("pearl_vs_baselines_batch")
+    # Single-metric variants kept for backwards compatibility / other uses.
     plot_metric("lat", "Latency (ms, log)",
                 "pearl_vs_baselines_lat_batch")
     plot_metric("tps", "Throughput (tx/s, log)",
