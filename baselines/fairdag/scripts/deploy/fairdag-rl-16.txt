@@ -1,0 +1,750 @@
+Input Rate (tx/s): 100
+Throughput: 101.0
+Latency: 848.16
+Consensus throughput: 101.02
+Consensus latency: 0.0
+Input Rate (tx/s): 100
+Throughput: 101.0
+Latency: 856.31
+Consensus throughput: 101.01
+Consensus latency: 0.0
+Input Rate (tx/s): 100
+Throughput: 101.0
+Latency: 857.68
+Consensus throughput: 101.01
+Consensus latency: 0.0
+Input Rate (tx/s): 100
+Throughput: 101.0
+Latency: 854.12
+Consensus throughput: 101.02
+Consensus latency: 0.0
+Input Rate (tx/s): 100
+Throughput: 101.0
+Latency: 856.22
+Consensus throughput: 100.94
+Consensus latency: 0.0
+Input Rate (tx/s): 200
+Throughput: 205.0
+Latency: 443.55
+Consensus throughput: 204.97
+Consensus latency: 0.0
+Input Rate (tx/s): 200
+Throughput: 205.0
+Latency: 444.86
+Consensus throughput: 204.9
+Consensus latency: 0.0
+Input Rate (tx/s): 200
+Throughput: 205.0
+Latency: 480.66
+Consensus throughput: 204.99
+Consensus latency: 0.0
+Input Rate (tx/s): 200
+Throughput: 205.0
+Latency: 463.9
+Consensus throughput: 204.99
+Consensus latency: 0.0
+Input Rate (tx/s): 200
+Throughput: 205.0
+Latency: 477.77
+Consensus throughput: 205.0
+Consensus latency: 0.0
+Input Rate (tx/s): 300
+Throughput: 266.22
+Latency: 2920.87
+Consensus throughput: 261.95
+Consensus latency: 0.0
+Input Rate (tx/s): 300
+Throughput: 271.21
+Latency: 1706.75
+Consensus throughput: 240.78
+Consensus latency: 0.0
+Input Rate (tx/s): 300
+Throughput: 93.6
+Latency: 390.25
+Consensus throughput: 100.96
+Consensus latency: 0.0
+Input Rate (tx/s): 300
+Throughput: 260.71
+Latency: 3186.02
+Consensus throughput: 235.76
+Consensus latency: 0.0
+Input Rate (tx/s): 300
+Throughput: 266.19
+Latency: 4091.95
+Consensus throughput: 267.23
+Consensus latency: 0.0
+Input Rate (tx/s): 400
+Throughput: 223.49
+Latency: 5549.5
+Consensus throughput: 224.25
+Consensus latency: 0.0
+Input Rate (tx/s): 400
+Throughput: 41.53
+Latency: 24407.68
+Consensus throughput: 124.32
+Consensus latency: 0.0
+Input Rate (tx/s): 400
+Throughput: 36.04
+Latency: 26343.84
+Consensus throughput: 127.52
+Consensus latency: 0.0
+Input Rate (tx/s): 400
+Throughput: 38.53
+Latency: 14426.73
+Consensus throughput: 153.01
+Consensus latency: 0.0
+Input Rate (tx/s): 400
+Throughput: 187.63
+Latency: 11330.14
+Consensus throughput: 206.12
+Consensus latency: 0.0
+Input Rate (tx/s): 500
+Throughput: 27.27
+Latency: 29281.13
+Consensus throughput: 162.03
+Consensus latency: 0.0
+Input Rate (tx/s): 500
+Throughput: 37.69
+Latency: 20620.54
+Consensus throughput: 114.99
+Consensus latency: 0.0
+Input Rate (tx/s): 500
+Throughput: 30.16
+Latency: 33562.52
+Consensus throughput: 269.79
+Consensus latency: 0.0
+Input Rate (tx/s): 500
+Throughput: 29.71
+Latency: 25747.15
+Consensus throughput: 108.41
+Consensus latency: 0.0
+Input Rate (tx/s): 500
+Throughput: 68.23
+Latency: 36244.71
+Consensus throughput: 141.93
+Consensus latency: 0.0
+Input Rate (tx/s): 600
+Throughput: 24.22
+Latency: 24448.02
+Consensus throughput: 92.02
+Consensus latency: 0.0
+Input Rate (tx/s): 600
+Throughput: 31.6
+Latency: 26784.85
+Consensus throughput: 114.4
+Consensus latency: 0.0
+Input Rate (tx/s): 600
+Throughput: 27.53
+Latency: 30101.38
+Consensus throughput: 90.89
+Consensus latency: 0.0
+Input Rate (tx/s): 600
+Throughput: 24.77
+Latency: 17575.86
+Consensus throughput: 114.42
+Consensus latency: 0.0
+Input Rate (tx/s): 600
+Throughput: 20.2
+Latency: 18909.8
+Consensus throughput: 241.33
+Consensus latency: 0.0
+Input Rate (tx/s): 700
+Throughput: 23.27
+Latency: 22952.56
+Consensus throughput: 124.23
+Consensus latency: 0.0
+Input Rate (tx/s): 700
+Throughput: 35.48
+Latency: 32059.87
+Consensus throughput: 113.27
+Consensus latency: 0.0
+Input Rate (tx/s): 700
+Throughput: 34.17
+Latency: 22389.1
+Consensus throughput: 117.55
+Consensus latency: 0.0
+Input Rate (tx/s): 700
+Throughput: 29.95
+Latency: 27474.05
+Consensus throughput: 92.36
+Consensus latency: 0.0
+Input Rate (tx/s): 700
+Throughput: 21.73
+Latency: 23251.15
+Consensus throughput: 103.01
+Consensus latency: 0.0
+Input Rate (tx/s): 800
+Throughput: 45.1
+Latency: 22373.74
+Consensus throughput: 161.72
+Consensus latency: 0.0
+Input Rate (tx/s): 800
+Throughput: 26.52
+Latency: 24406.21
+Consensus throughput: 103.52
+Consensus latency: 0.0
+Input Rate (tx/s): 800
+Throughput: 34.03
+Latency: 25155.12
+Consensus throughput: 102.02
+Consensus latency: 0.0
+Input Rate (tx/s): 800
+Throughput: 16.42
+Latency: 22645.91
+Consensus throughput: 99.39
+Consensus latency: 0.0
+Input Rate (tx/s): 800
+Throughput: 20.68
+Latency: 22691.27
+Consensus throughput: 121.52
+Consensus latency: 0.0
+Input Rate (tx/s): 900
+Throughput: 22.31
+Latency: 25884.65
+Consensus throughput: 103.04
+Consensus latency: 0.0
+Input Rate (tx/s): 900
+Throughput: 36.06
+Latency: 31556.13
+Consensus throughput: 102.81
+Consensus latency: 0.0
+Input Rate (tx/s): 900
+Throughput: 38.76
+Latency: 29297.12
+Consensus throughput: 128.6
+Consensus latency: 0.0
+Input Rate (tx/s): 900
+Throughput: 15.87
+Latency: 16033.37
+Consensus throughput: 128.46
+Consensus latency: 0.0
+Input Rate (tx/s): 900
+Throughput: 36.85
+Latency: 28321.01
+Consensus throughput: 113.02
+Consensus latency: 0.0
+Input Rate (tx/s): 1000
+Throughput: 34.49
+Latency: 33555.28
+Consensus throughput: 83.73
+Consensus latency: 0.0
+Input Rate (tx/s): 1000
+Throughput: 28.6
+Latency: 19488.5
+Consensus throughput: 102.74
+Consensus latency: 0.0
+Input Rate (tx/s): 1000
+Throughput: 24.88
+Latency: 27746.32
+Consensus throughput: 98.61
+Consensus latency: 0.0
+Input Rate (tx/s): 1000
+Throughput: 24.42
+Latency: 26397.88
+Consensus throughput: 95.75
+Consensus latency: 0.0
+Input Rate (tx/s): 1000
+Throughput: 17.53
+Latency: 20545.6
+Consensus throughput: 158.81
+Consensus latency: 0.0
+Input Rate (tx/s): 1000
+Throughput: 31.04
+Latency: 8730.44
+Consensus throughput: 130.89
+Consensus latency: 0.0
+Input Rate (tx/s): 1000
+Throughput: 22.71
+Latency: 28907.85
+Consensus throughput: 114.08
+Consensus latency: 0.0
+Input Rate (tx/s): 1000
+Throughput: 35.94
+Latency: 18369.36
+Consensus throughput: 117.63
+Consensus latency: 0.0
+Input Rate (tx/s): 1000
+Throughput: 37.06
+Latency: 25492.6
+Consensus throughput: 137.17
+Consensus latency: 0.0
+Input Rate (tx/s): 1000
+Throughput: 32.89
+Latency: 35704.88
+Consensus throughput: 126.38
+Consensus latency: 0.0
+Input Rate (tx/s): 11000
+Throughput: 54.63
+Latency: 27355.28
+Consensus throughput: 166.92
+Consensus latency: 0.0
+Input Rate (tx/s): 11000
+Throughput: 28.99
+Latency: 23877.05
+Consensus throughput: 108.61
+Consensus latency: 0.0
+Input Rate (tx/s): 11000
+Throughput: 20.66
+Latency: 22829.04
+Consensus throughput: 102.28
+Consensus latency: 0.0
+Input Rate (tx/s): 11000
+Throughput: 36.26
+Latency: 17793.94
+Consensus throughput: 110.48
+Consensus latency: 0.0
+Input Rate (tx/s): 11000
+Throughput: 36.48
+Latency: 29322.24
+Consensus throughput: 115.31
+Consensus latency: 0.0
+Input Rate (tx/s): 21000
+Throughput: 24.46
+Latency: 24483.47
+Consensus throughput: 123.67
+Consensus latency: 0.0
+Input Rate (tx/s): 21000
+Throughput: 32.52
+Latency: 30631.76
+Consensus throughput: 93.71
+Consensus latency: 0.0
+Input Rate (tx/s): 21000
+Throughput: 29.78
+Latency: 20890.49
+Consensus throughput: 110.27
+Consensus latency: 0.0
+Input Rate (tx/s): 21000
+Throughput: 22.88
+Latency: 23220.33
+Consensus throughput: 90.97
+Consensus latency: 0.0
+Input Rate (tx/s): 21000
+Throughput: 46.24
+Latency: 20632.27
+Consensus throughput: 166.27
+Consensus latency: 0.0
+Input Rate (tx/s): 31000
+Throughput: 35.46
+Latency: 23732.4
+Consensus throughput: 126.02
+Consensus latency: 0.0
+Input Rate (tx/s): 31000
+Throughput: 24.6
+Latency: 15392.23
+Consensus throughput: 129.69
+Consensus latency: 0.0
+Input Rate (tx/s): 31000
+Throughput: 38.18
+Latency: 33254.12
+Consensus throughput: 121.12
+Consensus latency: 0.0
+Input Rate (tx/s): 31000
+Throughput: 28.19
+Latency: 25678.83
+Consensus throughput: 92.12
+Consensus latency: 0.0
+Input Rate (tx/s): 31000
+Throughput: 47.89
+Latency: 31588.05
+Consensus throughput: 130.31
+Consensus latency: 0.0
+Input Rate (tx/s): 41000
+Throughput: 33.51
+Latency: 32666.82
+Consensus throughput: 120.76
+Consensus latency: 0.0
+Input Rate (tx/s): 41000
+Throughput: 45.68
+Latency: 32925.43
+Consensus throughput: 144.45
+Consensus latency: 0.0
+Input Rate (tx/s): 41000
+Throughput: 38.89
+Latency: 21792.35
+Consensus throughput: 125.78
+Consensus latency: 0.0
+Input Rate (tx/s): 41000
+Throughput: 42.2
+Latency: 24176.99
+Consensus throughput: 126.53
+Consensus latency: 0.0
+Input Rate (tx/s): 41000
+Throughput: 37.38
+Latency: 19272.24
+Consensus throughput: 217.6
+Consensus latency: 0.0
+Input Rate (tx/s): 51000
+Throughput: 25.92
+Latency: 26553.05
+Consensus throughput: 102.69
+Consensus latency: 0.0
+Input Rate (tx/s): 51000
+Throughput: 25.1
+Latency: 24352.09
+Consensus throughput: 132.03
+Consensus latency: 0.0
+Input Rate (tx/s): 51000
+Throughput: 24.58
+Latency: 27833.79
+Consensus throughput: 103.41
+Consensus latency: 0.0
+Input Rate (tx/s): 51000
+Throughput: 34.56
+Latency: 20219.66
+Consensus throughput: 173.38
+Consensus latency: 0.0
+Input Rate (tx/s): 51000
+Throughput: 42.07
+Latency: 35509.16
+Consensus throughput: 120.82
+Consensus latency: 0.0
+Input Rate (tx/s): 61000
+Throughput: 30.68
+Latency: 28478.19
+Consensus throughput: 115.1
+Consensus latency: 0.0
+Input Rate (tx/s): 61000
+Throughput: 30.92
+Latency: 19433.48
+Consensus throughput: 115.31
+Consensus latency: 0.0
+Input Rate (tx/s): 61000
+Throughput: 39.24
+Latency: 26057.54
+Consensus throughput: 153.55
+Consensus latency: 0.0
+Input Rate (tx/s): 61000
+Throughput: 50.79
+Latency: 30480.2
+Consensus throughput: 137.9
+Consensus latency: 0.0
+Input Rate (tx/s): 61000
+Throughput: 18.41
+Latency: 23395.77
+Consensus throughput: 101.27
+Consensus latency: 0.0
+Input Rate (tx/s): 71000
+Throughput: 28.41
+Latency: 23450.77
+Consensus throughput: 138.03
+Consensus latency: 0.0
+Input Rate (tx/s): 71000
+Throughput: 23.6
+Latency: 14982.67
+Consensus throughput: 128.74
+Consensus latency: 0.0
+Input Rate (tx/s): 71000
+Throughput: 17.3
+Latency: 14614.83
+Consensus throughput: 178.38
+Consensus latency: 0.0
+Input Rate (tx/s): 71000
+Throughput: 22.23
+Latency: 20126.67
+Consensus throughput: 101.1
+Consensus latency: 0.0
+Input Rate (tx/s): 71000
+Throughput: 29.03
+Latency: 21461.2
+Consensus throughput: 164.38
+Consensus latency: 0.0
+Input Rate (tx/s): 81000
+Throughput: 34.17
+Latency: 23821.6
+Consensus throughput: 125.95
+Consensus latency: 0.0
+Input Rate (tx/s): 81000
+Throughput: 31.19
+Latency: 22072.6
+Consensus throughput: 140.98
+Consensus latency: 0.0
+Input Rate (tx/s): 81000
+Throughput: 32.57
+Latency: 24755.26
+Consensus throughput: 132.0
+Consensus latency: 0.0
+Input Rate (tx/s): 81000
+Throughput: 26.89
+Latency: 22602.46
+Consensus throughput: 96.36
+Consensus latency: 0.0
+Input Rate (tx/s): 81000
+Throughput: 28.49
+Latency: 24980.65
+Consensus throughput: 113.27
+Consensus latency: 0.0
+Input Rate (tx/s): 91000
+Throughput: 35.89
+Latency: 29339.48
+Consensus throughput: 95.29
+Consensus latency: 0.0
+Input Rate (tx/s): 91000
+Throughput: 24.22
+Latency: 28613.19
+Consensus throughput: 165.31
+Consensus latency: 0.0
+Input Rate (tx/s): 91000
+Throughput: 28.09
+Latency: 24939.06
+Consensus throughput: 131.02
+Consensus latency: 0.0
+Input Rate (tx/s): 91000
+Throughput: 36.08
+Latency: 23830.44
+Consensus throughput: 146.82
+Consensus latency: 0.0
+Input Rate (tx/s): 91000
+Throughput: 27.07
+Latency: 30850.24
+Consensus throughput: 134.51
+Consensus latency: 0.0
+Input Rate (tx/s): 1000
+Throughput: 30.15
+Latency: 27352.64
+Consensus throughput: 91.95
+Consensus latency: 0.0
+Input Rate (tx/s): 1000
+Throughput: 33.08
+Latency: 31635.29
+Consensus throughput: 107.54
+Consensus latency: 0.0
+Input Rate (tx/s): 1000
+Throughput: 22.58
+Latency: 23781.85
+Consensus throughput: 109.23
+Consensus latency: 0.0
+Input Rate (tx/s): 1000
+Throughput: 26.96
+Latency: 25884.56
+Consensus throughput: 161.79
+Consensus latency: 0.0
+Input Rate (tx/s): 1000
+Throughput: 29.3
+Latency: 29548.29
+Consensus throughput: 115.14
+Consensus latency: 0.0
+Input Rate (tx/s): 2000
+Throughput: 36.65
+Latency: 25292.79
+Consensus throughput: 205.96
+Consensus latency: 0.0
+Input Rate (tx/s): 2000
+Throughput: 42.92
+Latency: 29541.87
+Consensus throughput: 127.34
+Consensus latency: 0.0
+Input Rate (tx/s): 2000
+Throughput: 38.58
+Latency: 22184.81
+Consensus throughput: 187.09
+Consensus latency: 0.0
+Input Rate (tx/s): 2000
+Throughput: 37.74
+Latency: 27256.68
+Consensus throughput: 115.2
+Consensus latency: 0.0
+Input Rate (tx/s): 2000
+Throughput: 21.09
+Latency: 21998.15
+Consensus throughput: 91.74
+Consensus latency: 0.0
+Input Rate (tx/s): 3000
+Throughput: 31.22
+Latency: 26270.66
+Consensus throughput: 125.31
+Consensus latency: 0.0
+Input Rate (tx/s): 3000
+Throughput: 29.52
+Latency: 20456.11
+Consensus throughput: 148.89
+Consensus latency: 0.0
+Input Rate (tx/s): 3000
+Throughput: 23.51
+Latency: 18956.3
+Consensus throughput: 111.96
+Consensus latency: 0.0
+Input Rate (tx/s): 3000
+Throughput: 33.72
+Latency: 22751.3
+Consensus throughput: 124.21
+Consensus latency: 0.0
+Input Rate (tx/s): 3000
+Throughput: 21.47
+Latency: 26597.82
+Consensus throughput: 108.16
+Consensus latency: 0.0
+Input Rate (tx/s): 4000
+Throughput: 34.35
+Latency: 27178.92
+Consensus throughput: 108.08
+Consensus latency: 0.0
+Input Rate (tx/s): 4000
+Throughput: 36.91
+Latency: 29446.91
+Consensus throughput: 96.1
+Consensus latency: 0.0
+Input Rate (tx/s): 4000
+Throughput: 40.94
+Latency: 31562.22
+Consensus throughput: 127.74
+Consensus latency: 0.0
+Input Rate (tx/s): 4000
+Throughput: 26.18
+Latency: 21203.44
+Consensus throughput: 138.03
+Consensus latency: 0.0
+Input Rate (tx/s): 4000
+Throughput: 30.8
+Latency: 10035.34
+Consensus throughput: 156.73
+Consensus latency: 0.0
+Input Rate (tx/s): 5000
+Throughput: 35.1
+Latency: 27583.97
+Consensus throughput: 131.89
+Consensus latency: 0.0
+Input Rate (tx/s): 5000
+Throughput: 22.25
+Latency: 18915.86
+Consensus throughput: 114.84
+Consensus latency: 0.0
+Input Rate (tx/s): 5000
+Throughput: 20.14
+Latency: 19999.05
+Consensus throughput: 115.39
+Consensus latency: 0.0
+Input Rate (tx/s): 5000
+Throughput: 23.48
+Latency: 34790.57
+Consensus throughput: 102.31
+Consensus latency: 0.0
+Input Rate (tx/s): 5000
+Throughput: 44.42
+Latency: 33765.26
+Consensus throughput: 141.13
+Consensus latency: 0.0
+Input Rate (tx/s): 6000
+Throughput: 25.48
+Latency: 26022.07
+Consensus throughput: 103.46
+Consensus latency: 0.0
+Input Rate (tx/s): 6000
+Throughput: 35.2
+Latency: 33518.7
+Consensus throughput: 101.89
+Consensus latency: 0.0
+Input Rate (tx/s): 6000
+Throughput: 49.82
+Latency: 32297.44
+Consensus throughput: 121.13
+Consensus latency: 0.0
+Input Rate (tx/s): 6000
+Throughput: 34.98
+Latency: 29723.54
+Consensus throughput: 114.74
+Consensus latency: 0.0
+Input Rate (tx/s): 6000
+Throughput: 31.66
+Latency: 29235.95
+Consensus throughput: 99.98
+Consensus latency: 0.0
+Input Rate (tx/s): 7000
+Throughput: 29.08
+Latency: 17168.07
+Consensus throughput: 138.03
+Consensus latency: 0.0
+Input Rate (tx/s): 7000
+Throughput: 37.22
+Latency: 33927.61
+Consensus throughput: 194.61
+Consensus latency: 0.0
+Input Rate (tx/s): 7000
+Throughput: 28.27
+Latency: 3191.11
+Consensus throughput: 208.64
+Consensus latency: 0.0
+Input Rate (tx/s): 7000
+Throughput: 37.88
+Latency: 27468.36
+Consensus throughput: 114.9
+Consensus latency: 0.0
+Input Rate (tx/s): 7000
+Throughput: 32.98
+Latency: 29267.77
+Consensus throughput: 102.42
+Consensus latency: 0.0
+Input Rate (tx/s): 8000
+Throughput: 24.29
+Latency: 27011.92
+Consensus throughput: 103.42
+Consensus latency: 0.0
+Input Rate (tx/s): 8000
+Throughput: 31.27
+Latency: 27985.2
+Consensus throughput: 96.62
+Consensus latency: 0.0
+Input Rate (tx/s): 8000
+Throughput: 43.16
+Latency: 30242.75
+Consensus throughput: 178.88
+Consensus latency: 0.0
+Input Rate (tx/s): 8000
+Throughput: 18.29
+Latency: 26973.76
+Consensus throughput: 92.02
+Consensus latency: 0.0
+Input Rate (tx/s): 8000
+Throughput: 18.91
+Latency: 26201.22
+Consensus throughput: 154.82
+Consensus latency: 0.0
+Input Rate (tx/s): 9000
+Throughput: 48.31
+Latency: 31128.78
+Consensus throughput: 137.86
+Consensus latency: 0.0
+Input Rate (tx/s): 9000
+Throughput: 46.8
+Latency: 29995.88
+Consensus throughput: 315.41
+Consensus latency: 0.0
+Input Rate (tx/s): 9000
+Throughput: 37.33
+Latency: 32629.14
+Consensus throughput: 198.79
+Consensus latency: 0.0
+Input Rate (tx/s): 9000
+Throughput: 18.79
+Latency: 28896.62
+Consensus throughput: 102.71
+Consensus latency: 0.0
+Input Rate (tx/s): 9000
+Throughput: 31.99
+Latency: 14286.96
+Consensus throughput: 199.06
+Consensus latency: 0.0
+Input Rate (tx/s): 10000
+Throughput: 40.63
+Latency: 1332.49
+Consensus throughput: 197.2
+Consensus latency: 0.0
+Input Rate (tx/s): 10000
+Throughput: 15.85
+Latency: 23582.13
+Consensus throughput: 89.35
+Consensus latency: 0.0
+Input Rate (tx/s): 10000
+Throughput: 22.47
+Latency: 17984.07
+Consensus throughput: 158.13
+Consensus latency: 0.0
+Input Rate (tx/s): 10000
+Throughput: 33.37
+Latency: 18549.04
+Consensus throughput: 206.52
+Consensus latency: 0.0
+Input Rate (tx/s): 10000
+Throughput: 25.43
+Latency: 23659.94
+Consensus throughput: 154.04
+Consensus latency: 0.0

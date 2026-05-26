@@ -1,0 +1,25 @@
+Input Rate (tx/s): 350
+Throughput: 397.45
+Latency: 534.85
+Consensus throughput: 382.78
+Consensus latency: 353.48
+Input Rate (tx/s): 350
+Throughput: 393.24
+Latency: 476.91
+Consensus throughput: 380.82
+Consensus latency: 349.46
+Input Rate (tx/s): 350
+Throughput: 395.31
+Latency: 740.73
+Consensus throughput: 360.79
+Consensus latency: 365.01
+Input Rate (tx/s): 350
+Throughput: 400.02
+Latency: 476.44
+Consensus throughput: 348.9
+Consensus latency: 330.77
+Input Rate (tx/s): 350
+Throughput: 392.54
+Latency: 506.18
+Consensus throughput: 362.99
+Consensus latency: 340.66

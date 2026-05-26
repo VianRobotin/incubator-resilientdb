@@ -1,0 +1,1 @@
+cmd='/var/scratch/vrobotin/narwhal/of_protocols/Themis_tx/secp256k1/autogen.sh;COMMAND;/var/scratch/vrobotin/narwhal/of_protocols/Themis_tx/secp256k1/configure;--disable-shared;--with-pic;--with-bignum=no;--enable-module-recovery'

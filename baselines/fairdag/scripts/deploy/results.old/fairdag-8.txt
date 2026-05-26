@@ -1,0 +1,20 @@
+Throughput: 159.26
+Latency: 325.39
+Consensus throughput: 159.53
+Consensus latency: 190.75
+Throughput: 156.62
+Latency: 262.12
+Consensus throughput: 156.39
+Consensus latency: 187.67
+Throughput: 158.8
+Latency: 257.6
+Consensus throughput: 158.68
+Consensus latency: 191.51
+Throughput: 155.93
+Latency: 274.34
+Consensus throughput: 136.63
+Consensus latency: 206.55
+Throughput: 158.96
+Latency: 267.59
+Consensus throughput: 158.51
+Consensus latency: 191.08
