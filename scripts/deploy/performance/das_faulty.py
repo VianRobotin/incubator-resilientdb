@@ -32,8 +32,11 @@ THIS_DIR    = Path(__file__).resolve().parent
 PEARL_ROOT  = THIS_DIR.parents[2]                       # incubator-resilientdb
 SCRATCH     = PEARL_ROOT.parent                          # /var/scratch/vrobotin
 
-FAIRDAG_ROOT  = SCRATCH / "baselines-fairdag"
-NARWHAL_ROOT  = SCRATCH / "narwhal"
+# Baselines now live inside the repo (incubator-resilientdb/baselines/) so
+# their changes can be committed alongside Pearl. The old out-of-repo copies
+# at SCRATCH/{baselines-fairdag,narwhal} are retired.
+FAIRDAG_ROOT  = PEARL_ROOT / "baselines" / "fairdag"
+NARWHAL_ROOT  = PEARL_ROOT / "baselines" / "narwhal"
 
 FAIRDAG_DEPLOY = FAIRDAG_ROOT / "scripts" / "deploy"
 NARWHAL_BENCH  = NARWHAL_ROOT / "benchmark"
@@ -60,6 +63,7 @@ SYSTEMS = {
     "pearl":       {"n": 11, "rate": 500},
     "fairdag-ol":  {"n": 16, "rate": 500},
     "fairdag-bof": {"n": 16, "rate": 500},
+    "tusk":        {"n": 16, "rate": 500},   # 3f+1, same as FairDAG
     "pompe":       {"n": 16, "rate": 500},
     "themis":      {"n": 21, "rate": 500},
 }
@@ -85,6 +89,7 @@ BASELINE_HEADER = ("baseline,n,f,mode,input_rate,rep,"
 BASELINE_F = {
     "fairdag-ol":  5,   # 3f+1 with n=16 -> f=5
     "fairdag-bof": 5,   # 3f+1 with n=16 -> f=5
+    "tusk":        5,   # 3f+1 with n=16 -> f=5
     "pompe":       5,   # 3f+1 with n=16 -> f=5
     "themis":      5,   # 4f+1 with n=21 -> f=5
 }
@@ -99,6 +104,7 @@ SYSTEM_MODE = {
     "pearl":       "ol",
     "fairdag-ol":  "ol",
     "fairdag-bof": "bof",
+    "tusk":        "none",   # no fair-ordering layer
     "pompe":       "ol",
     "themis":      "bof",
 }
@@ -210,31 +216,34 @@ def run_pearl(n: int, f: int, rate: int, dry_run: bool, mode: str = "ol"):
     return exec_tps, exec_lat_s * 1000, con_tps, con_lat_s * 1000, slots
 
 
-def run_fairdag(rl: bool, n: int, f: int, rate: int, dry_run: bool):
-    """Subprocess into baselines-fairdag/scripts/deploy/performance/das_faulty.py"""
+def run_fairdag(rl: bool, n: int, f: int, rate: int, dry_run: bool, system: str = "fairdag"):
+    """Subprocess into baselines/fairdag/scripts/deploy/performance/das_faulty.py.
+    `system="tusk"` runs the plain DAG-BFT substrate (ignores `rl`).
+    """
     cwd = FAIRDAG_DEPLOY
     cmd = [
         sys.executable, "performance/das_faulty.py",
         "--n", str(n), "--faults", str(f), "--rate", str(rate),
         "--rl", "1" if rl else "0",
+        "--system", system,
         "--duration", "300",
     ]
     if dry_run:
         print(f"[DRY-RUN] cd {cwd} && {' '.join(cmd)}")
         return 0.0, 0.0, 0.0, 0.0, 0
-    print(f"\n[fairdag] cd {cwd}")
-    print(f"[fairdag] {' '.join(cmd)}")
+    print(f"\n[{system}] cd {cwd}")
+    print(f"[{system}] {' '.join(cmd)}")
     proc = subprocess.run(cmd, cwd=str(cwd),
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           universal_newlines=True)
     sys.stdout.write(proc.stdout)
     sys.stderr.write(proc.stderr)
     if proc.returncode != 0:
-        print(f"[fairdag] non-zero exit ({proc.returncode}); recording zero")
+        print(f"[{system}] non-zero exit ({proc.returncode}); recording zero")
         return 0.0, 0.0, 0.0, 0.0, 0
     m = re.search(r"^RESULT_JSON (\{.*\})$", proc.stdout, re.MULTILINE)
     if not m:
-        print("[fairdag] no RESULT_JSON line found; recording zero")
+        print(f"[{system}] no RESULT_JSON line found; recording zero")
         return 0.0, 0.0, 0.0, 0.0, 0
     try:
         d = json.loads(m.group(1))
@@ -335,6 +344,8 @@ def run_one(system: str, f: int, dry_run: bool, pearl_mode: str = "ol"):
         return run_fairdag(rl=False, n=n, f=f, rate=rate, dry_run=dry_run)
     if system == "fairdag-bof":
         return run_fairdag(rl=True, n=n, f=f, rate=rate, dry_run=dry_run)
+    if system == "tusk":
+        return run_fairdag(rl=False, n=n, f=f, rate=rate, dry_run=dry_run, system="tusk")
     if system == "pompe":
         return run_narwhal("pompe", n, f, rate, dry_run)
     if system == "themis":

@@ -58,16 +58,18 @@ SERIES_STYLE = {
     "pearl-bof":   dict(color=PEARL_BOF_COLOR, marker="s", linestyle="-", label="Pearl (BOF)"),
     "fairdag-ol":  dict(color="#6A1B9A",       marker="v", linestyle="-", label="FairDAG-AB"),
     "fairdag-bof": dict(color="#C2185B",       marker="P", linestyle="-", label="FairDAG-RL"),
+    "tusk":        dict(color="#00838F",       marker="X", linestyle="-", label="Tusk"),
     "pompe":       dict(color="#2E7D32",       marker="D", linestyle="-", label="Pompe"),
     "themis":      dict(color="#FBC02D",       marker="^", linestyle="-", label="Themis"),
 }
-SERIES_ORDER = ["pearl-ol", "pearl-bof", "fairdag-ol", "fairdag-bof", "pompe", "themis"]
+SERIES_ORDER = ["pearl-ol", "pearl-bof", "fairdag-ol", "fairdag-bof", "tusk", "pompe", "themis"]
 
 SERIES_SOURCE = {
     "pearl-ol":    ("pearl.csv",       "ol"),
     "pearl-bof":   ("pearl.csv",       "bof"),
     "fairdag-ol":  ("fairdag-ol.csv",  None),
     "fairdag-bof": ("fairdag-bof.csv", None),
+    "tusk":        ("tusk.csv",        None),
     "pompe":       ("pompe.csv",       None),
     "themis":      ("themis.csv",      None),
 }

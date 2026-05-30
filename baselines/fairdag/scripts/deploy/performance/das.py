@@ -52,16 +52,24 @@ def run(
     faults: int = 0,
     rl: Optional[bool] = None,
     block_size: Optional[int] = None,
+    system: str = "fairdag",
 ):
-    # Resolve mode (rl flag) and the bash entry point + config template.
-    use_rl = RUN_RL if rl is None else rl
-    benchmark_file = (
-        "./performance/fairrl_performance.sh"
-        if use_rl else "./performance/fair_performance.sh"
-    )
-    template_config_path = (
-        "./config/fairrl.config" if use_rl else "./config/fair.config"
-    )
+    if system == "tusk":
+        benchmark_file = "./performance/tusk_performance.sh"
+        template_config_path = "./config/tusk.config"
+        use_rl = False
+    elif system == "fairdag":
+        # Resolve mode (rl flag) and the bash entry point + config template.
+        use_rl = RUN_RL if rl is None else rl
+        benchmark_file = (
+            "./performance/fairrl_performance.sh"
+            if use_rl else "./performance/fair_performance.sh"
+        )
+        template_config_path = (
+            "./config/fairrl.config" if use_rl else "./config/fair.config"
+        )
+    else:
+        raise ValueError(f"unknown system: {system!r} (expected 'fairdag' or 'tusk')")
 
     subprocess.call(
         ["bazel", "build", "//service/kv:kv_service"],
@@ -69,10 +77,12 @@ def run(
     )
 
     fault_tag = f"-f{faults}" if faults else ""
-    results_file = (
-        f"fairdagrl-{amount_replicas}{fault_tag}.txt"
-        if use_rl else f"fairdag-{amount_replicas}{fault_tag}.txt"
-    )
+    if system == "tusk":
+        results_file = f"tusk-{amount_replicas}{fault_tag}.txt"
+    elif use_rl:
+        results_file = f"fairdagrl-{amount_replicas}{fault_tag}.txt"
+    else:
+        results_file = f"fairdag-{amount_replicas}{fault_tag}.txt"
 
     preserve_manager = PreserveManager(username)
     try:
@@ -163,6 +173,7 @@ def run(
         found_c_latency = findall(r"average consensus latency: (\d+.?\d*)", text)
         clatency = float(found_c_latency[0].replace(",", ""))
 
+    os.makedirs("results", exist_ok=True)
     with open(os.path.join("results", results_file), "a") as f:
         if target_tps:
             f.write(f"Input Rate (tx/s): {target_tps}\n")

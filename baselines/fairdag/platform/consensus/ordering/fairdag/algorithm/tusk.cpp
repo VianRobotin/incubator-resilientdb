@@ -20,9 +20,10 @@ Tusk::Tusk(int id, int f, int total_num, SignatureVerifier* verifier,
   LOG(ERROR)<<"id:"<<id<<" f:"<<f<<" total:"<<total_num;
   limit_count_ = 2*f+1;
   // FAIRDAG_BLOCK_SIZE env var overrides the default for batch-size sweeps.
+  // Default 100 (matches Tusk and the BOF default) for the rate/faulty sweeps.
   const char* env_bs = std::getenv("FAIRDAG_BLOCK_SIZE");
   int env_bs_val = env_bs ? std::atoi(env_bs) : 0;
-  batch_size_ = (env_bs_val > 0) ? env_bs_val : total_num;
+  batch_size_ = (env_bs_val > 0) ? env_bs_val : 100;
   LOG(ERROR)<<"fairdag batch_size_:"<<batch_size_<<" (env="<<(env_bs?env_bs:"<unset>")<<")";
   proposal_manager_ = std::make_unique<ProposalManager>(id, limit_count_);
   execute_id_ = 1;

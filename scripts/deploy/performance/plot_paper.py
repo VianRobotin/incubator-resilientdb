@@ -72,6 +72,7 @@ SERIES_STYLE = {
     "themis":      dict(color="#FBC02D",       marker="^", linestyle="-",  label="Themis"),
     "fairdag-ol":  dict(color="#6A1B9A",       marker="v", linestyle="-",  label="FairDAG-AB"),
     "fairdag-bof": dict(color="#C2185B",       marker="P", linestyle="-",  label="FairDAG-RL"),
+    "tusk":        dict(color="#00838F",       marker="X", linestyle="-",  label="Tusk"),
 }
 
 # Bigger sizes than IEEE-minimum so individual elements are easy to read.
@@ -260,7 +261,7 @@ def _draw_saturation_panel(ax, pearl_data, n, show_legend=True):
 def _draw_overlay_panel(ax, sources, fault, show_legend=False):
     """One panel of the baselines overlay: all sources at a given f, log-scale y."""
     for key in ("pearl-ol", "pearl-bof",
-                "pompe", "themis", "fairdag-ol", "fairdag-bof"):
+                "pompe", "themis", "fairdag-ol", "fairdag-bof", "tusk"):
         per_rate = sources.get(key, {}).get(fault)
         if not per_rate:
             continue
@@ -286,9 +287,10 @@ def _draw_overlay_panel(ax, sources, fault, show_legend=False):
 def _draw_overlay_tput_vs_rate_panel(ax, sources, fault, show_legend=False):
     """Throughput vs injection rate, all sources for a given f, log axes.
     Log y-axis because Pompe collapses to <10 tx/s at f >= 5 while Pearl
-    sustains ~10k tx/s at the same point."""
+    sustains ~10k tx/s at the same point. A grey y=x reference marks the
+    optimal (throughput == offered rate)."""
     for key in ("pearl-ol", "pearl-bof",
-                "pompe", "themis", "fairdag-ol", "fairdag-bof"):
+                "pompe", "themis", "fairdag-ol", "fairdag-bof", "tusk"):
         per_rate = sources.get(key, {}).get(fault)
         if not per_rate:
             continue
@@ -303,7 +305,13 @@ def _draw_overlay_tput_vs_rate_panel(ax, sources, fault, show_legend=False):
     if not LINEAR:
         ax.set_xscale("log")
         ax.set_yscale("log")
-        ax.set_ylim(1e0, 2e4)
+        ax.set_ylim(1e0, 1e5)
+    # Optimal reference: throughput == offered rate. Drawn after the data
+    # so it spans the resolved x range; thin grey dashed, behind the lines.
+    xs = np.array(ax.get_xlim())
+    ax.plot(xs, xs, color="0.6", linestyle="--", linewidth=1.0,
+            zorder=0, label="optimal (y = x)")
+    ax.set_xlim(xs)
     ax.set_title(f"f = {fault}")
     ax.set_xlabel("Injection rate (tx/s)")
     ax.set_ylabel(_log_label("Throughput (tx/s, log)"))
@@ -314,7 +322,7 @@ def _draw_overlay_tput_vs_rate_panel(ax, sources, fault, show_legend=False):
 def _draw_overlay_lat_vs_rate_panel(ax, sources, fault, show_legend=False):
     """Latency vs injection rate, all sources for a given f, log y."""
     for key in ("pearl-ol", "pearl-bof",
-                "pompe", "themis", "fairdag-ol", "fairdag-bof"):
+                "pompe", "themis", "fairdag-ol", "fairdag-bof", "tusk"):
         per_rate = sources.get(key, {}).get(fault)
         if not per_rate:
             continue
@@ -445,7 +453,7 @@ def main():
         "pearl-ol":  {f: pearl_by_f.get((f, "ol"), {})  for f in (3, 5, 7)},
         "pearl-bof": {f: pearl_by_f.get((f, "bof"), {}) for f in (3, 5, 7)},
     }
-    for name in ("pompe", "themis", "fairdag-ol", "fairdag-bof"):
+    for name in ("pompe", "themis", "fairdag-ol", "fairdag-bof", "tusk"):
         d = load_baseline_by_f(BASELINES_DIR / f"{name}.csv")
         # Each baseline has at most one mode -- collapse (f, mode) -> f.
         per_f = defaultdict(lambda: defaultdict(lambda: {"tps": [], "lat_ms": []}))

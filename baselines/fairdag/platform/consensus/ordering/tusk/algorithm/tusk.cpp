@@ -1,5 +1,7 @@
 #include "platform/consensus/ordering/tusk/algorithm/tusk.h"
 
+#include <cstdlib>
+
 #include <glog/logging.h>
 
 #include "common/utils/utils.h"
@@ -10,7 +12,14 @@ namespace tusk {
 Tusk::Tusk(int id, int f, int total_num, SignatureVerifier* verifier)
     : ProtocolBase(id, f, total_num), verifier_(verifier) {
   limit_count_ = 2 * f + 1;
-  batch_size_ = 1;
+  // Block size (txns packed per DAG vertex). Default 100 for the rate/faulty
+  // sweeps; the FAIRDAG_BLOCK_SIZE env var (shared with the FairDAG baselines,
+  // propagated by deploy.sh) overrides it for the batch-size sweep.
+  const char* env_bs = std::getenv("FAIRDAG_BLOCK_SIZE");
+  int env_bs_val = env_bs ? std::atoi(env_bs) : 0;
+  batch_size_ = (env_bs_val > 0) ? env_bs_val : 100;
+  LOG(ERROR) << "tusk batch_size_:" << batch_size_
+             << " (env=" << (env_bs ? env_bs : "<unset>") << ")";
   proposal_manager_ = std::make_unique<ProposalManager>(id, limit_count_);
 
   execute_id_ = 1;
@@ -252,6 +261,12 @@ int last_round = 0;
           num++;
           //LOG(ERROR)<<" commit txn create time:"<<tx.create_time();
           Commit(tx);
+          // Count delivered txns so the `execute:` stat (summed by
+          // calculate_result.py for throughput) is populated. Tusk commits via
+          // AddExecuteMessage, which only bumps commit_txn (IncCommit), so
+          // without this the execution-throughput counter stays 0 — mirrors
+          // fairdag/algorithm/fairdag.cpp where IncExecute() follows Commit().
+          global_stats_->IncExecute();
         }
         pro++;
       }

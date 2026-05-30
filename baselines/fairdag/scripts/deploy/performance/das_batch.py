@@ -25,6 +25,8 @@ def main():
                    help="number of client machines (default: same as n)")
     p.add_argument("--rl", type=int, choices=[0, 1], default=0,
                    help="0 = OL/AB (fair_performance.sh), 1 = BOF/RL (fairrl_performance.sh)")
+    p.add_argument("--system", choices=["fairdag", "tusk"], default="fairdag",
+                   help="'fairdag' (OL/BOF via --rl) or 'tusk' (plain DAG-BFT; ignores --rl)")
     args = p.parse_args()
 
     client_num = args.client_num if args.client_num is not None else args.n
@@ -36,6 +38,7 @@ def main():
         faults=0,
         rl=bool(args.rl),
         block_size=args.batch,
+        system=args.system,
     )
     if not isinstance(result, dict):
         result = {"throughput": 0.0, "latency_ms": 0.0,
