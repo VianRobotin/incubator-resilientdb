@@ -5,11 +5,14 @@ plot_paper_batch_curated.py — Batch-size sweep figures for the paper.
 Reads das_results/batch/{pearl,fairdag-ol,fairdag-bof,pompe,themis}.csv and
 emits two figures into das_results/paper_plots/curated/:
 
+X-axis is the configured batch size on a linear scale (ticks at 25/50/100/
+200/400). Y-axes are log unless PLOT_LINEAR=1 is set.
+
   pearl_vs_baselines_lat_batch.png
-      Execution latency (ms, log) vs configured batch size (# txns, log).
+      Execution latency (ms, log) vs configured batch size (# txns).
 
   pearl_vs_baselines_tput_batch.png
-      Execution throughput (tx/s, log) vs configured batch size (# txns, log).
+      Execution throughput (tx/s, log) vs configured batch size (# txns).
 
 Series styling matches plot_paper.py exactly: Pearl OL navy, Pearl BOF amber,
 FairDAG-AB purple, FairDAG-RL crimson, Pompe green, Themis yellow.
@@ -173,10 +176,8 @@ def plot_metric(metric: str, ylabel: str, out_stem: str):
         plt.close(fig)
         return
 
-    ax.set_xlabel(_log_label("Configured batch size (# txns, log)"))
+    ax.set_xlabel("Configured batch size (# txns)")
     ax.set_ylabel(_log_label(ylabel))
-    if not LINEAR:
-        ax.set_xscale("log")
     ax.set_xticks([25, 50, 100, 200, 400])
     ax.get_xaxis().set_major_formatter(matplotlib.ticker.ScalarFormatter())
     if not LINEAR:
@@ -208,10 +209,8 @@ def plot_combined(out_stem: str):
                         color=st["color"], marker=st["marker"],
                         linestyle=st["linestyle"], label=st["label"], capsize=3)
             any_data = True
-        ax.set_xlabel(_log_label("Configured batch size (# txns, log)"))
+        ax.set_xlabel("Configured batch size (# txns)")
         ax.set_ylabel(_log_label(ylabel))
-        if not LINEAR:
-            ax.set_xscale("log")
         ax.set_xticks([25, 50, 100, 200, 400])
         ax.get_xaxis().set_major_formatter(matplotlib.ticker.ScalarFormatter())
         if not LINEAR:
