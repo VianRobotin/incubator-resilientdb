@@ -202,6 +202,14 @@ class ProposalManager {
   // Used by GetBatchOrderedTransactions, ComputeBatchOrderingReadOnly.
   std::vector<std::string> CollectBofCandidates(int64_t tau_prev, int64_t tau_current);
 
+  // Snapshot the per-replica TEE sequence numbers for the given candidates from
+  // ts_store_: returns txn_hash → {replica_id → s_R(t)}.  In BOF mode the TEE
+  // attestation timestamp IS that replica's monotonic sequence number, so this
+  // is exactly the data the global (cross-Car) γ-BOF edge count needs.  Taken
+  // under ts_mutex_; touches only the candidate entries to bound lock hold-time.
+  std::unordered_map<std::string, std::unordered_map<int, int64_t>>
+  SnapshotCandidateSeqs(const std::vector<std::string>& candidates);
+
  private:
   int32_t id_;
   int64_t local_block_id_ = 1;

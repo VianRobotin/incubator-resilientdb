@@ -701,24 +701,36 @@ void ProposalManager::AddRelativeOrdering(const RelativeOrdering& ordering) {
 // effects.  Candidates must already be filtered for the desired window and
 // must not include already-committed transactions.
 //
-// Edges are derived lazily from per-block stored orderings: for each block
-// that contributes candidates, we count (positional) precedence agreements
-// across that block's ≤ f+1 orderings and add an edge when the count meets
-// the threshold θ = ⌈γ(f+1)⌉.
+// Edges come from two complementary sources, both thresholded at θ = ⌈γ(f+1)⌉:
 //
-// Since txns from distinct blocks never co-occur in a single ordering, there
-// are no cross-block edges — the graph is the disjoint union of per-block
-// subgraphs.  Work is O(Σ_block b_i² · f) where b_i is the number of
-// candidates in block i, bounded by O(|candidates|² · f) in the worst case
-// but typically far smaller because candidates are spread across blocks.
+//   (a) Same-Car (intra-block) pairs — fast path.  For each block that
+//       contributes candidates, we count (positional) precedence agreements
+//       across that block's ≤ f+1 stored orderings.  This is the cheap
+//       short-circuit retained from the per-block-only design and is provably
+//       equal to the per-replica-sequence count for same-Car pairs (the block
+//       ordering for replica R is just R's txns sorted by s_R(t)).
 //
-// This replaces the previous O(k²)-per-ingest + whole-map-copy approach, whose
-// state grew unboundedly with history and caused the BOF saturation cliff.
+//   (b) Cross-Car (inter-block) pairs — global γ-batch-order fairness.  For
+//       every candidate pair that does NOT share an originating block we walk
+//       the per-replica TEE sequence numbers (cand_seq: txn → {replica → s_R})
+//       and count how many replicas attested both txns with s_R(ti) < s_R(tj)
+//       vs. the reverse, adding an edge when the count meets θ.  These are the
+//       edges the previous per-block restriction silently dropped — the cause
+//       of the cross-Car γ-BOF gap this change closes (handoff "Option 1").
+//
+// The TEE assigns sequence numbers monotonically across every txn it processes
+// (not per-Car), so (s_R(ti), s_R(tj)) is a valid receive-order comparison even
+// when ti, tj landed in different Cars.  Work is O(|candidates|² · f) worst
+// case (same as Themis); the same-Car fast path keeps the constant factor on
+// the common, dominant intra-block portion small.  Everything from the
+// Kosaraju SCC step onward is unchanged.
 static std::vector<std::vector<std::string>> ComputeBatchOrderingImpl(
     const std::vector<std::string>& candidates,
     const std::unordered_map<std::string, std::pair<int, int64_t>>& txn_to_block,
     const std::map<std::pair<int, int64_t>,
                    ProposalManager::BlockOrderings>& block_orderings,
+    const std::unordered_map<std::string,
+                             std::unordered_map<int, int64_t>>& cand_seq,
     float bof_gamma, int f) {
 
   if (candidates.empty()) return {};
@@ -785,6 +797,46 @@ static std::vector<std::vector<std::string>> ComputeBatchOrderingImpl(
           radj[ca].push_back(cb);
         }
       }
+    }
+  }
+
+  // Cross-Car edges: global γ-batch-order fairness over per-replica TEE
+  // sequence numbers.  For every pair of candidates that does NOT share an
+  // originating block (the same-Car pairs were handled by the fast path above)
+  // count, over the replicas that attested BOTH txns, how many observed
+  // s_R(ti) < s_R(tj) vs. the reverse, and add an edge when the count meets θ.
+  for (int i = 0; i < n; ++i) {
+    auto si_it = cand_seq.find(candidates[i]);
+    if (si_it == cand_seq.end()) continue;  // no attestations collected yet
+    const auto& si = si_it->second;
+    auto bi = txn_to_block.find(candidates[i]);
+    for (int j = i + 1; j < n; ++j) {
+      // Skip same-Car pairs — already decided by the fast path above (using
+      // the cheap intra-block count, provably equal to the seq count here).
+      auto bj = txn_to_block.find(candidates[j]);
+      if (bi != txn_to_block.end() && bj != txn_to_block.end() &&
+          bi->second == bj->second) {
+        continue;
+      }
+      auto sj_it = cand_seq.find(candidates[j]);
+      if (sj_it == cand_seq.end()) continue;
+      const auto& sj = sj_it->second;
+
+      // Intersect the two attestor sets, iterating the smaller map.
+      const bool i_smaller = si.size() <= sj.size();
+      const auto& small = i_smaller ? si : sj;
+      const auto& large = i_smaller ? sj : si;
+      int ab = 0, ba = 0;  // ab: s_R(i) < s_R(j); ba: the reverse
+      for (const auto& [replica, seq_small] : small) {
+        auto lit = large.find(replica);
+        if (lit == large.end()) continue;  // not a common attestor
+        const int64_t seq_i = i_smaller ? seq_small : lit->second;
+        const int64_t seq_j = i_smaller ? lit->second : seq_small;
+        if (seq_i < seq_j) ab++;
+        else if (seq_j < seq_i) ba++;
+      }
+      if (ab >= theta) { adj[i].push_back(j); radj[j].push_back(i); }
+      if (ba >= theta) { adj[j].push_back(i); radj[i].push_back(j); }
     }
   }
 
@@ -869,6 +921,30 @@ std::vector<std::string> ProposalManager::CollectBofCandidates(
   return candidates;
 }
 
+// Snapshot per-replica TEE sequence numbers for the given candidates.
+// In BOF mode each SignedTimestamp's timestamp field carries the signing
+// replica's monotonic sequence number s_R(t); ts_store_ holds one entry per
+// (txn, attesting replica).  This is the per-replica seq map the cross-Car
+// edge count in ComputeBatchOrderingImpl consumes.  Pruned in lockstep with
+// bof_seq_ on commit (MarkBofCommitted), so entries live exactly as long as
+// the txn remains a candidate.
+std::unordered_map<std::string, std::unordered_map<int, int64_t>>
+ProposalManager::SnapshotCandidateSeqs(const std::vector<std::string>& candidates) {
+  std::unordered_map<std::string, std::unordered_map<int, int64_t>> out;
+  out.reserve(candidates.size());
+  std::unique_lock<std::mutex> lk(ts_mutex_);
+  for (const auto& h : candidates) {
+    auto it = ts_store_.find(h);
+    if (it == ts_store_.end()) continue;
+    auto& m = out[h];
+    m.reserve(it->second.size());
+    for (const auto& ts : it->second) {
+      m[ts.sender_id()] = ts.timestamp();
+    }
+  }
+  return out;
+}
+
 // Algorithm 5 + 6: build batch-ordered groups.
 // Does NOT mark transactions committed — Commit() calls MarkBofCommitted()
 // after the slot is actually executed so that transactions from a failed
@@ -891,8 +967,11 @@ std::vector<std::vector<std::string>> ProposalManager::GetBatchOrderedTransactio
     block_orderings_copy = block_orderings_;
   }
 
+  // Per-replica TEE sequence numbers for the cross-Car edge count.
+  auto cand_seq = SnapshotCandidateSeqs(candidates);
+
   return ComputeBatchOrderingImpl(candidates, txn_to_block_copy,
-                                  block_orderings_copy, bof_gamma_, f_);
+                                  block_orderings_copy, cand_seq, bof_gamma_, f_);
 }
 
 // Mark a set of transactions as BOF-committed so CollectBofCandidates
@@ -935,6 +1014,12 @@ void ProposalManager::MarkBofCommitted(const std::vector<std::string>& hashes) {
   {
     std::unique_lock<std::mutex> lk(ts_mutex_);
     for (const auto& h : hashes) {
+      // Dropping bof_seq_ removes h from the candidate set; dropping ts_store_
+      // releases the per-replica sequence numbers s_R(h).  These must be erased
+      // in lockstep: SnapshotCandidateSeqs reads ts_store_ for every candidate,
+      // so the per-replica seqs of any txn still in bof_seq_ (i.e. still a
+      // candidate) must remain available for the cross-Car edge count.  hashes
+      // here are only the txns that actually executed, so candidates are kept.
       bof_seq_.erase(h);
       ts_store_.erase(h);
     }
@@ -972,8 +1057,11 @@ std::vector<std::vector<std::string>> ProposalManager::ComputeBatchOrderingReadO
     block_orderings_copy = block_orderings_;
   }
 
+  // Per-replica TEE sequence numbers for the cross-Car edge count.
+  auto cand_seq = SnapshotCandidateSeqs(candidates);
+
   return ComputeBatchOrderingImpl(candidates, txn_to_block_copy,
-                                  block_orderings_copy, bof_gamma_, f_);
+                                  block_orderings_copy, cand_seq, bof_gamma_, f_);
 }
 
 }  // namespace autobahn
