@@ -63,8 +63,16 @@ Autobahn implements three algorithms from the thesis paper:
 no future transaction can arrive with ordering key ≤ τ (Lemma 5 in paper).
 
 **Two modes** controlled by `batch_order_fairness` flag in config:
-- `ol` — Ordering Linearizability (full TEE-based fair ordering, the thesis contribution)
-- `bof` — Batch Order Fairness (baseline comparison mode, Pompe-style)
+- `ol` — Ordering Linearizability (full TEE-based fair ordering, a thesis contribution)
+- `bof` — γ-Batch-Order Fairness (the other thesis contribution): a **global**
+  relative-ordering scheme. Each replica's TEE attests a per-transaction
+  sequence number; the ordering layer builds a dependency graph by comparing,
+  for every eligible transaction pair, the per-replica attestations across the
+  first f+1 replicas that covered both (no per-block restriction — cross-Car
+  pairs get edges too), then resolves Condorcet cycles via SCC decomposition
+  into batches. A same-Car (per-block) count is kept as a fast path, and
+  committed ordering state is pruned each commit to bound the in-memory graph.
+  Not a baseline — it's Pearl's own fair-ordering mode at n > 2γf/(2γ−1).
 
 ---
 
