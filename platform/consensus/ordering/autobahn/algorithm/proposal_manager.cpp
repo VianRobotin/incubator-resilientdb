@@ -35,6 +35,14 @@ ProposalManager::ProposalManager(int32_t id, int total_num, int f, SignatureVeri
 
   // Initialize last-seen vector to 0 for all replicas.
   last_seen_.resize(total_num + 1, 0);  // 1-indexed
+
+  // Seed an empty BOF snapshot so readers don't need a null check.
+  bof_snap_ = std::make_shared<const BofSnapshot>();
+}
+
+ProposalManager::~ProposalManager() {
+  // Worker may or may not have been started (only started in BOF mode).
+  StopBofWorker();
 }
 
 // ============================================================
@@ -386,6 +394,13 @@ std::vector<SignedTimestamp> ProposalManager::TimestampTransactions(const Block&
     }
   }
 
+  // Adding to bof_seq_ changes the candidate set and ts_store_ — wake the
+  // worker so the published snapshot reflects the new state.  No-op when the
+  // worker thread isn't running (i.e. OL mode).
+  if (batch_order_fairness_ && !new_timestamps.empty()) {
+    NotifyBofWorker();
+  }
+
   return new_timestamps;
 }
 
@@ -415,12 +430,23 @@ void ProposalManager::AddTimestamp(const SignedTimestamp& ts) {
   store.push_back(ts);
 
   // Section V-B: maintain per-replica max last-seen timestamp for the
-  // execution threshold τ computation.  In OL mode these are wall-clock
-  // values; updating here keeps last_seen_[i] current so
-  // ComputeExecutionThreshold() returns a live τ and the Δ-waits fire.
+  // execution threshold τ computation.  Updates in BOTH modes — in OL the
+  // value is a wall-clock TEE timestamp, in BOF it is the per-replica
+  // monotonic TEE sequence number s_R.  Either way the (f+1)-th smallest
+  // M_i is a Lemma-5-safe finalization horizon (no future tx can attest a
+  // smaller indicator from f+1 replicas), which is what CollectBofCandidates
+  // now uses to window the BOF dependency-graph input.
   int sender = ts.sender_id();
-  if (sender >= 1 && sender <= total_num_ && !batch_order_fairness_) {
+  if (sender >= 1 && sender <= total_num_) {
     last_seen_[sender] = std::max(last_seen_[sender], ts.timestamp());
+  }
+
+  // BOF: a new cross-replica attestation may add an edge to the dependency
+  // graph (specifically the cross-Car path that consumes ts_store_ in
+  // ComputeBatchOrderingImpl).  Notify the worker so it recomputes.  Cheap
+  // when the worker isn't running — the cv has no waiters.
+  if (batch_order_fairness_) {
+    NotifyBofWorker();
   }
 }
 
@@ -690,6 +716,12 @@ void ProposalManager::AddRelativeOrdering(const RelativeOrdering& ordering) {
     txn_to_block_.emplace(h, block_key);
   }
   entry.orderings.push_back(std::move(txn_list));
+
+  // Worker recompute trigger.  Releasing bof_mutex_ first (the cv's mutex is
+  // distinct) avoids serialising the worker behind the message-receiving
+  // thread that called us.
+  lk.unlock();
+  NotifyBofWorker();
 }
 
 // ============================================================
@@ -776,17 +808,26 @@ static std::vector<std::vector<std::string>> ComputeBatchOrderingImpl(
 
     // For each candidate pair (a, b) in this block, count orderings where
     // rank[a] < rank[b].  O(b² · num_orderings) with O(1) rank lookups.
+    //
+    // Early exits (change 2):
+    //   * stop once either side has reached θ — the verdict is final;
+    //   * stop once neither side can still reach θ even if every remaining
+    //     ordering voted for it (`remaining` shrinks each iteration).
     int b = static_cast<int>(cand_ids.size());
     for (int i = 0; i < b; ++i) {
       for (int j = i + 1; j < b; ++j) {
         int ca = cand_ids[i], cb = cand_ids[j];
         int ab = 0, ba = 0;
+        int remaining = num_orderings;
         for (int o = 0; o < num_orderings; ++o) {
+          --remaining;
           auto ita = rank[o].find(ca);
           auto itb = rank[o].find(cb);
           if (ita == rank[o].end() || itb == rank[o].end()) continue;
           if (ita->second < itb->second) ab++;
           else if (itb->second < ita->second) ba++;
+          if (ab >= theta || ba >= theta) break;
+          if (ab + remaining < theta && ba + remaining < theta) break;
         }
         if (ab >= theta) {
           adj[ca].push_back(cb);
@@ -823,17 +864,25 @@ static std::vector<std::vector<std::string>> ComputeBatchOrderingImpl(
       const auto& sj = sj_it->second;
 
       // Intersect the two attestor sets, iterating the smaller map.
+      // Short-circuits (change 2): either side reaching θ, or neither able to
+      // reach θ even if all remaining common attestors voted for it.  The
+      // initial `remaining` upper bound is the size of `small` — every common
+      // attestor must appear in both maps and we iterate the smaller one.
       const bool i_smaller = si.size() <= sj.size();
       const auto& small = i_smaller ? si : sj;
       const auto& large = i_smaller ? sj : si;
       int ab = 0, ba = 0;  // ab: s_R(i) < s_R(j); ba: the reverse
+      int remaining = static_cast<int>(small.size());
       for (const auto& [replica, seq_small] : small) {
+        --remaining;
         auto lit = large.find(replica);
         if (lit == large.end()) continue;  // not a common attestor
         const int64_t seq_i = i_smaller ? seq_small : lit->second;
         const int64_t seq_j = i_smaller ? lit->second : seq_small;
         if (seq_i < seq_j) ab++;
         else if (seq_j < seq_i) ba++;
+        if (ab >= theta || ba >= theta) break;
+        if (ab + remaining < theta && ba + remaining < theta) break;
       }
       if (ab >= theta) { adj[i].push_back(j); radj[j].push_back(i); }
       if (ba >= theta) { adj[j].push_back(i); radj[i].push_back(j); }
@@ -887,24 +936,81 @@ static std::vector<std::vector<std::string>> ComputeBatchOrderingImpl(
 
 // Collect candidate transactions (window filter + not-yet-committed).
 // Caller holds neither ordering_mutex_ nor bof_mutex_.
+//
+// BOF candidate selection (changes 1 + 5):
+//   1. Start from every uncommitted txn in bof_seq_.
+//   2. Apply the τ window (bof_seq_[h] ∈ (tau_prev, tau_current]) when one
+//      is requested.  This is the BOF analogue of OL's Lemma-5 windowing:
+//      bof_seq_[h] is THIS replica's TEE seq for h; (tau_prev, tau_current]
+//      is derived from last_seen_ (the (f+1)-th smallest of per-replica
+//      max-seqs), so any txn with bof_seq_[h] ≤ tau_current is known to
+//      have an attestation from at least f+1 replicas with s_R(h) ≤ τ_current.
+//      Soft-reject in autobahn.cpp tolerates the per-replica drift in
+//      bof_seq_[h] between leader and validators.
+//   3. Apply the count cap (bof_max_candidates_) — keep only the smallest
+//      `cap` seqs (oldest-pending first), with a deterministic hash tiebreak.
+//   4. Force-include any txn aged ≥ bof_force_age_slots_ committed slots,
+//      even if (3) would otherwise drop it.  Bounds tail latency for stragglers
+//      that lose every pairwise contest and never reach a topologically-early
+//      batch.
 std::vector<std::string> ProposalManager::CollectBofCandidates(
     int64_t tau_prev, int64_t tau_current) {
   std::vector<std::string> candidates;
   if (batch_order_fairness_) {
-    // BOF mode: candidates are transactions with a local TEE sequence number
-    // that have not yet been committed.  The tau window does not apply — BOF
-    // sequence numbers are monotonic counters, not wall-clock timestamps.
-    // Take a snapshot of committed txns first (avoids holding two locks at once).
     std::set<std::string> committed;
     {
       std::unique_lock<std::mutex> blk(bof_mutex_);
       committed = bof_committed_txns_;
     }
+
+    const int64_t current_slot = bof_slot_counter_.load(std::memory_order_relaxed);
     std::unique_lock<std::mutex> lk(ts_mutex_);
+
+    // Pass 1: collect (seq, hash) pairs that survive the window + committed
+    // filters, and tag the age of every survivor for the force-include rule.
+    std::vector<std::pair<int64_t, std::string>> pool;
+    pool.reserve(bof_seq_.size());
+    std::vector<std::pair<int64_t, std::string>> forced;
     for (const auto& entry : bof_seq_) {
-      if (committed.count(entry.first) == 0)
-        candidates.push_back(entry.first);
+      const std::string& h = entry.first;
+      const int64_t seq = entry.second;
+      if (committed.count(h)) continue;
+      // Window: (tau_prev, tau_current].
+      if (seq <= tau_prev || seq > tau_current) continue;
+      // Age-stamp on first sight so force-include has a baseline.
+      auto fit = bof_first_pending_slot_.find(h);
+      if (fit == bof_first_pending_slot_.end()) {
+        bof_first_pending_slot_[h] = current_slot;
+      }
+      int64_t age = 0;
+      if (fit != bof_first_pending_slot_.end()) {
+        age = current_slot - fit->second;
+      }
+      if (bof_force_age_slots_ > 0 && age >= bof_force_age_slots_) {
+        forced.emplace_back(seq, h);
+      } else {
+        pool.emplace_back(seq, h);
+      }
     }
+
+    // Pass 2: apply the count cap.  Keep the smallest seqs (oldest pending);
+    // tiebreak by hash for cross-replica determinism.  Forced entries are
+    // appended afterwards and always make it in.
+    if (bof_max_candidates_ > 0 &&
+        static_cast<int>(pool.size()) > bof_max_candidates_) {
+      std::nth_element(
+          pool.begin(), pool.begin() + bof_max_candidates_, pool.end(),
+          [](const std::pair<int64_t, std::string>& a,
+             const std::pair<int64_t, std::string>& b) {
+            if (a.first != b.first) return a.first < b.first;
+            return a.second < b.second;
+          });
+      pool.resize(bof_max_candidates_);
+    }
+
+    candidates.reserve(pool.size() + forced.size());
+    for (auto& p : pool) candidates.push_back(std::move(p.second));
+    for (auto& p : forced) candidates.push_back(std::move(p.second));
   } else {
     // OL mode: candidates are transactions whose ordering key falls in the
     // execution window (tau_prev, tau_current].
@@ -949,29 +1055,44 @@ ProposalManager::SnapshotCandidateSeqs(const std::vector<std::string>& candidate
 // Does NOT mark transactions committed — Commit() calls MarkBofCommitted()
 // after the slot is actually executed so that transactions from a failed
 // or skipped slot are never silently discarded.
+//
+// Changes 3 + 4: the O(n²·f) dependency-graph computation runs on the
+// background BOF worker (see BofWorkerLoop) and publishes via a shared_ptr
+// snapshot.  This function returns the latest snapshot's batches, filtered to
+// the requested (tau_prev, tau_current] window using the local_seq map the
+// worker captured atomically with the batch computation.  The consensus
+// critical path now pays only a shared_ptr load + O(|batches|) filter.
 std::vector<std::vector<std::string>> ProposalManager::GetBatchOrderedTransactions(
     int64_t tau_prev, int64_t tau_current) {
+  auto snap = GetBofSnapshot();
+  if (!snap || snap->batches.empty()) return {};
 
-  auto candidates = CollectBofCandidates(tau_prev, tau_current);
-  if (candidates.empty()) return {};
-
-  // Snapshot the per-block orderings and the txn→block index under
-  // bof_mutex_.  Snapshot cost is O(Σ block_orderings | ordering |) across
-  // blocks whose candidates we'll touch; in practice ≈ O(|pending txns|)
-  // because each txn appears in at most f+1 orderings.
-  std::unordered_map<std::string, std::pair<int, int64_t>> txn_to_block_copy;
-  std::map<std::pair<int, int64_t>, BlockOrderings> block_orderings_copy;
+  // Snapshot already excludes committed txns (worker calls CollectBofCandidates
+  // which filters them out).  Drop any that have been committed since the
+  // snapshot was published — between worker recompute and now, MarkBofCommitted
+  // may have moved txns into bof_committed_txns_.
+  std::set<std::string> committed;
   {
-    std::unique_lock<std::mutex> lk(bof_mutex_);
-    txn_to_block_copy = txn_to_block_;
-    block_orderings_copy = block_orderings_;
+    std::unique_lock<std::mutex> blk(bof_mutex_);
+    committed = bof_committed_txns_;
   }
 
-  // Per-replica TEE sequence numbers for the cross-Car edge count.
-  auto cand_seq = SnapshotCandidateSeqs(candidates);
-
-  return ComputeBatchOrderingImpl(candidates, txn_to_block_copy,
-                                  block_orderings_copy, cand_seq, bof_gamma_, f_);
+  std::vector<std::vector<std::string>> out;
+  out.reserve(snap->batches.size());
+  for (const auto& batch : snap->batches) {
+    std::vector<std::string> filtered;
+    filtered.reserve(batch.size());
+    for (const auto& h : batch) {
+      auto sit = snap->local_seq.find(h);
+      if (sit == snap->local_seq.end()) continue;
+      const int64_t seq = sit->second;
+      if (seq <= tau_prev || seq > tau_current) continue;
+      if (committed.count(h)) continue;
+      filtered.push_back(h);
+    }
+    if (!filtered.empty()) out.push_back(std::move(filtered));
+  }
+  return out;
 }
 
 // Mark a set of transactions as BOF-committed so CollectBofCandidates
@@ -1022,8 +1143,13 @@ void ProposalManager::MarkBofCommitted(const std::vector<std::string>& hashes) {
       // here are only the txns that actually executed, so candidates are kept.
       bof_seq_.erase(h);
       ts_store_.erase(h);
+      bof_first_pending_slot_.erase(h);
     }
   }
+
+  // Candidate set changed — refresh the published snapshot so the next
+  // proposal/validation doesn't keep returning committed txns.
+  NotifyBofWorker();
 }
 
 void ProposalManager::PruneOlCommitted(const std::vector<std::string>& hashes) {
@@ -1042,13 +1168,95 @@ void ProposalManager::PruneOlCommitted(const std::vector<std::string>& hashes) {
 
 // Read-only variant: same computation but does NOT mark transactions committed.
 // Used by replicas to validate a leader's BOF proposal (Algorithm 3) without
-// mutating bof_committed_txns_ prematurely.
+// mutating bof_committed_txns_ prematurely.  Always shares the same snapshot
+// the leader would have read (modulo network delay) — the soft-reject path in
+// autobahn.cpp tolerates the resulting ordering drift.
 std::vector<std::vector<std::string>> ProposalManager::ComputeBatchOrderingReadOnly(
     int64_t tau_prev, int64_t tau_current) {
+  // Same body as GetBatchOrderedTransactions — both are pure reads now.
+  return GetBatchOrderedTransactions(tau_prev, tau_current);
+}
 
-  auto candidates = CollectBofCandidates(tau_prev, tau_current);
-  if (candidates.empty()) return {};
+// ============================================================
+// BOF Worker (changes 3 + 4)
+// ============================================================
 
+void ProposalManager::NotifyBofWorker() {
+  std::lock_guard<std::mutex> lk(bof_worker_mutex_);
+  bof_worker_dirty_ = true;
+  bof_worker_cv_.notify_one();
+}
+
+void ProposalManager::AdvanceBofSlot() {
+  bof_slot_counter_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ProposalManager::StartBofWorker() {
+  if (bof_worker_thread_.joinable()) return;  // already running
+  bof_worker_stop_.store(false, std::memory_order_relaxed);
+  bof_worker_thread_ = std::thread(&ProposalManager::BofWorkerLoop, this);
+}
+
+void ProposalManager::StopBofWorker() {
+  if (!bof_worker_thread_.joinable()) return;
+  {
+    std::lock_guard<std::mutex> lk(bof_worker_mutex_);
+    bof_worker_stop_.store(true, std::memory_order_relaxed);
+    bof_worker_dirty_ = true;
+    bof_worker_cv_.notify_all();
+  }
+  bof_worker_thread_.join();
+}
+
+std::shared_ptr<const ProposalManager::BofSnapshot>
+ProposalManager::GetBofSnapshot() const {
+  std::lock_guard<std::mutex> lk(bof_snap_mutex_);
+  return bof_snap_;
+}
+
+// Worker loop: wait for a dirty notification, recompute the snapshot, publish.
+// Multiple notifications between recomputes coalesce into one rebuild (we
+// reset the flag under the worker mutex before releasing it).
+void ProposalManager::BofWorkerLoop() {
+  while (!bof_worker_stop_.load(std::memory_order_relaxed)) {
+    {
+      std::unique_lock<std::mutex> lk(bof_worker_mutex_);
+      bof_worker_cv_.wait(lk, [&] {
+        return bof_worker_dirty_ ||
+               bof_worker_stop_.load(std::memory_order_relaxed);
+      });
+      if (bof_worker_stop_.load(std::memory_order_relaxed)) return;
+      bof_worker_dirty_ = false;
+    }
+
+    auto snap = RecomputeBofSnapshot();
+    {
+      std::lock_guard<std::mutex> lk(bof_snap_mutex_);
+      bof_snap_ = std::move(snap);
+    }
+  }
+}
+
+// Build a fresh BofSnapshot from the current source-of-truth state.  The two
+// state copies (block_orderings_, txn_to_block_) and the candidate seq snapshot
+// happen here, off the critical path; ComputeBatchOrderingImpl runs without
+// holding any locks.
+std::shared_ptr<const ProposalManager::BofSnapshot>
+ProposalManager::RecomputeBofSnapshot() {
+  // No τ filter at worker time: the worker computes the dependency graph over
+  // the full bounded candidate set; callers apply their τ window when reading
+  // the snapshot.  This way one recompute serves both the leader and every
+  // replica even though they may compute slightly different τ values.
+  auto candidates = CollectBofCandidates(
+      std::numeric_limits<int64_t>::min(),
+      std::numeric_limits<int64_t>::max());
+
+  auto out = std::make_shared<BofSnapshot>();
+  out->version = ++bof_snap_version_;
+  if (candidates.empty()) return out;
+
+  // Snapshot block_orderings_ + txn_to_block_ under bof_mutex_.  The worker
+  // pays this copy cost off the critical path.
   std::unordered_map<std::string, std::pair<int, int64_t>> txn_to_block_copy;
   std::map<std::pair<int, int64_t>, BlockOrderings> block_orderings_copy;
   {
@@ -1057,11 +1265,22 @@ std::vector<std::vector<std::string>> ProposalManager::ComputeBatchOrderingReadO
     block_orderings_copy = block_orderings_;
   }
 
-  // Per-replica TEE sequence numbers for the cross-Car edge count.
+  // Per-replica TEE sequence numbers (cross-Car edge count input) and the
+  // local-seq map readers will need to apply their τ window.
   auto cand_seq = SnapshotCandidateSeqs(candidates);
+  {
+    std::unique_lock<std::mutex> lk(ts_mutex_);
+    out->local_seq.reserve(candidates.size());
+    for (const auto& h : candidates) {
+      auto it = bof_seq_.find(h);
+      if (it != bof_seq_.end()) out->local_seq[h] = it->second;
+    }
+  }
 
-  return ComputeBatchOrderingImpl(candidates, txn_to_block_copy,
-                                  block_orderings_copy, cand_seq, bof_gamma_, f_);
+  out->batches = ComputeBatchOrderingImpl(
+      candidates, txn_to_block_copy, block_orderings_copy, cand_seq,
+      bof_gamma_, f_);
+  return out;
 }
 
 }  // namespace autobahn

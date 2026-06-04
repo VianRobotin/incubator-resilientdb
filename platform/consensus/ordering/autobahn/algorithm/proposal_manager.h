@@ -1,10 +1,14 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
+#include <limits>
 #include <list>
 #include <map>
+#include <memory>
 #include <set>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -22,6 +26,7 @@ namespace autobahn {
 class ProposalManager {
  public:
   ProposalManager(int32_t id, int total_num, int f, SignatureVerifier* verifier);
+  ~ProposalManager();
 
   // --- Block management (unchanged) ---
   void MakeBlock(std::vector<std::unique_ptr<Transaction>>& txn);
@@ -154,6 +159,44 @@ class ProposalManager {
   // γ ∈ (0.5, 1.0]; default 1.0 (= f+1, strictest, works for n=2f+1).
   void SetBofGamma(float gamma) { bof_gamma_ = gamma; }
 
+  // Cap the per-slot BOF candidate set.  0 = no cap (legacy behaviour).
+  // When non-zero, CollectBofCandidates returns at most this many txns, taking
+  // the smallest local TEE sequence numbers first (oldest-pending), with the
+  // hash as a deterministic tiebreak.  This bounds the O(n²) edge-count cost
+  // and prevents queueing collapse at high input rates.
+  void SetBofMaxCandidates(int n) { bof_max_candidates_ = n; }
+
+  // Force-include any txn that has been pending for >= this many slots without
+  // being committed, even if the count cap would otherwise drop it.  0 = off.
+  // Bounds tail latency for stragglers under the bounded-candidate regime.
+  void SetBofForceAgeSlots(int slots) { bof_force_age_slots_ = slots; }
+
+  // Increment the BOF slot counter — called by AutoBahn::Commit() once per
+  // committed slot.  The counter tags candidates so SetBofForceAgeSlots() can
+  // tell which ones have aged past the threshold.
+  void AdvanceBofSlot();
+
+  // Start / stop the background BOF worker (the dependency-graph computation
+  // is run asynchronously and published via a shared_ptr snapshot, so the
+  // consensus critical path only pays a snapshot read instead of the full
+  // O(n²·f) per propose/validate).  Started automatically when BOF mode is
+  // enabled; stopped in the destructor.
+  void StartBofWorker();
+  void StopBofWorker();
+
+  // Computed BOF batches plus the snapshot metadata used to filter them.
+  struct BofSnapshot {
+    std::vector<std::vector<std::string>> batches;
+    // Local-seq for every txn appearing in `batches`, captured atomically with
+    // the batch computation so callers can window without re-locking ts_mutex_.
+    std::unordered_map<std::string, int64_t> local_seq;
+    int64_t version = 0;
+  };
+
+  // Atomically load the most recent BOF snapshot.  Returns an empty snapshot
+  // (no batches) if the worker has not produced one yet.
+  std::shared_ptr<const BofSnapshot> GetBofSnapshot() const;
+
   // Public so the free-function helper ComputeBatchOrderingImpl (defined in
   // the .cpp) can reference it.  Holds up to f+1 orderings for a given block,
   // each ordering being the list of txn hashes in one replica's observed
@@ -273,6 +316,24 @@ class ProposalManager {
   bool batch_order_fairness_ = false;
   float bof_gamma_ = 1.0f;  // γ ∈ (0.5, 1.0]; edge threshold θ = ⌈γ(f+1)⌉
 
+  // Bound the candidate set passed to the dependency-graph computation.
+  // 0 = no cap.  Non-zero values trade per-slot batch size for bounded
+  // O(n²) work and stable throughput at saturation.
+  int bof_max_candidates_ = 0;
+
+  // Force-include candidates older than this many committed slots, regardless
+  // of the count cap.  Bounds tail latency for stragglers.  0 = disabled.
+  int bof_force_age_slots_ = 0;
+
+  // Monotonic per-commit counter used to age candidates for the force-include
+  // rule.  Incremented by AdvanceBofSlot() once per committed slot.
+  std::atomic<int64_t> bof_slot_counter_{0};
+
+  // First committed-slot index at which a txn entered the candidate set.
+  // Populated lazily by CollectBofCandidates; pruned in MarkBofCommitted.
+  // Guarded by ts_mutex_ (same lock that protects bof_seq_).
+  std::unordered_map<std::string, int64_t> bof_first_pending_slot_;
+
   std::mutex bof_mutex_;
 
   // Per-block stored orderings.  Each ordering is the list of txn hashes in
@@ -311,6 +372,33 @@ class ProposalManager {
   // BOF sequence numbers assigned by TEE (ecall_assign_sequence_number).
   // Stored as the ordering_key in the SignedTimestamp for BOF transactions.
   std::map<std::string, int64_t> bof_seq_;
+
+  // ===========================================================
+  // Background BOF Worker (changes 3 + 4 — off-critical-path graph build)
+  // ===========================================================
+  //
+  // The worker maintains a shared_ptr snapshot of the latest computed batches.
+  // Mutators (AddRelativeOrdering, MarkBofCommitted, TimestampTransactions in
+  // BOF mode) flip a dirty flag and notify the worker; the worker recomputes
+  // and publishes via the snap_mutex_-guarded shared_ptr.  Readers (the leader
+  // building a proposal, every replica validating one) load the latest
+  // snapshot — O(snapshot-size) instead of O(n²·f).
+  void BofWorkerLoop();
+  void NotifyBofWorker();
+  // Recompute the snapshot from the current source-of-truth state.  Called
+  // from the worker thread; takes bof_mutex_ and ts_mutex_ briefly for the
+  // input snapshot, then releases them before running the O(n²·f) graph step.
+  std::shared_ptr<const BofSnapshot> RecomputeBofSnapshot();
+
+  std::thread bof_worker_thread_;
+  std::atomic<bool> bof_worker_stop_{false};
+  std::condition_variable bof_worker_cv_;
+  std::mutex bof_worker_mutex_;
+  bool bof_worker_dirty_ = false;
+  int64_t bof_snap_version_ = 0;
+
+  mutable std::mutex bof_snap_mutex_;
+  std::shared_ptr<const BofSnapshot> bof_snap_;
 };
 
 }  // namespace autobahn

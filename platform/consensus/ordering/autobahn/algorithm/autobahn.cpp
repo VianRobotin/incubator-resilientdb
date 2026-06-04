@@ -41,6 +41,29 @@ AutoBahn::AutoBahn(int id, int f, int total_num, int block_size, SignatureVerifi
   proposal_manager_->SetBofGamma(bof_gamma);
   proposal_manager_->SetDeltaUs(delta_ms_ * 1000);
 
+  // BOF throughput tuning (changes 1, 4, 5).  The dependency-graph build is
+  // O(n²·f) over the candidate set; capping the per-slot candidate count
+  // prevents queueing collapse at high input rates.  Force-include after a
+  // few slots so the cap can never starve a straggler.  The worker thread
+  // moves the O(n²·f) work off the propose/validate critical path.
+  if (batch_order_fairness_) {
+    // ~ 8 × block_size lets the leader fit several blocks per slot's batch
+    // without re-entering the n²·f danger zone.  Tunable via env if needed.
+    int bof_cap = 8 * block_size;
+    if (const char* env = getenv("BOF_MAX_CANDIDATES")) {
+      try { bof_cap = std::stoi(env); } catch (...) {}
+    }
+    int bof_age = 4;  // slots before a stale candidate is force-included
+    if (const char* env = getenv("BOF_FORCE_AGE_SLOTS")) {
+      try { bof_age = std::stoi(env); } catch (...) {}
+    }
+    proposal_manager_->SetBofMaxCandidates(bof_cap);
+    proposal_manager_->SetBofForceAgeSlots(bof_age);
+    proposal_manager_->StartBofWorker();
+    LOG(ERROR) << "[BOF] tuning: max_candidates=" << bof_cap
+               << " force_age_slots=" << bof_age << " (worker started)";
+  }
+
   // Try to initialize the SGX TEE enclave. Fall back to software simulation
   // silently if the enclave .so is not found (e.g., first build without make).
   const char* enclave_env = getenv("TEE_ENCLAVE_PATH");
@@ -506,8 +529,13 @@ void AutoBahn::AsyncConsensus() {
     // post-commit if its final K(t)/bof_seq has not been confirmed ≤ τ.
     int total_fair_txns = 0;
     if (batch_order_fairness_) {
+      // Pass the same (τ_prev, τ_current] window OL uses.  In BOF mode the
+      // last_seen_[r] values are per-replica TEE sequence numbers (Algorithm 1
+      // update covers both modes after the AddTimestamp fix), so τ is the
+      // (f+1)-th smallest s_R — any tx with bof_seq ≤ τ_current has the
+      // Lemma-5 guarantee that f+1 replicas have already attested it.
       auto batches = proposal_manager_->GetBatchOrderedTransactions(
-          -1, std::numeric_limits<int64_t>::max());
+          tau_prev, tau_current);
       for (const auto& batch : batches) {
         BatchGroup* bg = proposal->add_batch_groups();
         for (const auto& txn_hash : batch) {
@@ -716,9 +744,11 @@ bool AutoBahn::ReceiveProposal(std::unique_ptr<Proposal> proposal) {
   //   replica must not independently place ta in a LATER batch than tb.
   //   Same-batch placement is always acceptable (γ-BOF relaxation).
   if (batch_order_fairness_) {
-    // Compute local batch ordering without marking anything committed yet.
+    // Compute local batch ordering for the same window the leader used,
+    // without marking anything committed yet.
+    int64_t tau_prev_proposal = proposal->prev_threshold();
     auto local_batches = proposal_manager_->ComputeBatchOrderingReadOnly(
-        -1, std::numeric_limits<int64_t>::max());
+        tau_prev_proposal, tau_block);
 
     // Build txn → batch-index maps for both sides.
     std::unordered_map<std::string, int> local_idx, proposal_idx;
@@ -1127,6 +1157,12 @@ void AutoBahn::Commit(std::unique_ptr<Proposal> proposal) {
   // ============================================================
 
   tau_committed_ = std::max(tau_committed_, raw_proposal->threshold());
+
+  // Tick the BOF slot counter so SetBofForceAgeSlots() can age stragglers
+  // out of the candidate cap.  No-op in OL mode (counter unused).
+  if (batch_order_fairness_) {
+    proposal_manager_->AdvanceBofSlot();
+  }
 
   {
     std::lock_guard<std::mutex> lk(pending_exec_mutex_);
