@@ -39,6 +39,15 @@ PROJ_ROOT  = Path(__file__).resolve().parents[3]
 FAULTY_DIR = PROJ_ROOT / "das_results" / "faulty"
 OUT_DIR    = PROJ_ROOT / "das_results" / "paper_plots" / _OUT_SUBDIR
 
+# The x=0 (no-fault) reference comes from the rate sweep at the same
+# configuration the faulty sweep used: f=5 (Pearl n=11, baselines 3f+1=16/22),
+# rate=500 tx/s. Lets each line start at zero faults instead of one.
+PEARL_RATE_CSV     = PROJ_ROOT / "das_results" / "tput_latency.csv"
+BASELINE_RATE_DIR  = PROJ_ROOT / "das_results" / "baselines"
+ZERO_FAULT_RATE       = 500
+ZERO_FAULT_PEARL_N    = 11
+ZERO_FAULT_BASELINE_F = 5
+
 
 def _log_label(text):
     return text if not LINEAR else text.replace(", log", "").replace(" (log)", "")
@@ -136,6 +145,62 @@ def aggregate(points):
     return out
 
 
+def load_zero_fault(system):
+    """No-fault (silent_faults=0) samples for `system`, pulled from the rate
+    sweep at the faulty-sweep configuration (f=5, rate=500)."""
+    fname, mode = SERIES_SOURCE[system]
+    pts = []
+    if system.startswith("pearl"):
+        path = PEARL_RATE_CSV
+        if not path.exists():
+            return pts
+        with path.open(newline="") as fh:
+            for row in csv.DictReader(fh):
+                try:
+                    if int(row["n"]) != ZERO_FAULT_PEARL_N:
+                        continue
+                    if int(row["input_rate"]) != ZERO_FAULT_RATE:
+                        continue
+                    if row.get("mode", "").strip() != mode:
+                        continue
+                    tps = float(row["execution_tps"])
+                    lat = float(row["execution_latency_ms"])
+                except (KeyError, ValueError):
+                    continue
+                if tps <= 0 and lat <= 0:
+                    continue
+                pts.append((tps, lat))
+    else:
+        path = BASELINE_RATE_DIR / fname
+        if not path.exists():
+            return pts
+        with path.open(newline="") as fh:
+            for row in csv.DictReader(fh):
+                try:
+                    if int(row["f"]) != ZERO_FAULT_BASELINE_F:
+                        continue
+                    if int(row["input_rate"]) != ZERO_FAULT_RATE:
+                        continue
+                    tps = float(row["execution_tps"])
+                    lat = float(row["execution_latency_ms"])
+                except (KeyError, ValueError):
+                    continue
+                if tps <= 0 and lat <= 0:
+                    continue
+                pts.append((tps, lat))
+    return pts
+
+
+def aggregated_series(system):
+    """Per-fault aggregates for `system`, including the x=0 no-fault point."""
+    fname, mode = SERIES_SOURCE[system]
+    points = load_csv(FAULTY_DIR / fname, mode_filter=mode)
+    zf = load_zero_fault(system)
+    if zf:
+        points[0] = zf
+    return aggregate(points)
+
+
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
@@ -153,8 +218,7 @@ def plot_metric(metric: str, ylabel: str, out_stem: str):
     fig, ax = plt.subplots(figsize=(FULL_W, PANEL_H))
     any_data = False
     for system in SERIES_ORDER:
-        fname, mode = SERIES_SOURCE[system]
-        agg = aggregate(load_csv(FAULTY_DIR / fname, mode_filter=mode))
+        agg = aggregated_series(system)
         if not agg:
             continue
         xs   = [t[0] for t in agg]
@@ -178,7 +242,7 @@ def plot_metric(metric: str, ylabel: str, out_stem: str):
 
     ax.set_xlabel("Number of silent faulty replicas")
     ax.set_ylabel(_log_label(ylabel))
-    ax.set_xticks([1, 2, 3, 4, 5])
+    ax.set_xticks([0, 1, 2, 3, 4, 5])
     if not LINEAR:
         ax.set_yscale("log")
     ax.legend(loc="best", framealpha=0.9)
@@ -196,8 +260,7 @@ def plot_combined(out_stem: str):
     for ax, metric, ylabel in ((ax_t, "tps", "Throughput (tx/s, log)"),
                                (ax_l, "lat", "Latency (ms, log)")):
         for system in SERIES_ORDER:
-            fname, mode = SERIES_SOURCE[system]
-            agg = aggregate(load_csv(FAULTY_DIR / fname, mode_filter=mode))
+            agg = aggregated_series(system)
             if not agg:
                 continue
             xs = [t[0] for t in agg]
@@ -212,7 +275,7 @@ def plot_combined(out_stem: str):
             any_data = True
         ax.set_xlabel("Number of silent faulty replicas")
         ax.set_ylabel(_log_label(ylabel))
-        ax.set_xticks([1, 2, 3, 4, 5])
+        ax.set_xticks([0, 1, 2, 3, 4, 5])
         if not LINEAR:
             ax.set_yscale("log")
 

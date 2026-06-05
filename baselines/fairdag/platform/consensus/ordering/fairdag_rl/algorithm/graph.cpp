@@ -41,7 +41,7 @@ void Graph::Clear() {
 
 bool Graph::IsTournament(){
   uint64_t num = g_.size();
-  LOG(ERROR)<<"check is tournament num: "<< num << " expected edges: " << num*(num-1)/2 <<" edges: "<< edge_num_ <<" graph round: "<< round_;
+  // LOG(ERROR)<<"check is tournament num: "<< num << " expected edges: " << num*(num-1)/2 <<" edges: "<< edge_num_ <<" graph round: "<< round_;  // hot path: per CheckGraph iteration
   std::map<uint64_t, std::set<uint64_t>> source_nodes;
 
   assert(edge_num_ <= num*(num-1)/2);
@@ -105,7 +105,7 @@ void Graph::Dfs(uint64_t u) {
 }
 
 void Graph::Order(){
-  LOG(ERROR)<<" order g size:"<<g_.size();
+  // LOG(ERROR)<<" order g size:"<<g_.size();  // hot path: per finalized graph
   for (auto it :  g_){
     uint64_t u = it.first;
    // LOG(ERROR)<<" u:"<<u<<" belong:"<<belong_[u];
@@ -119,7 +119,7 @@ void Graph::Order(){
     }
   }
 
-  LOG(ERROR)<<" scc:"<<scc_;
+  // LOG(ERROR)<<" scc:"<<scc_;  // hot path: per finalized graph
   std::queue<uint64_t> q;
   result_.clear();
   for(uint64_t i = 1; i <= scc_; ++i){
@@ -177,7 +177,7 @@ std::vector<std::pair<uint64_t, uint64_t>> Graph::GetOrder() {
     return std::vector<std::pair<uint64_t, uint64_t>>();
   }
 
-  LOG(ERROR)<<"get order:"<< round_ <<" size:"<<g_.size();
+  // LOG(ERROR)<<"get order:"<< round_ <<" size:"<<g_.size();  // hot path: per finalized graph
   std::vector<uint64_t> res;
   Clear();
   //LOG(ERROR)<<" commit_txns:"<<commit_txns.size();

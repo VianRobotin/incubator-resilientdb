@@ -138,7 +138,7 @@ void Tusk::AsyncSend() {
       }
     }
 
-    LOG(ERROR) << "txns.size(): " << txns.size();
+    // LOG(ERROR) << "txns.size(): " << txns.size();  // hot path: per proposal
     auto proposal = proposal_manager_ -> GenerateProposal(txns);
     //LOG(ERROR)<<"gen proposal block";
     broadcast_call_(MessageType::NewBlock, *proposal);
@@ -313,7 +313,7 @@ void Tusk::AsyncCommitCausalHistory() {
         pro++;
       }
     }
-    LOG(ERROR)<<"commit proposals: "<<committed_lo_txn_list->size()<<" round: "<<commit_round<<" blocks: "<<pro;
+    // LOG(ERROR)<<"commit proposals: "<<committed_lo_txn_list->size()<<" round: "<<commit_round<<" blocks: "<<pro;  // hot path: per commit
     //commit_(*txns);
         (*committed_lo_txn_list)[0]->set_queuing_time(GetCurrentTime());
     int64_t commit_time_end = GetCurrentTime();

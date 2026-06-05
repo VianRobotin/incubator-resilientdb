@@ -79,6 +79,25 @@ SERIES_STYLE = {
 FULL_W  = 11.0  # inches; cross-column 1x3 figures
 PANEL_H = 4.0
 
+# Throughput axis cap for the saturation panels (figs 4 / 11). Pearl peaks
+# ~13k tx/s; 20k gives headroom while keeping the curves legible instead of
+# squashed against the bottom by the y=x line drawn out to the max rate.
+SATURATION_YMAX = 20000
+
+# Log-scale throughput bounds for the main (non-linear) saturation panels
+# (fig 4). Frames Pearl's ~0.5k-13k tx/s range with a little headroom.
+SATURATION_LOG_YMIN = 300
+SATURATION_LOG_YMAX = 60000
+
+# Latency-axis cap for the linear throughput-latency overlay (fig 16). Keeps
+# Pearl / Tusk / FairDAG-AB on-panel; higher-latency baselines exit the top.
+OVERLAY_LINEAR_YMAX = 10000
+
+# Throughput-axis cap for the linear throughput-vs-rate overlay (fig 13).
+# Focuses on the fair-ordering region (Pearl ~13k, FairDAG-AB ~4.4k); Tusk is
+# kept but its no-fair-ordering ceiling (~30-40k at f>=5) runs off the top.
+TPUT_RATE_LINEAR_YMAX = 17000
+
 plt.rcParams.update({
     "font.size":        11.0,
     "axes.titlesize":   13.0,
@@ -247,10 +266,27 @@ def _draw_saturation_panel(ax, pearl_data, n, show_legend=True):
                     label=st["label"], capsize=3)
         if len(rates) > 0:
             max_rate = max(max_rate, float(rates.max()))
-    if max_rate > 0:
-        lim = max_rate * 1.05
-        ax.plot([0, lim], [0, lim], color="black", linestyle=":",
+    if not LINEAR:
+        # Main figure: log-log, matching the throughput-vs-rate overlay
+        # (Figure fig:pearl-vs-baselines-tput). Both the 500..50k rate range
+        # and the throughput dynamic range stay legible, and y=x remains a
+        # straight diagonal across the panel.
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_ylim(SATURATION_LOG_YMIN, SATURATION_LOG_YMAX)
+        xs = np.array(ax.get_xlim())
+        ax.plot(xs, xs, color="black", linestyle=":",
                 linewidth=1.2, alpha=0.5, label="y = x")
+        ax.set_xlim(xs)
+    else:
+        # Linear appendix version: focus the throughput axis on the data
+        # (Pearl peaks ~13k tx/s) so the y=x line and post-knee rates don't
+        # blow the range out past 50k.
+        if max_rate > 0:
+            lim = min(max_rate * 1.05, SATURATION_YMAX)
+            ax.plot([0, lim], [0, lim], color="black", linestyle=":",
+                    linewidth=1.2, alpha=0.5, label="y = x")
+        ax.set_ylim(0, SATURATION_YMAX)
     ax.set_title(f"N = {n}  (f = {(n - 1) // 2})")
     ax.set_xlabel("Injection rate (tx/s)")
     ax.set_ylabel("Throughput (tx/s)")
@@ -277,6 +313,12 @@ def _draw_overlay_panel(ax, sources, fault, show_legend=False):
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_ylim(1e2, 1e5)
+    else:
+        # Linear: focus on the competitive region. Pearl (~0.3-1.6s), Tusk and
+        # FairDAG-AB (up to ~8.5s) stay on-panel; Pompe / Themis / FairDAG-RL
+        # latencies run to tens of seconds and intentionally exit the top.
+        ax.set_ylim(0, OVERLAY_LINEAR_YMAX)
+        ax.set_xlim(left=0)
     ax.set_title(f"f = {fault}")
     ax.set_xlabel(_log_label("Throughput (tx/s, log)"))
     ax.set_ylabel(_log_label("Latency (ms, log)"))
@@ -306,12 +348,23 @@ def _draw_overlay_tput_vs_rate_panel(ax, sources, fault, show_legend=False):
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_ylim(1e0, 1e5)
-    # Optimal reference: throughput == offered rate. Drawn after the data
-    # so it spans the resolved x range; thin grey dashed, behind the lines.
-    xs = np.array(ax.get_xlim())
-    ax.plot(xs, xs, color="0.6", linestyle="--", linewidth=1.0,
-            zorder=0, label="optimal (y = x)")
-    ax.set_xlim(xs)
+        # Optimal reference: throughput == offered rate. Drawn after the data
+        # so it spans the resolved x range; thin grey dashed, behind the lines.
+        xs = np.array(ax.get_xlim())
+        ax.plot(xs, xs, color="0.6", linestyle="--", linewidth=1.0,
+                zorder=0, label="optimal (y = x)")
+        ax.set_xlim(xs)
+    else:
+        # Linear axes: focus the throughput axis on the fair-ordering region
+        # with an explicit shared cap (Tusk's no-fair ceiling runs off the top
+        # at f>=5) and clip the y=x reference to it so it can't inflate the
+        # axis out to the 50k max injection rate.
+        xs = np.array(ax.get_xlim())
+        hi = min(float(xs[1]), float(TPUT_RATE_LINEAR_YMAX))
+        ax.plot([0, hi], [0, hi], color="0.6", linestyle="--", linewidth=1.0,
+                zorder=0, label="optimal (y = x)")
+        ax.set_xlim(xs)
+        ax.set_ylim(0, TPUT_RATE_LINEAR_YMAX)
     ax.set_title(f"f = {fault}")
     ax.set_xlabel("Injection rate (tx/s)")
     ax.set_ylabel(_log_label("Throughput (tx/s, log)"))

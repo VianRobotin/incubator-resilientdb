@@ -150,7 +150,7 @@ std::vector<std::pair<uint64_t, uint64_t>> FairDAG::FinalOrder(Graph* g){
 
     // Free pending_txn_ids_
     all_pending_txn_ids_.erase(id);
-    LOG(ERROR) << "[ER] " << id;
+    // LOG(ERROR) << "[ER] " << id;  // hot path: fires per executed txn
     for (auto& round: txn_id_proposers_[id]) {
       for(auto proposer : round.second){
         if(pending_txn_ids_[proposer].find(id) != pending_txn_ids_[proposer].end()){
@@ -484,9 +484,9 @@ void FairDAG::ConstructDependencyGraph(Graph * g, const std::vector<Transaction*
   }
   round_solid_[round].clear();
   round_solid_.erase(round);
-  LOG(ERROR) << "Start Adding Edges";
+  // LOG(ERROR) << "Start Adding Edges";  // hot path: fires per committed graph
   AddEdges(possible_edges);
-  LOG(ERROR) << "End Adding Edges";
+  // LOG(ERROR) << "End Adding Edges";
 }
 
 void FairDAG::FindPossibleEdges(Graph* g, uint64_t id1, std::set<std::pair<uint64_t,uint64_t>>& possible_edges, std::vector<uint64_t>& ids){
@@ -513,14 +513,14 @@ void FairDAG::FindPossibleEdges(Graph* g, uint64_t id1, std::set<std::pair<uint6
 }
 
 void FairDAG::CheckGraph(){
-  LOG(ERROR)<<"start";
+  // LOG(ERROR)<<"start";  // hot path: fires per CheckGraph call
   while(!g_queue_.empty()){
     Graph * g = g_queue_.front().get();
     if (txn_to_add_ids_.size() > 0) {
       std::vector<uint64_t> nodes;
       for (auto &id: txn_to_add_ids_) {
         auto key = proposals_idx_2_key_[id];
-        LOG(ERROR) << "ReAdd " << id << " " << key.first << " " << key.second  << " to round " << g->Round();
+        // LOG(ERROR) << "ReAdd " << id << " " << key.first << " " << key.second  << " to round " << g->Round();  // hot path
         g->AddNode(id);
         id_2_first_g_[id] = g;
         std::set<std::pair<uint64_t,uint64_t>> possible_edges;
@@ -548,7 +548,7 @@ void FairDAG::CheckGraph(){
     if(g->IsTournament()){
       auto orders = FinalOrder(g);
       g_set_.erase(g);
-      LOG(ERROR)<<"[X] graph is done:"<<g<<" order size:"<<orders.size()<<" graph size:"<<g->Size() << " round: " << g->Round();
+      // LOG(ERROR)<<"[X] graph is done:"<<g<<" order size:"<<orders.size()<<" graph size:"<<g->Size() << " round: " << g->Round();  // hot path: per finalized graph
       // if(orders.size()==0){
       //   break;
       // }
@@ -558,7 +558,7 @@ void FairDAG::CheckGraph(){
       break;
     }
   }
-  LOG(ERROR)<<"done";
+  // LOG(ERROR)<<"done";  // hot path: fires per CheckGraph call
 }
 
 
