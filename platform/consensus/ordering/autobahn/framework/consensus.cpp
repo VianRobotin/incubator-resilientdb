@@ -29,6 +29,8 @@
 #include <glog/logging.h>
 #include <unistd.h>
 
+#include <algorithm>
+
 #include "common/crypto/signature_verifier.h"
 #include "common/utils/utils.h"
 #include "proto/kv/kv.pb.h"
@@ -42,7 +44,18 @@ Consensus::Consensus(const ResDBConfig& config,
   int total_replicas = config_.GetReplicaNum();
   // Sync HotStuff operates in a synchronous network with 2f+1 replicas.
   // f = (n-1)/2 (tolerates minority Byzantine faults under synchrony).
+  //
+  // `fault_num` lets the operator pin f independently of n, so Pearl can be
+  // deployed on a deliberately oversized committee (e.g. a 3f+1 = n committee
+  // at the baselines' fault tolerance) instead of always claiming the maximal
+  // f=(n-1)/2. Unset => the native 2f+1 behaviour. Clamp to [0, (n-1)/2] so a
+  // bad value can never produce a 2f+1 quorum larger than the committee.
   int f = (total_replicas - 1) / 2;
+  if (config_.GetConfigData().has_fault_num() &&
+      config_.GetConfigData().fault_num() > 0) {
+    int pinned = config_.GetConfigData().fault_num();
+    f = std::min(pinned, (total_replicas - 1) / 2);
+  }
 
   start_ = 0;
 

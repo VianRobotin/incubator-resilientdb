@@ -159,7 +159,7 @@ def generate_certs(cert_dir: Path, replica_ips: List[str], client_ips: List[str]
 
 def write_server_config(config_path: Path, node_ips: List[str], mode: str,
                         block_size: int, target_input_tps_per_client: int,
-                        runtime: int):
+                        runtime: int, fault_num: int = 0):
     bof_flag = (mode == "bof")
     replica_info = [
         {"id": i, "ip": ip, "port": BASE_PORT + i - 1}
@@ -181,6 +181,10 @@ def write_server_config(config_path: Path, node_ips: List[str], mode: str,
     }
     if target_input_tps_per_client > 0:
         config["target_input_tps"] = target_input_tps_per_client
+    # Pin committee fault tolerance f independently of n (e.g. a 3f+1 = n
+    # deployment at the baselines' f). Unset/0 => protocol uses f=(n-1)/2.
+    if fault_num > 0:
+        config["fault_num"] = fault_num
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
 
@@ -319,6 +323,7 @@ def run_experiment(
     num_clients: int = 1,
     target_tps: int = 0,
     silent_faults: int = 0,
+    fault_num: int = 0,
 ) -> Tuple[float, float, float, float, int]:
     """
     Reserve machines, run one experiment, return:
@@ -388,7 +393,7 @@ def run_experiment(
 
         config_path = runtime_dir / "server.config"
         write_server_config(config_path, replica_ips, mode, block_size,
-                            per_client_tps, runtime)
+                            per_client_tps, runtime, fault_num=fault_num)
         print(f"Config: {config_path}  (per_client_tps={per_client_tps})")
 
         for j, ip in enumerate(client_ips, 1):

@@ -50,6 +50,7 @@ message ResConfigData{
   optional bool batch_order_fairness = 25;  // true = batch-order fairness, false/default = ordering linearizability
   optional float bof_gamma = 26;  // γ parameter for BOF edge threshold θ=⌈γ(f+1)⌉, default 1.0
   optional int32 target_input_tps = 27;  // per-client target TPS; 0 = unlimited (max throughput)
+  optional int32 fault_num = 28;  // override committee fault tolerance f; unset => f=(n-1)/2 (2f+1 committee)
 }
 
 message ReplicaStates {
