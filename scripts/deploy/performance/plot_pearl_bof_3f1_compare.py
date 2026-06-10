@@ -13,8 +13,8 @@ Series:
     fairdag-rl           das_results/baselines/fairdag-bof.csv (labelled FairDAG-RL)
 
 Two files are written per run, identical content on different axis scales:
-    <out>_f{f}_log.png       log axes (rate log; tput-vs-lat log-log)
-    <out>_f{f}_linear.png    linear axes
+    <out>_f{f}_log.pdf       log axes (rate log; tput-vs-lat log-log)
+    <out>_f{f}_linear.pdf    linear axes
 
 Usage:
     python3 plot_pearl_bof_3f1_compare.py [--f F [F ...]] [--metric exec|consensus]
@@ -242,7 +242,7 @@ def main():
 
         for log_scale, tag in ((True, "log"), (False, "linear")):
             fig = build_figure(data, f, log_scale, args.metric)
-            out = Path(f"{out_stem}_f{f}_{tag}.png")
+            out = Path(f"{out_stem}_f{f}_{tag}.pdf")
             fig.savefig(out, bbox_inches="tight")
             plt.close(fig)
             print(f"  wrote {out}")
