@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-plot_pearl_bof_3f1_compare.py — Compare four systems at a single fault
-level f in one figure with two side-by-side panels:
+plot_pearl_bof_3f1_compare.py — Committee-size control for the BOF path:
+Pearl-BOF run unchanged at 2f+1 vs 3f+1 at a single fault level f, on a
+single latency-vs-throughput panel (no title).
 
-    (left)  Latency vs injection rate
-    (right) Throughput vs injection rate
-
-Series:
-    pearl-bof            das_results/tput_latency.csv          mode=bof  (2f+1)
-    pearl-bof (3f+1)     das_results/tput_latency_pearl_3f1.csv mode=bof (3f+1)
-    themis               das_results/baselines/themis.csv
-    fairdag-rl           das_results/baselines/fairdag-bof.csv (labelled FairDAG-RL)
+Series (Pearl only — the Themis / FairDAG-RL baselines are discussed in the
+paper text but deliberately left off this control figure):
+    pearl-bof            das_results/tput_latency.csv           mode=bof  (2f+1)
+    pearl-bof (3f+1)     das_results/tput_latency_pearl_3f1.csv mode=bof  (3f+1)
 
 Two files are written per run, identical content on different axis scales:
     <out>_f{f}_log.pdf       log axes (rate log; tput-vs-lat log-log)
@@ -55,10 +52,11 @@ PEARL_3F1_N_FOR_F = {3: 10, 5: 16, 7: 22}
 SERIES_STYLE = {
     "pearl-bof":     dict(color="#E65100", marker="s", linestyle="-",  label="Pearl-BOF (2f+1)"),
     "pearl-bof-3f1": dict(color="#B71C1C", marker="D", linestyle="--", label="Pearl-BOF (3f+1)"),
-    "themis":        dict(color="#FBC02D", marker="^", linestyle="-",  label="Themis"),
-    "fairdag-rl":    dict(color="#6A1B9A", marker="v", linestyle="-",  label="FairDAG-RL"),
 }
-SERIES_ORDER = ["pearl-bof", "pearl-bof-3f1", "themis", "fairdag-rl"]
+# Only the two Pearl committee sizes are plotted; the Themis / FairDAG-RL
+# baselines are discussed in the text but kept off this control figure so the
+# committee-size effect reads cleanly.
+SERIES_ORDER = ["pearl-bof", "pearl-bof-3f1"]
 
 plt.rcParams.update({
     "font.size":        11.0,
@@ -184,23 +182,19 @@ def build_figure(data, f, log_scale, metric):
 
     ax_lt.set_xlabel("Throughput (tx/s)")
     ax_lt.set_ylabel("Latency (ms)")
-    ax_lt.set_title("Latency vs throughput")
 
     if log_scale:
         ax_lt.set_xscale("log")
         ax_lt.set_yscale("log")
     else:
         ax_lt.set_xlim(left=0)
-        # Cap latency so the Pearl curves are readable; the baselines' high-latency
-        # low-throughput points (8k-29k ms) otherwise dominate the linear y-axis.
-        ax_lt.set_ylim(0, 3000)
+        # Only the two Pearl curves remain, so let the y-axis autoscale to them.
+        ax_lt.set_ylim(bottom=0)
 
     handles, labels = ax_lt.get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=len(labels),
                frameon=False, bbox_to_anchor=(0.5, 1.0))
-    scale_word = "log scale" if log_scale else "linear scale"
-    fig.suptitle(f"f = {f}   ({scale_word})", y=1.08, fontsize=12, fontweight="bold")
-    fig.tight_layout(rect=[0, 0, 1, 0.88])
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
     return fig
 
 
@@ -229,8 +223,6 @@ def main():
         data = {
             "pearl-bof":     series_arrays(load_pearl(PEARL_CSV, pearl_2f1_n, args.metric)),
             "pearl-bof-3f1": series_arrays(load_pearl(PEARL_3F1_CSV, pearl_3f1_n, args.metric)),
-            "themis":        series_arrays(load_baseline(BASELINES_DIR / "themis.csv", f, args.metric)),
-            "fairdag-rl":    series_arrays(load_baseline(BASELINES_DIR / "fairdag-bof.csv", f, args.metric)),
         }
 
         print(f"f = {f}  (pearl 2f+1 n={pearl_2f1_n}, pearl 3f+1 n={pearl_3f1_n})")
