@@ -18,7 +18,12 @@ include $(SGX_SDK)/buildenv.mk
 
 SGX_LIBRARY_PATH        := $(SGX_SDK)/lib64
 SGX_TRUSTED_LIBRARY_PATH := $(SGX_SDK)/lib64
-SGX_EDGER8R             := $(SGX_SDK)/bin/x64/sgx_edger8r
+# The SDK's prebuilt sgx_edger8r needs GLIBC >= 2.29, which DAS5 lacks.  By
+# default we build it from the linux-sgx sources vendored in this repo (needs
+# OCaml, e.g. from opam: PATH=$OPAMROOT/default/bin:$PATH).
+EDGER8R_SRC             := ../../../../../linux-sgx/sdk/edger8r/linux
+EDGER8R_BUILT           := tools/sgx_edger8r
+SGX_EDGER8R             ?= $(EDGER8R_BUILT)
 SGX_ENCLAVE_SIGNER      := $(SGX_SDK)/bin/x64/sgx_sign
 
 ENCLAVE_DIR := enclave
@@ -70,30 +75,31 @@ Signed_Enclave_So := tee_enclave.signed.so
 Enclave_Config    := $(ENCLAVE_DIR)/tee_enclave.config.xml
 Enclave_Test_Key  := $(ENCLAVE_DIR)/tee_enclave_private.pem
 
-.PHONY: all gen_stubs enclave host clean
+.PHONY: all gen_stubs enclave host check clean
 
 all: gen_stubs enclave host
+
+# ---- Step 0: sgx_edger8r built from source ----
+$(EDGER8R_BUILT):
+	@mkdir -p tools/edger8r_build
+	cp $(EDGER8R_SRC)/*.ml $(EDGER8R_SRC)/*.mll $(EDGER8R_SRC)/*.mly tools/edger8r_build/
+	cd tools/edger8r_build && ocamlbuild -no-links -libs str,unix Edger8r.native
+	cp tools/edger8r_build/_build/Edger8r.native $@
 
 # ---- Step 1: Generate trusted/untrusted stubs from EDL ----
 gen_stubs: $(GEN_DIR)/tee_enclave_t.h $(GEN_DIR)/tee_enclave_u.h
 
-$(GEN_DIR)/tee_enclave_t.h $(GEN_DIR)/tee_enclave_u.h: tee_enclave.edl
+$(GEN_DIR)/tee_enclave_t.h $(GEN_DIR)/tee_enclave_u.h: tee_enclave.edl $(SGX_EDGER8R)
 	@mkdir -p $(GEN_DIR)
-	@if $(SGX_EDGER8R) --version > /dev/null 2>&1; then \
-	    $(SGX_EDGER8R) --trusted   tee_enclave.edl --search-path $(SGX_SDK)/include \
-	                                                --trusted-dir  $(GEN_DIR); \
-	    $(SGX_EDGER8R) --untrusted tee_enclave.edl --search-path $(SGX_SDK)/include \
-	                                                --untrusted-dir $(GEN_DIR); \
-	else \
-	    echo "[TEE] sgx_edger8r unavailable (GLIBC too old) — using pre-updated gen/ files"; \
-	    touch $(GEN_DIR)/tee_enclave_t.h $(GEN_DIR)/tee_enclave_t.c \
-	          $(GEN_DIR)/tee_enclave_u.h $(GEN_DIR)/tee_enclave_u.c; \
-	fi
+	$(SGX_EDGER8R) --trusted   tee_enclave.edl --search-path $(SGX_SDK)/include \
+	                                            --trusted-dir  $(GEN_DIR)
+	$(SGX_EDGER8R) --untrusted tee_enclave.edl --search-path $(SGX_SDK)/include \
+	                                            --untrusted-dir $(GEN_DIR)
 
 # ---- Step 2: Build enclave .so ----
 enclave: $(Signed_Enclave_So)
 
-$(ENCLAVE_DIR)/tee_enclave.o: $(ENCLAVE_DIR)/tee_enclave.cpp $(GEN_DIR)/tee_enclave_t.h
+$(ENCLAVE_DIR)/tee_enclave.o: $(ENCLAVE_DIR)/tee_enclave.cpp tee_msg.h $(GEN_DIR)/tee_enclave_t.h
 	$(CXX) $(Enclave_CXX_Flags) -I$(GEN_DIR) -c $< -o $@
 
 $(GEN_DIR)/tee_enclave_t.o: $(GEN_DIR)/tee_enclave_t.c $(GEN_DIR)/tee_enclave_t.h
@@ -123,13 +129,23 @@ host: libtee_host.a
 $(GEN_DIR)/tee_enclave_u.o: $(GEN_DIR)/tee_enclave_u.c $(GEN_DIR)/tee_enclave_u.h
 	$(CC) -I$(SGX_SDK)/include -fPIC -O2 -c $< -o $@
 
-tee_host.o: tee_host.cpp tee_host.h $(GEN_DIR)/tee_enclave_u.h
+tee_host.o: tee_host.cpp tee_host.h tee_msg.h $(GEN_DIR)/tee_enclave_u.h
 	$(CXX) $(Host_CXX_Flags) -c $< -o $@
 
 libtee_host.a: $(GEN_DIR)/tee_enclave_u.o tee_host.o
 	ar rcs $@ $^
 	@echo "[TEE] Host library: $@"
 
+# ---- Enclave rule checks (SIM mode) ----
+tee_host_check: tee_host_check.cpp libtee_host.a $(Signed_Enclave_So)
+	$(CXX) $(Host_Include) -std=c++14 -O1 -Wall $< libtee_host.a -o $@ \
+	    -Wl,-rpath,$(dir $(shell $(CXX) -print-file-name=libstdc++.so)) \
+	    -L$(SGX_LIBRARY_PATH) -Wl,-rpath-link,$(SGX_LIBRARY_PATH) -l$(Urts_Lib) -lsgx_uae_service_sim -lcrypto -lpthread
+
+check: tee_host_check
+	LD_LIBRARY_PATH=$(SGX_LIBRARY_PATH) ./tee_host_check $(Signed_Enclave_So)
+
 clean:
 	rm -f $(ENCLAVE_DIR)/*.o $(GEN_DIR)/*.o $(GEN_DIR)/*.h $(GEN_DIR)/*.c
 	rm -f $(Enclave_So) $(Signed_Enclave_So) libtee_host.a tee_host.o
+	rm -rf tools tee_host_check

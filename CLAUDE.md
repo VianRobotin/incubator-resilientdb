@@ -50,29 +50,30 @@ incubator-resilientdb/
 
 ## Protocol Architecture
 
-Autobahn implements three algorithms from the thesis paper:
+The code follows the Pearl paper, Sec. 5-7.
 
-- **Algorithm 1 — TEE-enabled data dissemination**: Each replica TEE-timestamps received
-  transactions. After Δ, computes local ordering key `K_r(t)` = (f+1)-th smallest timestamp.
-- **Algorithm 2 — Pre-Ordered Sync HotStuff (proposal)**: Leader extracts transactions in
-  window `(τ_prev, τ_current]`, sorts by `K(t)`, proposes ordered block.
-- **Algorithm 3 — Voting and commit**: Replicas validate ordering before voting; commit after
-  `f+1` votes (2f+1 total size).
-
-**Execution threshold τ**: (f+1)-th smallest of max last-seen timestamps per replica. Guarantees
-no future transaction can arrive with ordering key ≤ τ (Lemma 5 in paper).
-
-**Two modes** controlled by `batch_order_fairness` flag in config:
-- `ol` — Ordering Linearizability (full TEE-based fair ordering, a thesis contribution)
-- `bof` — γ-Batch-Order Fairness (the other thesis contribution): a **global**
-  relative-ordering scheme. Each replica's TEE attests a per-transaction
-  sequence number; the ordering layer builds a dependency graph by comparing,
-  for every eligible transaction pair, the per-replica attestations across the
-  first f+1 replicas that covered both (no per-block restriction — cross-Car
-  pairs get edges too), then resolves Condorcet cycles via SCC decomposition
-  into batches. A same-Car (per-block) count is kept as a fast path, and
-  committed ordering state is pruned each commit to bound the in-memory graph.
-  Not a baseline — it's Pearl's own fair-ordering mode at n > 2γf/(2γ−1).
+- **Dissemination (Alg. 1):** every replica attests a transaction on first
+  reception (OL: TEE timestamp; BOF: TEE Car placement), echoes it with the
+  evidence, and after a 2Delta collection window has the enclave compute
+  K_r(t) (OL) or record the placement announcements (BOF).  Cars are sealed by
+  the enclave when full or every X = Delta and carry the frontier (OL: G_r;
+  BOF: (w_r, M_r)) plus the PoA of the lane's latest certified Car.
+- **Consensus (Alg. 2):** Sync HotStuff, stable leader per view.  Blocks are a
+  tip cut + parent certificate (+ BOF delinquency claims), signed by
+  TEE.SignBlock.  Votes wait for (ii) OL collection windows / (iii) BOF
+  delinquency timers; commit after 2Delta; blame budget (3p+4)Delta.
+- **Execution:** `algorithm/ol_ordering.*` (K(t), tau, K(t) < tau) and
+  `algorithm/bof_ordering.*` (settlement, theta = ceil(gamma(n-f)) edge rule,
+  SCC batches) derive the order from committed Cars only.
+- **Enclave:** `tee/` (rebuild with `make`; `make check` tests the enclave
+  rules; `sgx_edger8r` is built from `linux-sgx` sources, needs opam OCaml).
+- **Config:** `batch_order_fairness`, `bof_gamma`, `delta_ms` (default 50),
+  `heartbeat_ms`, `blame_p`, `fault_num`.
+- **Benchmark client** sends every transaction to all n replicas and runs
+  open-loop at `target_input_tps` (das.py sets `max_process_txn` huge).  One
+  client process tops out around 3k req/s: use several (`num_clients`).
+- Each replica logs `executed_batch ... order_digest:<hex>`; equal digests at
+  equal slots across replicas = identical execution order.
 
 ---
 

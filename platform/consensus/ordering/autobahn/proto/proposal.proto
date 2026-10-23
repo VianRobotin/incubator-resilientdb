@@ -1,217 +1,188 @@
-
 syntax = "proto3";
 import "common/proto/signature_info.proto";
 
 package resdb.autobahn;
 
-message Transaction{
+// Messages of Pearl (paper Sec. 5-7).  Tags written `tee_tag` are produced by
+// an enclave and verified through TEE.Verify; `SignatureInfo` fields are
+// ordinary replica signatures (Car acknowledgments, votes, blames).
+
+message Transaction {
   int32 id = 1;
   bytes data = 2;
-  bytes hash = 3;
+  bytes hash = 3;            // id(t): SHA-256 of the client request
   int32 proxy_id = 4;
   int32 proposer_id = 5;
   int64 uid = 6;
   int64 create_time = 7;
   int64 queuing_time = 8;
-  int64 ordering_key = 9;     // K(t): final ordering key for fair ordering
+  int64 ordering_key = 9;    // OL: K(t) at execution
 }
 
-// Algorithm 1: TEE-signed timestamp attestation for a single transaction.
-// σ_i = Sign_TEE(t_i, T_i) where T_i is the TEE's clock reading.
-message SignedTimestamp {
-  bytes txn_hash = 1;          // Transaction identifier (hash digest)
-  int64 timestamp = 2;        // T_i: TEE clock value at time of receipt
-  SignatureInfo signature = 3; // TEE signature over (txn_hash, timestamp)
-  int32 sender_id = 4;        // Replica that produced this timestamp
+// ---------------------------------------------------------------------------
+// Dissemination layer (Sec. 5.2, Alg. 1)
+// ---------------------------------------------------------------------------
+
+// Retransmission of t with the sender's TEE evidence (BroadcastOLEcho /
+// BroadcastBOFEcho): value = T (OL timestamp) or c_r(t) (BOF placement).
+message Echo {
+  Transaction txn = 1;
+  int64 value = 2;
+  bytes tee_tag = 3;
 }
 
-// Batch of signed timestamps broadcast after timestamping a Car's transactions.
-message TimestampBatch {
-  repeated SignedTimestamp timestamps = 1;
-  int32 sender_id = 2;
-  // 64-byte ECDSA-P256 public key of the sender's TEE enclave: gx[32] || gy[32]
-  // (SGX little-endian format). Present only when running with SGX TEE.
-  // Receivers cache this per sender_id for signature verification.
-  bytes tee_pubkey = 3;
-}
-
-// Per-transaction ordering key included in consensus blocks.
-// K_r(t) = (f+1)-th smallest timestamp from collected TEE timestamps.
-message OrderingKeyEntry {
-  bytes txn_hash = 1;
-  int64 ordering_key = 2;     // K_r(t): local ordering key computed by this replica
-  SignatureInfo signature = 3; // TEE signature certifying this ordering key
-}
-
-message Header {
-  bytes hash = 1;
-  int32 height = 2;
-  int32 proposer_id = 3;
-  int32 proposal_id = 4;
-  bytes prehash = 5;
-}
-
-message History {
-  bytes hash = 1;
-  int32 state = 2;
-  int32 sender = 3;
-}
-
-message Cert {
-  repeated SignatureInfo sign = 1;
-}
-
-// Tip reference for one lane in the Autobahn DAG.
-message TipRef {
+message EchoBatch {
   int32 sender_id = 1;
-  int64 block_id = 2;
+  repeated Echo echoes = 2;
 }
 
-// Sync HotStuff proposal extending the original Proposal.
-message Proposal {
-  int32 slot_id = 1;
-  int32 sender_id = 2;
-  repeated Block block = 3;
-  bool fast_commit = 4;
-  SignatureInfo sign = 5;
-  bytes hash = 6;
-  Cert cert = 7;
+message OlCarItem {
+  bytes txn_hash = 1;
+  int64 key = 2;             // K_r(t)
+}
 
-  // Sync HotStuff fields
-  int32 view_number = 8;
-  repeated TipRef tip_cut = 9;
-  int64 threshold = 10;        // tau_current: execution threshold
-  int64 prev_threshold = 11;   // tau_prev: previous execution threshold
-  repeated int64 last_seen_vector = 12; // L vector: latest timestamp seen from each replica's TEE
-  int64 propose_time = 13;     // time when proposal was created (for 2*delta timer)
-  // Fair ordering: ordering keys for transactions in the execution window
-  repeated OrderingKeyEntry ordering_keys = 14;
-  // Batch-order fairness: ordered batches of transaction hashes.
-  // Transactions within the same BatchGroup can be in any order relative to
-  // each other, but batches are ordered (batch 0 before batch 1, etc.).
-  repeated BatchGroup batch_groups = 15;
-  // TEE-signed last-seen vector L⃗ (Section V-B).
-  // 64-byte ECDSA-P256 signature from the proposer's TEE over the serialized
-  // last_seen_vector bytes. Replicas verify this to prevent Byzantine inflation of τ.
-  bytes last_seen_sig = 16;
-};
+// One entry M_r[j] of a reception frontier, with j's enclave tag.
+message Announcement {
+  bool present = 1;
+  int64 car = 2;
+  bytes txn_hash = 3;
+  bytes tee_tag = 4;
+}
 
-enum MessageType {
-  NewProposal = 0;
-  Vote = 1;
-  Prepare = 2;
-  VoteAck = 3;
-  Commit = 4;
-  Recovery = 5;
-  NewBlocks = 6;
-  ProposalAck = 7;
-  CMD_BlockACK = 8;
-  CMD_BlockQuery = 9;
-  CMD_SingleBlock = 10;
-  CMD_ProposalQuery = 11;
-  CMD_ProposalQueryResponse = 12;
-  // Sync HotStuff message types
-  SyncHS_Propose = 13;
-  SyncHS_Vote = 14;
-  SyncHS_Equivocation = 15;
-  // Fair ordering: TEE timestamp dissemination
-  TEE_Timestamps = 16;
-  // Batch-order fairness: relative ordering dissemination
-  BOF_RelativeOrder = 17;
-};
+// Proof of Availability: f+1 acknowledgments of one Car.
+message Poa {
+  int64 index = 1;
+  bytes car_hash = 2;
+  repeated SignInfo acks = 3;
+}
 
-message VoteMessage {
-  bytes hash = 1;
-  int32 proposer_id = 2;
-  MessageType type = 3;
+message Car {
+  int32 lane = 1;
+  int64 index = 2;
+  bytes prev_hash = 3;
+  bytes hash = 4;
+  bytes tee_tag = 5;
+  // Transaction bodies.  OL: one per ol_item, same order.  BOF: one per
+  // non-heartbeat bof_item, same order.
+  repeated Transaction txns = 6;
+  repeated OlCarItem ol_items = 7;
+  int64 frontier = 8;                 // G_r (OL) or w_r (BOF)
+  repeated bytes bof_items = 9;       // enclave order
+  repeated bool bof_heartbeat = 10;
+  repeated Announcement m = 11;       // m[j-1] = M_r[j]
+  Poa poa = 12;                       // latest certified Car of this lane
+  int64 seal_time = 13;
+}
+
+message CarAck {
+  int32 lane = 1;
+  int64 index = 2;
+  bytes car_hash = 3;
+  SignInfo sign = 4;
+}
+
+message CarQuery {
+  int32 lane = 1;
+  int64 index = 2;
+  int32 requester = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Consensus layer (Sec. 5.3, Alg. 2): Sync HotStuff over tip cuts
+// ---------------------------------------------------------------------------
+
+message Tip {
+  int32 lane = 1;
+  int64 index = 2;
+  bytes car_hash = 3;
+  Poa poa = 4;
+}
+
+// Delinquency claim <j, c>: lane j has not reached position c (BOF only).
+message Claim {
+  int32 lane = 1;
+  int64 position = 2;
+}
+
+message Vote {
+  int64 view = 1;
+  int64 height = 2;
+  bytes block_hash = 3;
   int32 sender_id = 4;
-  int32 proposal_id = 5;
-};
+  SignatureInfo sign = 5;
+}
 
-message CommittedProposals{
-  repeated Proposal proposals = 1;
+message QuorumCert {
+  int64 view = 1;
+  int64 height = 2;
+  bytes block_hash = 3;
+  repeated Vote votes = 4;
+}
+
+message ConsensusBlock {
+  int64 view = 1;
+  int64 height = 2;
+  bytes parent_hash = 3;
+  QuorumCert parent_qc = 4;   // certificate of the parent (absent at height 1)
+  repeated Tip tips = 5;      // one certified lane tip per replica
+  repeated Claim claims = 6;  // BOF delinquency claims
+  int32 proposer = 7;
+  bytes hash = 8;
+  bytes tee_tag = 9;          // TEE.SignBlock
+  int64 propose_time = 10;
+}
+
+// Proposal as broadcast by the leader and forwarded by every voter.
+message Proposal {
+  ConsensusBlock block = 1;
+  int32 forwarder = 2;
+  // First proposal of a view: the certified block it extends (selected from
+  // the Status messages), for replicas that do not hold it yet.
+  ConsensusBlock parent = 3;
+}
+
+message Blame {
+  int64 view = 1;
   int32 sender_id = 2;
-};
+  SignatureInfo sign = 3;
+}
 
-message HashValue{
-	repeated uint64 bits = 1;
-};
+// Evidence that view `view` must be left: f+1 blames, or two conflicting
+// blocks signed by the leader at the same height.
+message QuitView {
+  int64 view = 1;
+  repeated Blame blames = 2;
+  ConsensusBlock equivocation_a = 3;
+  ConsensusBlock equivocation_b = 4;
+}
+
+// Sent to the next leader after quitting a view: the highest certified block
+// this replica is locked on.
+message Status {
+  int64 view = 1;            // the view being entered
+  int32 sender_id = 2;
+  QuorumCert highest_qc = 3;
+  ConsensusBlock highest_block = 4;
+}
+
+// ---------------------------------------------------------------------------
 
 message SignInfo {
   bytes hash = 1;
   int32 sender_id = 2;
-  int32 local_id = 3;
+  int64 local_id = 3;
   SignatureInfo sign = 4;
 }
 
-message Block {
-  message BlockData {
-    repeated Transaction transaction = 1;
-  }
-  BlockData data = 1;
-  bytes hash = 2;
-  int32 sender_id = 3;
-  int32 local_id = 4;
-  int64 create_time = 5;
-  repeated SignInfo last_sign_info = 6;
-  repeated SignInfo sign_info = 7;
-}
-
-message BlockACK {
-  bytes hash = 2;
-  int32 sender_id = 3;
-  int32 local_id = 4;
-  int32 responder = 5;
-  SignInfo sign_info = 6;
-}
-
-message BlockQuery {
-  bytes hash = 2;
-  int32 proposer = 3;
-  int32 local_id = 4;
-  int32 sender = 5;
-}
-
-message ProposalQuery {
-  bytes hash = 2;
-  int32 proposer = 3;
-  int32 id = 4;
-  int32 sender = 5;
-}
-
-message ProposalQueryResp {
-  repeated Proposal proposal = 1;
-}
-
-message ProposalResponse {
-  Header header = 1;
-  int32 leader = 2;
-}
-
-message VoteMsg {
-  int32 slot_id = 1;
-  int32 sender_id = 2;
-}
-
-// Batch-Order Fairness: a group of transactions that may be ordered in any
-// relative order (no f+1 majority distinguishes their receive order).
-// Batches themselves are totally ordered.
-message BatchGroup {
-  repeated bytes txn_hashes = 1;
-}
-
-// Batch-Order Fairness: a replica's local receive order for transactions in a block.
-// Each replica broadcasts this after receiving a block, recording the order in which
-// it first observed each transaction (relative ordering indicator).
-message RelativeOrdering {
-  repeated bytes txn_hashes = 1;  // Transaction hashes in the order received by this replica
-  int32 sender_id = 2;           // Replica that observed this ordering
-  int64 block_local_id = 3;      // Block that triggered this ordering report
-  int32 block_sender_id = 4;     // Owner of the block
-}
-
-// Equivocation proof: two conflicting proposals from the same leader in the same view.
-message EquivocationProof {
-  Proposal proposal_a = 1;
-  Proposal proposal_b = 2;
+enum MessageType {
+  Unused = 0;
+  Echo_Batch = 1;
+  Car_Prop = 2;
+  Car_Ack = 3;
+  Car_Query = 4;
+  SyncHS_Propose = 5;
+  SyncHS_Vote = 6;
+  SyncHS_Blame = 7;
+  SyncHS_QuitView = 8;
+  SyncHS_Status = 9;
 }

@@ -1,22 +1,26 @@
 package(default_visibility = ["//platform/consensus/ordering/autobahn:__subpackages__"])
 
 cc_library(
-    name = "proposal_state",
-    hdrs = ["proposal_state.h"],
+    name = "ol_ordering",
+    srcs = ["ol_ordering.cpp"],
+    hdrs = ["ol_ordering.h"],
+    deps = ["//common:comm"],
 )
 
 cc_library(
-    name = "proposal_manager",
-    srcs = ["proposal_manager.cpp"],
-    hdrs = ["proposal_manager.h"],
+    name = "bof_ordering",
+    srcs = ["bof_ordering.cpp"],
+    hdrs = ["bof_ordering.h"],
+    deps = ["//common:comm"],
+)
+
+cc_test(
+    name = "ordering_test",
+    srcs = ["ordering_test.cpp"],
     deps = [
-        ":proposal_graph",
-        "//common:comm",
-        "//platform/statistic:stats",
-        "//common/crypto:signature_verifier",
-        "//common/utils",
-        "//platform/consensus/ordering/autobahn/proto:proposal_cc_proto",
-        "//platform/consensus/ordering/autobahn/tee:tee_host",
+        ":bof_ordering",
+        ":ol_ordering",
+        "//common/test:test_main",
     ],
 )
 
@@ -30,33 +34,19 @@ cc_library(
 )
 
 cc_library(
-    name = "proposal_graph",
-    srcs = ["proposal_graph.cpp"],
-    hdrs = ["proposal_graph.h"],
-    deps = [
-        #":ranking",
-        ":proposal_state",
-        "//platform/statistic:stats",
-        "//common:comm",
-        "//common/utils",
-        "//platform/consensus/ordering/autobahn/proto:proposal_cc_proto",
-    ],
-)
-
-cc_library(
     name = "autobahn",
     srcs = ["autobahn.cpp"],
     hdrs = ["autobahn.h"],
     linkopts = [
-        "-L/opt/intel/sgxsdk/lib64",
+        "-L/var/scratch/vrobotin/sgxsdk/lib64",
         "-lsgx_urts_sim",
         "-lssl",
         "-lcrypto",
         "-lpthread",
     ],
     deps = [
-        ":proposal_graph",
-        ":proposal_manager",
+        ":bof_ordering",
+        ":ol_ordering",
         "//platform/statistic:stats",
         "//common:comm",
         "//common/crypto:signature_verifier",
@@ -64,23 +54,5 @@ cc_library(
         "//platform/consensus/ordering/autobahn/proto:proposal_cc_proto",
         "//platform/common/queue:lock_free_queue",
         "//platform/consensus/ordering/autobahn/tee:tee_host",
-    ],
-)
-
-cc_test(
-    name = "proposal_graph_test",
-    srcs = ["proposal_graph_test.cpp"],
-    deps = [
-        ":proposal_graph",
-        "//common/test:test_main",
-    ],
-)
-
-cc_test(
-    name = "autobahn_test",
-    srcs = ["autobahn_test.cpp"],
-    deps = [
-        ":autobahn",
-        "//common/test:test_main",
     ],
 )

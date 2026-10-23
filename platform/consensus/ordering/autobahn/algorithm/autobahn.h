@@ -1,177 +1,278 @@
 #pragma once
 
+#include <condition_variable>
 #include <deque>
+#include <functional>
 #include <map>
-#include <queue>
+#include <memory>
+#include <mutex>
 #include <set>
+#include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
-#include "platform/common/queue/lock_free_queue.h"
-#include "platform/consensus/ordering/common/algorithm/protocol_base.h"
-#include "platform/consensus/ordering/autobahn/algorithm/proposal_manager.h"
+#include "platform/consensus/ordering/autobahn/algorithm/bof_ordering.h"
+#include "platform/consensus/ordering/autobahn/algorithm/ol_ordering.h"
 #include "platform/consensus/ordering/autobahn/proto/proposal.pb.h"
 #include "platform/consensus/ordering/autobahn/tee/tee_host.h"
+#include "platform/consensus/ordering/common/algorithm/protocol_base.h"
 #include "platform/statistic/stats.h"
 
 namespace resdb {
 namespace autobahn {
 
-// AutoBahn with Sync HotStuff consensus and Fair Ordering (Ordering Linearizability).
+// Pearl: TEE-enabled fair ordering with minimal replication.
 //
-// Implements the protocol from "Fair Ordering via Trusted DAG":
+// Implements the paper's three layers (Sec. 5-7):
 //
-//   Data Dissemination Layer (TEE-Enabled Autobahn, Algorithm 1):
-//     - Blocks (Cars) are broadcast and certified via PoA (f+1 ACKs)
-//     - Each replica TEE-timestamps every transaction it receives
-//     - Timestamps are broadcast and collected from all replicas
-//     - After Δ, local ordering key K_r(t) = (f+1)-th smallest timestamp
+//  Dissemination (Sec. 5.2, Alg. 1): every replica attests each transaction
+//  on first reception (TEE timestamp in OL, Car placement in BOF), echoes it
+//  with that evidence, and seals Cars into its lane when full or every
+//  X = Delta.  Cars carry the TEE-derived frontier (G_r in OL, (w_r, M_r) in
+//  BOF) and the PoA of the lane's latest certified Car.  A replica acks Car i
+//  of a lane only once it acked Car i-1.
 //
-//   Consensus Layer (Pre-Ordered Sync HotStuff, Algorithms 2-3):
-//     - Leader extracts transactions in execution window (τ_prev, τ_current]
-//     - Transactions sorted by ordering key K(t) before inclusion
-//     - Replicas validate ordering and vote
-//     - After 2Δ without equivocation, commit in fair order
+//  Consensus (Sec. 5.3, Alg. 2): Sync HotStuff with a stable leader.  A block
+//  carries the certificate of its parent, a tip cut (one certified tip per
+//  lane) and, in BOF, delinquency claims.  Voters check (i) a valid and
+//  fresh tip cut, (ii) in OL, that their collection window closed for every
+//  newly referenced transaction, (iii) in BOF, that their delinquency timer
+//  expired for every claim; they then forward the proposal, broadcast their
+//  vote and commit after 2 Delta without equivocation.  Leaders are replaced
+//  through Sync HotStuff's blame / view-change rules, with the (3p+4)Delta
+//  blame budget.
 //
-//   Execution Threshold (Section V-B):
-//     - τ = (f+1)-th smallest of max last-seen timestamps per replica
-//     - Guarantees no future transaction can have K(t') ≤ τ (Lemma 5)
-class AutoBahn: public common::ProtocolBase {
+//  Execution (Sec. 6-7): committed blocks are handed, in order, to the OL or
+//  BOF orderer, which derives the execution order from committed Cars alone.
+//
+// Threads: network handlers verify signatures and TEE tags (stateless) and
+// post the message to the protocol thread, which owns all lane and consensus
+// state and runs the timers; the execution thread runs the orderers.
+class AutoBahn : public common::ProtocolBase {
  public:
-  AutoBahn(int id, int f, int total_num, int block_size, SignatureVerifier* verifier,
-           bool batch_order_fairness = false, float bof_gamma = 1.0f);
+  struct Params {
+    bool batch_order_fairness = false;
+    double bof_gamma = 1.0;
+    int64_t delta_us = 50000;      // Delta
+    int64_t heartbeat_us = 50000;  // idle period before a heartbeat
+    int blame_p = 1;               // p of the (3p+4)Delta blame budget
+    std::string enclave_path;
+    std::string group_seed;        // 32 bytes
+  };
+
+  AutoBahn(int id, int f, int total_num, int block_size,
+           SignatureVerifier* verifier, const Params& params);
   ~AutoBahn();
 
+  // Starts the protocol and execution threads; call once the framework has
+  // installed the send/broadcast/commit callbacks.
+  void Start();
+
   bool ReceiveTransaction(std::unique_ptr<Transaction> txn);
-  void ReceiveBlock(std::unique_ptr<Block> block);
-  void ReceiveBlockACK(std::unique_ptr<BlockACK> block);
-
-  // Sync HotStuff message handlers
-  bool ReceiveProposal(std::unique_ptr<Proposal> proposal);
-  bool ReceiveVote(std::unique_ptr<Proposal> vote);
-  bool ReceiveEquivocation(std::unique_ptr<EquivocationProof> proof);
-
-  // Fair ordering: TEE timestamp collection
-  void ReceiveTimestamps(std::unique_ptr<TimestampBatch> batch);
-
-  // Batch-order fairness: relative ordering collection
-  void ReceiveRelativeOrdering(std::unique_ptr<RelativeOrdering> ordering);
+  void ReceiveEchoBatch(std::unique_ptr<EchoBatch> batch);
+  void ReceiveCar(std::unique_ptr<Car> car);
+  void ReceiveCarAck(std::unique_ptr<CarAck> ack);
+  void ReceiveCarQuery(std::unique_ptr<CarQuery> query);
+  void ReceiveProposal(std::unique_ptr<Proposal> proposal);
+  void ReceiveVote(std::unique_ptr<Vote> vote);
+  void ReceiveBlame(std::unique_ptr<Blame> blame);
+  void ReceiveQuitView(std::unique_ptr<QuitView> quit);
+  void ReceiveStatus(std::unique_ptr<Status> status);
 
  private:
-  bool IsStop();
-  void GenerateBlocks();
-  void AsyncDissemination();
-  void AsyncConsensus();     // Leader: propose with fair ordering (Algorithm 2)
-  void AsyncCommitTimer();   // Timer-based commit: wait 2Δ, then commit
-
-  bool WaitForResponse(int64_t block_id);
-  void BlockDone();
-
-  void NotifyView();
-  bool WaitForNextView(int view);
-
-  bool WaitForNextLeader();
-  void StartNextLeader(int slot);
-
-  void Commit(std::unique_ptr<Proposal> proposal);
-
-  // Equivocation detection
-  bool DetectEquivocation(const Proposal& proposal);
-
- private:
-  std::condition_variable bc_block_cv_, view_cv_, leader_cv_;
-  LockFreeQueue<Transaction> txns_;
-  std::unique_ptr<ProposalManager> proposal_manager_;
-  SignatureVerifier* verifier_;
-  int execute_id_;
-
-  int id_, total_num_, f_, batch_size_;
-  bool batch_order_fairness_;
-  std::atomic<int> is_stop_;
-  int timeout_ms_;
-  int64_t delta_ms_;  // Synchronous network delay bound (Δ)
-
-  std::thread block_thread_, dissemi_thread_, consensus_thread_, commit_thread_;
-
-  std::mutex block_mutex_, bc_mutex_, view_mutex_, vote_mutex_, commit_mutex_, leader_mutex_;
-
-  // Block timing for consensus (certification) latency
-  std::unordered_map<int64_t, int64_t> block_disseminate_time_;  // block_id → disseminate time_us
-  std::unordered_map<int64_t, int> block_txn_count_;             // block_id → txn count
-  std::mutex block_time_mutex_;
-  std::map<int, std::map<int, SignInfo>> block_ack_;
-
-  // Sync HotStuff vote tracking
-  std::map<int, std::map<int, std::unique_ptr<Proposal>>> vote_ack_;
-
-  Stats* global_stats_;
-  std::map<int, int64_t> commit_block_;
-
-  // SGX TEE enclave (nullptr when running without SGX)
-  std::unique_ptr<TeeHost> tee_host_;
-
-  bool is_leader_;
-  int cur_slot_;
-
-  // Equivocation detection state
-  std::map<int, std::string> seen_proposal_hash_;
-  std::set<int> equivocated_views_;
-  std::mutex equivocation_mutex_;
-
-  // Pending proposals waiting for 2Δ timer.
-  //
-  // Lifecycle:
-  //   1. ReceiveProposal inserts a placeholder with {proposal=nullptr,
-  //      validated=false, receive_time=now} as soon as the message arrives
-  //      (after equivocation check).  This tells AsyncCommitTimer that the
-  //      slot is in flight so its "slot missing" skip timer does NOT fire
-  //      while payload validation is still running.
-  //   2. When ReceiveProposal finishes validating + voting, it atomically
-  //      swaps in the proposal pointer and sets validated=true.
-  //   3. On validation failure, the placeholder is erased.
-  //   4. AsyncCommitTimer only proceeds to commit once validated=true.
-  //      It also enforces a bounded staleness so a never-validated entry
-  //      does not wedge the chain forever.
-  struct PendingCommit {
-    std::unique_ptr<Proposal> proposal;
-    int64_t receive_time = 0;
-    bool quorum_reached = false;  // true when 2f+1 replicas have voted
-    bool validated = false;       // true once ReceiveProposal finishes checks
+  // Dissemination state of a transaction until its collection window closed.
+  struct TxnRecord {
+    int64_t first_seen = 0;
+    std::map<int, TeeHost::SignedIndicator> evidence;  // by signer
   };
-  std::map<int, PendingCommit> pending_commits_;
-  std::mutex pending_commit_mutex_;
 
-  // Vote timing diagnostics: slot → time of first vote received (us)
-  std::map<int, int64_t> vote_first_time_;
-  // slot → time quorum (2f+1 votes) was reached (us)
-  std::map<int, int64_t> vote_quorum_time_;
-  std::mutex vote_timing_mutex_;
+  struct Lane {
+    std::map<int64_t, Car> cars;        // acknowledged, not yet committed
+    std::map<int64_t, std::string> hashes;
+    std::map<int64_t, Car> buffered;    // waiting for their predecessor
+    std::map<int64_t, Car> recent;      // recently committed (for queries)
+    std::map<int64_t, int64_t> queried; // index -> last query time
+    int64_t buffer_since = 0;
+    int64_t acked = 0;
+    int64_t committed = 0;
+    // Highest certified Car known, and when each certification was learned
+    // (for the freshness check).
+    Poa certified;
+    std::deque<std::pair<int64_t, int64_t>> certified_at;  // (index, time)
+  };
 
-  // Own-originated txn create_time tracking, used to compute execution
-  // latency (create → actual execution) without cross-node clock skew.
-  // Populated in ReceiveTransaction for txns we originated, consulted at
-  // execution time, and erased only when the tx actually executes (not at
-  // commit — a committed-but-not-yet-eligible tx still needs its create_time
-  // preserved until τ eventually passes its ordering indicator).
-  std::unordered_map<std::string, int64_t> own_create_times_;
-  std::mutex own_create_times_mutex_;
+  struct BlockState {
+    ConsensusBlock block;
+    int64_t receive_time = 0;
+    bool known_only = false;     // learned as a certified ancestor
+    bool tipcut_checked = false;
+    bool rejected = false;       // failed check (i): never vote
+    bool voted = false;
+    bool queued = false;         // in the commit queue
+    bool committed = false;
+  };
 
-  // Post-commit execution eligibility (matches thesis Sections V-B / VI).
-  //
-  // A transaction is only safe to execute once the execution threshold τ
-  // has advanced past its ordering indicator: K(t) in OL, bof_seq in BOF.
-  // This replaces the (incorrect) Propose-time filter that collapsed
-  // eligibility into batch membership.
-  //
-  // tau_committed_: monotonic floor on the committed execution threshold
-  //   across all committed slots. Updated from each slot's threshold field.
-  // pending_exec_: transactions that have been committed by Sync HotStuff
-  //   but whose ordering indicator is either not yet finalized or is still
-  //   above tau_committed_. Each Commit() re-scans this buffer; a tx leaves
-  //   the buffer the first time its indicator ≤ tau_committed_.
-  int64_t tau_committed_ = 0;
-  std::unordered_map<std::string, Transaction> pending_exec_;
-  std::mutex pending_exec_mutex_;
+  struct CommitTimer {
+    int64_t expire = 0;
+    std::string hash;
+    int64_t view = 0;
+  };
+
+  // A committed block as handed to the execution thread.
+  struct CommittedBlock {
+    int64_t height = 0;
+    std::vector<Car> cars;     // commitment order
+    std::vector<int> claims;   // lanes named by newly committed claims
+  };
+
+  // Protocol-thread plumbing.
+  bool NetworkReady();
+  void Post(std::function<void()> fn);
+  void ProtocolLoop();
+  void Tick();
+
+  // Dissemination layer.
+  void OnFirstReceive(const Transaction& txn);
+  void QueueEcho(const Transaction& txn, int64_t value, const std::string& tag);
+  void FlushEchoes();
+  void HandleEchoBatch(const EchoBatch& batch);
+  void CloseCollectionWindows();
+  void MaybeHeartbeat();
+  void MaybeSealCar();
+  void SealCar();
+  SignInfo SignAck(const Car& car);
+  bool VerifyPoa(int lane, const Poa& poa);
+  bool VerifyCar(const Car& car);
+  void HandleCar(const Car& car);
+  void AcceptCar(Lane& lane, Car car);
+  void LearnCertified(int lane, const Poa& poa);
+  void HandleCarAck(const CarAck& ack);
+  void RequestCar(int lane, int64_t index);
+  void RequestMissingCars();
+  const Car* FindCar(int lane, int64_t index) const;
+
+  // Consensus layer.
+  int LeaderOf(int64_t view) const;
+  static bool RankAbove(const QuorumCert& a, const QuorumCert& b);
+  std::string BlockDigest(const ConsensusBlock& b) const;
+  std::string VoteDigest(int64_t view, int64_t height,
+                         const std::string& hash) const;
+  std::string BlameDigest(int64_t view) const;
+  bool VerifyVote(const Vote& v);
+  bool VerifyQc(const QuorumCert& qc);
+  bool VerifyBlock(const ConsensusBlock& b);
+  bool VerifyBlame(const Blame& b);
+  const Tip* TipOf(const ConsensusBlock& b, int lane) const;
+  int64_t TipIndex(const std::string& block_hash, int lane) const;
+  void StoreKnownBlock(const ConsensusBlock& b);
+  void HandleProposal(const ConsensusBlock& b);
+  bool ValidTipCut(const BlockState& st);
+  bool VoteWaitsOver(const BlockState& st);
+  void ProcessPendingVotes();
+  void CastVote(BlockState& st);
+  void HandleVote(const Vote& v);
+  void CheckCommitTimers();
+  void EnqueueCommitChain(const std::string& hash);
+  void ProcessPendingCommits();
+  void MaybePropose();
+  void CheckBlame();
+  void HandleBlame(const Blame& blame);
+  void QuitCurrentView();
+  void EnterNextView();
+
+  // BOF delinquency timers (Sec. 7.1).
+  void ArmDelinquencyTimers(const std::vector<std::pair<int, int64_t>>& armed);
+  void CheckDelinquencyTimers();
+
+  // Execution layer.
+  void ExecutionLoop();
+  void Execute(const CommittedBlock& block);
+
+  // ---- Configuration ----
+  const int n_;
+  const int block_size_;
+  const Params params_;
+  const bool bof_;
+  SignatureVerifier* verifier_;
+  Stats* global_stats_;
+  std::unique_ptr<TeeHost> tee_;
+
+  // ---- Threads and queues ----
+  std::thread protocol_thread_, execution_thread_;
+  std::mutex event_mutex_;
+  std::condition_variable event_cv_;
+  std::deque<std::function<void()>> events_;
+  std::mutex exec_mutex_;
+  std::condition_variable exec_cv_;
+  std::deque<CommittedBlock> exec_queue_;
+
+  // ---- Dissemination state (protocol thread) ----
+  std::unordered_set<std::string> seen_;
+  std::unordered_map<std::string, TxnRecord> txns_;
+  std::unordered_map<std::string, Transaction> bodies_;  // until sealed
+  std::deque<std::pair<int64_t, std::string>> windows_;  // (due, id)
+  std::deque<std::pair<int64_t, std::string>> retry_windows_;
+  std::vector<Echo> echo_out_;
+  int64_t last_echo_flush_ = 0;
+  std::vector<TeeHost::OlItem> ol_open_;  // OL: keys awaiting a seal
+  int open_count_ = 0;                    // BOF: items in the open Car
+  bool heartbeat_since_seal_ = false;     // OL
+  bool network_ready_ = false;
+  int64_t start_time_ = 0;
+  int64_t last_seal_ = 0;
+  int64_t last_activity_ = 0;
+  int64_t last_heartbeat_ = 0;
+  std::string last_car_hash_;
+  std::map<int64_t, std::map<int, SignInfo>> own_acks_;
+  Poa own_poa_;
+  std::vector<Lane> lanes_;
+
+  // ---- Consensus state (protocol thread) ----
+  int64_t view_ = 1;
+  bool in_view_ = true;
+  int64_t view_start_ = 0;
+  int64_t quit_time_ = 0;
+  bool blamed_ = false;
+  bool consensus_started_ = false;
+  std::map<std::string, BlockState> blocks_;
+  std::map<std::pair<int64_t, int64_t>, std::string> seen_heights_;
+  std::set<std::pair<int64_t, std::string>> pending_votes_;  // (height, hash)
+  std::map<std::string, std::map<int, Vote>> votes_;
+  std::map<std::string, QuorumCert> qcs_;
+  QuorumCert highest_qc_;  // lock
+  QuorumCert base_qc_;     // certificate the leader's first block extends
+  std::map<int64_t, std::map<int, Blame>> blames_;
+  std::map<int64_t, std::vector<ConsensusBlock>> future_blocks_;
+  std::map<int64_t, std::map<int, Status>> statuses_;
+  std::deque<int64_t> vote_times_;
+  std::vector<CommitTimer> commit_timers_;
+  std::string voted_tip_;  // last block voted in this view
+  std::deque<std::string> commit_queue_;
+  int64_t committed_height_ = 0;
+  std::string committed_hash_;
+  std::string last_proposed_;
+  int64_t last_propose_time_ = 0;
+  bool leader_ready_ = false;
+  // BOF delinquency timers: (lane, position) -> arm time.
+  std::map<std::pair<int, int64_t>, int64_t> delinquency_armed_;
+  std::set<std::pair<int, int64_t>> delinquency_expired_;
+  std::map<int, int64_t> claim_targets_;
+  std::set<int> claimed_lanes_;    // claimed in this view, not yet committed
+  std::set<int> discarded_lanes_;  // named by a committed claim
+
+  // ---- Execution state (execution thread) ----
+  std::unique_ptr<OlOrderer> ol_;
+  std::unique_ptr<BofOrderer> bof_orderer_;
+  std::unordered_map<std::string, Transaction> exec_bodies_;
+  std::unordered_set<std::string> exec_committed_;
+  int64_t execute_id_ = 1;
+  std::string order_digest_;
+
+  // Receipt times of transactions received directly from a client (latency).
+  std::mutex create_mutex_;
+  std::unordered_map<std::string, int64_t> create_times_;
 };
 
 }  // namespace autobahn

@@ -15,11 +15,16 @@
 extern "C" {
 #endif
 
-sgx_status_t ecall_init_tee(uint8_t* pubkey_out);
-sgx_status_t ecall_timestamp_txn(const uint8_t* hash, int64_t* timestamp_out, uint8_t* sig_out);
-sgx_status_t ecall_assign_sequence_number(const uint8_t* hash, int64_t* seq_out, uint8_t* sig_out);
-sgx_status_t ecall_sign_bytes(const uint8_t* data, uint32_t data_len, uint8_t* sig_out);
-sgx_status_t ecall_verify_bytes(const uint8_t* data, uint32_t data_len, const uint8_t* expected_mac);
+sgx_status_t ecall_init(uint32_t self_id, uint32_t n, uint32_t f, uint32_t mode, const uint8_t* group_seed);
+sgx_status_t ecall_ol_attest(const uint8_t* id, int64_t* ts_out, uint8_t* tag_out);
+sgx_status_t ecall_ol_local_key(const uint8_t* id, const uint8_t* records, uint32_t rec_len, int64_t* key_out);
+sgx_status_t ecall_ol_seal_car(const uint8_t* items, uint32_t items_len, int64_t* index_out, int64_t* frontier_out, uint8_t* car_hash_out, uint8_t* tag_out);
+sgx_status_t ecall_bof_place(const uint8_t* id, int64_t* car_out, uint8_t* tag_out);
+sgx_status_t ecall_bof_record_announcements(const uint8_t* id, const uint8_t* records, uint32_t rec_len);
+sgx_status_t ecall_bof_seal_car(uint8_t* items_out, uint32_t items_cap, uint32_t* num_items_out, int64_t* index_out, int64_t* w_out, uint8_t* m_out, uint32_t m_cap, uint8_t* car_hash_out, uint8_t* tag_out);
+sgx_status_t ecall_heartbeat(uint8_t* id_out, int64_t* value_out);
+sgx_status_t ecall_sign_block(int64_t view, int64_t height, const uint8_t* digest, uint8_t* tag_out);
+sgx_status_t ecall_verify_batch(const uint8_t* records, uint32_t rec_len, uint8_t* ok_out, uint32_t count);
 
 sgx_status_t SGX_CDECL ocall_get_time(int64_t* t);
 sgx_status_t SGX_CDECL sgx_oc_cpuidex(int cpuinfo[4], int leaf, int subleaf);

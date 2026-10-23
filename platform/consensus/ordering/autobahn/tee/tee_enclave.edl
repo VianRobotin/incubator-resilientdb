@@ -1,80 +1,120 @@
-/* TEE Enclave EDL — ECALL/OCALL interface for the AutoBahn fair-ordering TEE.
+/* TEE Enclave EDL — ECALL/OCALL interface of the Pearl enclave.
  *
- * The enclave provides:
- *   - Monotonic clock (OCALL-backed, monotonicity enforced inside enclave)
- *   - ECDSA-P256 key pair (hardware-sealed in hardware mode)
- *   - Seen-set for deduplication (inside enclave memory)
+ * Every ECALL enforces, inside the enclave, the rule the paper assigns to the
+ * TEE (Sec. 5.1-5.2, Alg. 1): one attestation per transaction (set H),
+ * monotonic indicators, Car contents that match what the enclave attested,
+ * frontiers derived from enclave state, and non-equivocating block signing.
+ * There is deliberately no ECALL that signs arbitrary host-supplied bytes.
+ *
+ * Message layouts and packed-record sizes are defined in tee_msg.h.
  */
 
 enclave {
     from "sgx_tstdc.edl" import *;
 
     trusted {
-        /* Initialize the TEE: generate ECDSA-P256 key pair.
-         * Returns the 64-byte uncompressed public key: gx[32] || gy[32]
-         * (SGX little-endian format).
-         * Idempotent: returns the same key on subsequent calls.
-         */
-        public sgx_status_t ecall_init_tee(
-            [out, size=64] uint8_t* pubkey_out
+        /* Initialise the enclave for replica `self_id` of `n` (fault bound f).
+         * mode: 0 = Pearl-OL, 1 = Pearl-BOF.  `group_seed` provisions the
+         * authentication key shared by the committee's enclaves. */
+        public sgx_status_t ecall_init(
+            uint32_t self_id, uint32_t n, uint32_t f, uint32_t mode,
+            [in, size=32] const uint8_t* group_seed
         );
 
-        /* Timestamp a transaction.
-         * hash:          32-byte transaction hash
-         * timestamp_out: microseconds since epoch (monotonically increasing)
-         * sig_out:       64-byte ECDSA-P256 signature over SHA-256(hash||timestamp)
-         *                in SGX format: r[32] || s[32] (little-endian)
-         *
-         * Returns SGX_SUCCESS on new transaction.
-         * Returns SGX_ERROR_INVALID_PARAMETER if hash was already attested
-         * (deduplication — the TEE will not sign twice for the same tx).
-         */
-        public sgx_status_t ecall_timestamp_txn(
-            [in,  size=32] const uint8_t* hash,
-            [out]          int64_t*       timestamp_out,
-            [out, size=64] uint8_t*       sig_out
+        /* OL, OnFirstReceive: attest t with a monotonic host timestamp.
+         * Returns SGX_ERROR_INVALID_PARAMETER if t is already in H. */
+        public sgx_status_t ecall_ol_attest(
+            [in, size=32]  const uint8_t* id,
+            [out]          int64_t*       ts_out,
+            [out, size=32] uint8_t*       tag_out
         );
 
-        /* Assign a monotonically increasing sequence number to a transaction.
-         * Used for Batch-Order Fairness (Algorithm 4): relative ordering only,
-         * no wall-clock dependency.
-         * Returns SGX_ERROR_INVALID_PARAMETER if the hash was already attested.
-         */
-        public sgx_status_t ecall_assign_sequence_number(
-            [in,  size=32] const uint8_t* hash,
-            [out]          int64_t*       seq_out,
-            [out, size=64] uint8_t*       sig_out
+        /* OL, AfterCollectionWindow: verify the signed timestamps collected
+         * for t (PEARL_SIGNED_TS_REC records), select the (f+1)-th smallest
+         * and certify it as the local ordering key K_r(t). */
+        public sgx_status_t ecall_ol_local_key(
+            [in, size=32]       const uint8_t* id,
+            [in, size=rec_len]  const uint8_t* records,
+            uint32_t                           rec_len,
+            [out]               int64_t*       key_out
         );
 
-        /* Sign arbitrary bytes with the enclave's ECDSA-P256 key.
-         * Used to produce a tamper-proof TEE attestation of the last-seen
-         * vector L⃗ included in each consensus proposal (Section V-B).
-         * data_len must be > 0 and ≤ 1024.
-         */
-        public sgx_status_t ecall_sign_bytes(
-            [in, size=data_len] const uint8_t* data,
-            uint32_t                            data_len,
-            [out, size=64]      uint8_t*        sig_out
+        /* OL, OnCarReady: seal the next Car of the lane.  Items are
+         * PEARL_OL_ITEM_REC records; each must carry the key this enclave
+         * certified.  Returns the completion frontier G_r, the Car hash and
+         * its tag. */
+        public sgx_status_t ecall_ol_seal_car(
+            [in, size=items_len] const uint8_t* items,
+            uint32_t                            items_len,
+            [out]                int64_t*       index_out,
+            [out]                int64_t*       frontier_out,
+            [out, size=32]       uint8_t*       car_hash_out,
+            [out, size=32]       uint8_t*       tag_out
         );
 
-        /* Verify a previously-signed L⃗ HMAC inside the enclave.
-         * Returns SGX_SUCCESS if the first 32 bytes of expected_mac match
-         * HMAC-SHA256(g_hmac_key, data).  Returns SGX_ERROR_INVALID_PARAMETER
-         * if the MAC does not match.  Requires ecall_init_tee to have run.
-         */
-        public sgx_status_t ecall_verify_bytes(
-            [in, size=data_len] const uint8_t* data,
-            uint32_t                            data_len,
-            [in, size=32]       const uint8_t* expected_mac
+        /* BOF, OnFirstReceive: increment s, append t to the open Car and
+         * return the placement announcement c_r(t) with its tag. */
+        public sgx_status_t ecall_bof_place(
+            [in, size=32]  const uint8_t* id,
+            [out]          int64_t*       car_out,
+            [out, size=32] uint8_t*       tag_out
+        );
+
+        /* BOF, AfterCollectionWindow: verify the placement announcements
+         * collected for t (PEARL_SIGNED_PLACE_REC records) and record them;
+         * closes t's collection window, which advances (w, M). */
+        public sgx_status_t ecall_bof_record_announcements(
+            [in, size=32]      const uint8_t* id,
+            [in, size=rec_len] const uint8_t* records,
+            uint32_t                          rec_len
+        );
+
+        /* BOF, OnCarReady: seal the open Car.  Writes the ordered item list
+         * (PEARL_BOF_ITEM_REC records, up to items_cap bytes), the reception
+         * frontier w and M (n PEARL_M_REC records), the Car hash and its tag. */
+        public sgx_status_t ecall_bof_seal_car(
+            [out, size=items_cap] uint8_t*  items_out,
+            uint32_t                        items_cap,
+            [out]                 uint32_t* num_items_out,
+            [out]                 int64_t*  index_out,
+            [out]                 int64_t*  w_out,
+            [out, size=m_cap]     uint8_t*  m_out,
+            uint32_t                        m_cap,
+            [out, size=32]        uint8_t*  car_hash_out,
+            [out, size=32]        uint8_t*  tag_out
+        );
+
+        /* Heartbeat (Sec. 5.2): issue a fresh indicator when client traffic
+         * pauses.  OL: advances the attested clock (value_out = timestamp).
+         * BOF: places an enclave-generated no-op item in the open Car
+         * (id_out = its identifier, value_out = its Car index). */
+        public sgx_status_t ecall_heartbeat(
+            [out, size=32] uint8_t* id_out,
+            [out]          int64_t* value_out
+        );
+
+        /* TEE.SignBlock (Alg. 2): sign a consensus block digest.  Refuses a
+         * second block at the same or a lower (view, height). */
+        public sgx_status_t ecall_sign_block(
+            int64_t view, int64_t height,
+            [in, size=32]  const uint8_t* digest,
+            [out, size=32] uint8_t*       tag_out
+        );
+
+        /* TEE.Verify: check a batch of (u32 msg_len, msg, tag) records.
+         * ok_out[i] = 1 iff record i carries a valid tag. */
+        public sgx_status_t ecall_verify_batch(
+            [in, size=rec_len]  const uint8_t* records,
+            uint32_t                           rec_len,
+            [out, size=count]   uint8_t*       ok_out,
+            uint32_t                           count
         );
     };
 
     untrusted {
-        /* Host-provided wall-clock time (microseconds since epoch).
-         * The enclave enforces monotonicity on top of this value, so the host
-         * cannot cause timestamps to go backward, only forward.
-         * In hardware mode this would be replaced by sgx_get_trusted_time().
-         */
+        /* Host-provided wall-clock time (microseconds since epoch).  The
+         * enclave only enforces that attested values strictly increase
+         * (Sec. 2: TEEs have no trusted clock). */
         void ocall_get_time([out] int64_t* t);
     };
 };

@@ -78,115 +78,85 @@ Consensus::Consensus(const ResDBConfig& config,
   Init();
 
   if (!is_client) {
-    bool batch_order_fairness = config_.GetConfigData().batch_order_fairness();
-    // γ ∈ (0.5, 1.0] for BOF; default 1.0 (strictest, works for n=2f+1).
-    float bof_gamma = config_.GetConfigData().has_bof_gamma()
-                          ? config_.GetConfigData().bof_gamma()
-                          : 1.0f;
-    autobahn_ = std::make_unique<AutoBahn>(
-        config_.GetSelfInfo().id(), f,
-        total_replicas, config_.GetConfigData().block_size(),
-        GetSignatureVerifier(),
-        batch_order_fairness, bof_gamma);
+    const auto& cfg = config_.GetConfigData();
+    AutoBahn::Params params;
+    params.batch_order_fairness = cfg.batch_order_fairness();
+    // gamma in (1/2, 1] for BOF; default 1.0 (n > 2 gamma f / (2 gamma - 1)).
+    params.bof_gamma = cfg.has_bof_gamma() ? cfg.bof_gamma() : 1.0f;
+    params.delta_us =
+        1000LL * (cfg.has_delta_ms() && cfg.delta_ms() > 0 ? cfg.delta_ms() : 50);
+    params.heartbeat_us = cfg.has_heartbeat_ms() && cfg.heartbeat_ms() > 0
+                              ? 1000LL * cfg.heartbeat_ms()
+                              : params.delta_us;
+    params.blame_p = cfg.has_blame_p() && cfg.blame_p() > 0 ? cfg.blame_p() : 1;
+    const char* enclave = getenv("TEE_ENCLAVE_PATH");
+    params.enclave_path =
+        enclave ? enclave
+                : "platform/consensus/ordering/autobahn/tee/tee_enclave.signed.so";
+    // Committee authentication key of the enclaves.  On SGX hardware it would
+    // be provisioned after remote attestation; in SIM mode every replica
+    // derives it from the same seed.
+    const char* seed = getenv("PEARL_GROUP_SEED");
+    params.group_seed =
+        SignatureVerifier::CalculateHash(seed ? seed : "pearl-sim-group-seed");
 
+    autobahn_ = std::make_unique<AutoBahn>(
+        config_.GetSelfInfo().id(), f, total_replicas, cfg.block_size(),
+        GetSignatureVerifier(), params);
     InitProtocol(autobahn_.get());
+    autobahn_->Start();
   }
 }
 
+namespace {
+template <typename T>
+std::unique_ptr<T> Parse(const Request& request) {
+  auto msg = std::make_unique<T>();
+  if (!msg->ParseFromString(request.data())) {
+    LOG(ERROR) << "parse " << MessageType_Name(
+                      static_cast<MessageType>(request.user_type()))
+               << " fail";
+    return nullptr;
+  }
+  return msg;
+}
+}  // namespace
+
 int Consensus::ProcessCustomConsensus(std::unique_ptr<Request> request) {
-  // Data dissemination messages (unchanged)
-  if (request->user_type() == MessageType::NewBlocks) {
-    std::unique_ptr<Block> block = std::make_unique<Block>();
-    if (!block->ParseFromString(request->data())) {
-      assert(1 == 0);
-      LOG(ERROR) << "parse block fail";
+  switch (request->user_type()) {
+    case MessageType::Echo_Batch:
+      if (auto m = Parse<EchoBatch>(*request)) autobahn_->ReceiveEchoBatch(std::move(m));
+      break;
+    case MessageType::Car_Prop:
+      if (auto m = Parse<Car>(*request)) autobahn_->ReceiveCar(std::move(m));
+      break;
+    case MessageType::Car_Ack:
+      if (auto m = Parse<CarAck>(*request)) autobahn_->ReceiveCarAck(std::move(m));
+      break;
+    case MessageType::Car_Query:
+      if (auto m = Parse<CarQuery>(*request)) autobahn_->ReceiveCarQuery(std::move(m));
+      break;
+    case MessageType::SyncHS_Propose:
+      if (auto m = Parse<Proposal>(*request)) autobahn_->ReceiveProposal(std::move(m));
+      break;
+    case MessageType::SyncHS_Vote:
+      if (auto m = Parse<Vote>(*request)) autobahn_->ReceiveVote(std::move(m));
+      break;
+    case MessageType::SyncHS_Blame:
+      if (auto m = Parse<Blame>(*request)) autobahn_->ReceiveBlame(std::move(m));
+      break;
+    case MessageType::SyncHS_QuitView:
+      if (auto m = Parse<QuitView>(*request)) autobahn_->ReceiveQuitView(std::move(m));
+      break;
+    case MessageType::SyncHS_Status:
+      if (auto m = Parse<Status>(*request)) autobahn_->ReceiveStatus(std::move(m));
+      break;
+    default:
+      LOG(ERROR) << "unknown Pearl message type " << request->user_type();
       return -1;
-    }
-    autobahn_->ReceiveBlock(std::move(block));
-    return 0;
-  }
-  else if (request->user_type() == MessageType::CMD_BlockACK) {
-    std::unique_ptr<BlockACK> block_ack = std::make_unique<BlockACK>();
-    if (!block_ack->ParseFromString(request->data())) {
-      LOG(ERROR) << "parse block ack fail";
-      assert(1 == 0);
-      return -1;
-    }
-    autobahn_->ReceiveBlockACK(std::move(block_ack));
-    return 0;
-  }
-  // Sync HotStuff consensus messages
-  else if (request->user_type() == MessageType::SyncHS_Propose) {
-    std::unique_ptr<Proposal> proposal = std::make_unique<Proposal>();
-    if (!proposal->ParseFromString(request->data())) {
-      LOG(ERROR) << "parse SyncHS proposal fail";
-      assert(1 == 0);
-      return -1;
-    }
-    if (!autobahn_->ReceiveProposal(std::move(proposal))) {
-      return -1;
-    }
-    return 0;
-  }
-  else if (request->user_type() == MessageType::SyncHS_Vote) {
-    std::unique_ptr<Proposal> vote = std::make_unique<Proposal>();
-    if (!vote->ParseFromString(request->data())) {
-      LOG(ERROR) << "parse SyncHS vote fail";
-      assert(1 == 0);
-      return -1;
-    }
-    if (!autobahn_->ReceiveVote(std::move(vote))) {
-      return -1;
-    }
-    return 0;
-  }
-  else if (request->user_type() == MessageType::SyncHS_Equivocation) {
-    std::unique_ptr<EquivocationProof> proof = std::make_unique<EquivocationProof>();
-    if (!proof->ParseFromString(request->data())) {
-      LOG(ERROR) << "parse equivocation proof fail";
-      assert(1 == 0);
-      return -1;
-    }
-    if (!autobahn_->ReceiveEquivocation(std::move(proof))) {
-      return -1;
-    }
-    return 0;
-  }
-  // Fair ordering: TEE timestamp dissemination
-  else if (request->user_type() == MessageType::TEE_Timestamps) {
-    std::unique_ptr<TimestampBatch> batch = std::make_unique<TimestampBatch>();
-    if (!batch->ParseFromString(request->data())) {
-      LOG(ERROR) << "parse TEE timestamp batch fail";
-      assert(1 == 0);
-      return -1;
-    }
-    autobahn_->ReceiveTimestamps(std::move(batch));
-    return 0;
-  }
-  // Batch-order fairness: relative ordering dissemination
-  else if (request->user_type() == MessageType::BOF_RelativeOrder) {
-    std::unique_ptr<RelativeOrdering> ordering = std::make_unique<RelativeOrdering>();
-    if (!ordering->ParseFromString(request->data())) {
-      LOG(ERROR) << "parse relative ordering fail";
-      assert(1 == 0);
-      return -1;
-    }
-    autobahn_->ReceiveRelativeOrdering(std::move(ordering));
-    return 0;
-  }
-  // Legacy PBFT messages — log and ignore (protocol replaced by Sync HotStuff)
-  else if (request->user_type() == MessageType::NewProposal ||
-           request->user_type() == MessageType::ProposalAck ||
-           request->user_type() == MessageType::Prepare ||
-           request->user_type() == MessageType::Commit) {
-    LOG(ERROR) << "Received legacy PBFT message type "
-               << MessageType_Name(request->user_type())
-               << " — ignoring (Sync HotStuff active)";
-    return 0;
   }
   return 0;
 }
-
 
 int Consensus::ProcessNewTransaction(std::unique_ptr<Request> request) {
   std::unique_ptr<Transaction> txn = std::make_unique<Transaction>();
@@ -201,12 +171,10 @@ int Consensus::CommitMsg(const google::protobuf::Message& msg) {
 }
 
 int Consensus::CommitMsgInternal(const Transaction& txn) {
-  // Autobahn updates throughput stats directly in Commit() via
-  // global_stats_->ConsumeTransactions(). The standard executor path
-  // (AddExecuteMessage → RegisterExecute) uses a 1024-slot bucket ring that
-  // overflows when a full block of transactions is submitted at once.
-  // Transactions are internally generated for benchmarking so there is no
-  // external client waiting for a response; skip the executor path entirely.
+  // Execution throughput and latency are measured by the replicas (Execute()
+  // logs `executed_batch`).  The benchmark client sends open-loop at its
+  // target rate (das.py sets max_process_txn above any run's volume), so no
+  // reply is sent back.
   (void)txn;
   return 0;
 }

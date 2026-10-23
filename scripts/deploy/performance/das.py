@@ -172,7 +172,11 @@ def write_server_config(config_path: Path, node_ips: List[str], mode: str,
         "enable_viewchange": False,
         "recovery_enabled": False,
         "max_client_complaint_num": 10,
-        "max_process_txn": 4096,
+        # The client stops sending once max_process_txn requests await a
+        # reply.  Pearl replicas do not reply (latency is measured at the
+        # replicas), so with a target rate the client must run open-loop:
+        # with 4096 every run sent only 4096 transactions in total.
+        "max_process_txn": (1 << 30) if target_input_tps_per_client > 0 else 4096,
         "worker_num": 10,
         "input_worker_num": 1,
         "output_worker_num": 5,
