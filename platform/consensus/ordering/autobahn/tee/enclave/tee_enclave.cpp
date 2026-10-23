@@ -14,7 +14,7 @@
  *     two different Cars at one position;
  *   - the (view, height) of the last block it signed.
  *
- * Authentication: tags are HMAC-SHA256 under a key shared by the
+ * Authentication: tags are AES-128-CMAC under a key shared by the
  * committee's enclaves (provisioned from `group_seed` at ecall_init; on SGX
  * hardware this provisioning would follow remote attestation).  Tags are
  * therefore verified inside an enclave (ecall_verify_batch), matching
@@ -36,6 +36,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../aes_cmac.h"
 #include "../tee_msg.h"
 
 namespace {
@@ -52,7 +53,7 @@ struct Announcement {
 bool g_initialized = false;
 uint32_t g_self = 0, g_n = 0, g_f = 0;
 Mode g_mode = kModeOL;
-uint8_t g_key[32];
+pearl::AesCmac g_cmac;  /* keyed with the committee group key */
 
 /* H: identifiers already attested. */
 std::unordered_set<std::string>* g_history = nullptr;
@@ -91,8 +92,8 @@ std::string Key(const uint8_t* id) {
 }
 
 sgx_status_t Tag(const uint8_t* msg, uint32_t len, uint8_t* tag_out) {
-  return sgx_hmac_sha256_msg(msg, (int)len, g_key, sizeof(g_key), tag_out,
-                             PEARL_TAG_LEN);
+  g_cmac.Mac(msg, len, tag_out);
+  return SGX_SUCCESS;
 }
 
 /* SHA-256 that also accepts empty input (sgx_sha256_msg rejects it). */
@@ -107,11 +108,7 @@ sgx_status_t Sha256(const uint8_t* data, uint32_t len, uint8_t* out) {
 }
 
 bool TagValid(const uint8_t* msg, uint32_t len, const uint8_t* tag) {
-  uint8_t expect[PEARL_TAG_LEN];
-  if (Tag(msg, len, expect) != SGX_SUCCESS) return false;
-  uint8_t diff = 0;
-  for (int i = 0; i < PEARL_TAG_LEN; i++) diff |= expect[i] ^ tag[i];
-  return diff == 0;
+  return g_cmac.Valid(msg, len, tag);
 }
 
 /* Hash the Car content, record it as the lane tip and tag it. */
@@ -162,8 +159,10 @@ sgx_status_t ecall_init(uint32_t self_id, uint32_t n, uint32_t f,
       mode > kModeBOF) {
     return SGX_ERROR_INVALID_PARAMETER;
   }
-  sgx_status_t ret = Sha256(group_seed, 32, g_key);
+  uint8_t key[32];
+  sgx_status_t ret = Sha256(group_seed, 32, key);
   if (ret != SGX_SUCCESS) return ret;
+  g_cmac.SetKey(key);
 
   g_self = self_id;
   g_n = n;
@@ -185,9 +184,11 @@ sgx_status_t ecall_init(uint32_t self_id, uint32_t n, uint32_t f,
   return SGX_SUCCESS;
 }
 
-sgx_status_t ecall_ol_attest(const uint8_t* id, int64_t ts,
-                             uint8_t* tag_out) {
-  if (!g_initialized || g_mode != kModeOL) return SGX_ERROR_INVALID_STATE;
+namespace {
+
+/* ---- Per-transaction rules; the ECALLs below apply them to batches. ---- */
+
+sgx_status_t OlAttest(const uint8_t* id, int64_t ts, uint8_t* tag_out) {
   std::string key = Key(id);
   if (g_history->count(key) || !FreshTimestamp(ts)) {
     return SGX_ERROR_INVALID_PARAMETER;
@@ -201,9 +202,8 @@ sgx_status_t ecall_ol_attest(const uint8_t* id, int64_t ts,
   return Tag(msg, sizeof(msg), tag_out);
 }
 
-sgx_status_t ecall_ol_local_key(const uint8_t* id, const uint8_t* records,
-                                uint32_t rec_len, int64_t* key_out) {
-  if (!g_initialized || g_mode != kModeOL) return SGX_ERROR_INVALID_STATE;
+sgx_status_t OlLocalKey(const uint8_t* id, const uint8_t* records,
+                        uint32_t rec_len, int64_t* key_out) {
   if (rec_len % PEARL_SIGNED_TS_REC != 0) return SGX_ERROR_INVALID_PARAMETER;
   std::string key = Key(id);
   /* Only for a transaction this enclave attested and has not keyed yet. */
@@ -234,6 +234,75 @@ sgx_status_t ecall_ol_local_key(const uint8_t* id, const uint8_t* records,
   *key_out = k;
   return SGX_SUCCESS;
 }
+
+sgx_status_t BofPlace(const uint8_t* id, int64_t* car_out, uint8_t* tag_out) {
+  std::string key = Key(id);
+  if (!g_history->insert(key).second) return SGX_ERROR_INVALID_PARAMETER;
+
+  ++g_seq;
+  int64_t c = g_open_car;
+  g_open_items->push_back(std::make_pair(key, false));
+  (*g_window_open)[key] = c;
+  (*g_open_count)[c]++;
+
+  uint8_t msg[PEARL_INDICATOR_MSG_LEN];
+  pearl_indicator_msg(msg, PEARL_DOM_BOF_PLACEMENT, g_self, id, c);
+  *car_out = c;
+  return Tag(msg, sizeof(msg), tag_out);
+}
+
+sgx_status_t BofRecordAnnouncements(const uint8_t* id, const uint8_t* records,
+                                   uint32_t rec_len) {
+  if (rec_len % PEARL_SIGNED_PLACE_REC != 0) return SGX_ERROR_INVALID_PARAMETER;
+  std::string key = Key(id);
+  auto open = g_window_open->find(key);
+  if (open == g_window_open->end()) return SGX_ERROR_INVALID_PARAMETER;
+  int64_t own_car = open->second;
+
+  std::vector<Announcement>& maxima = (*g_car_max)[own_car];
+  if (maxima.empty()) maxima.resize(g_n + 1);
+
+  uint32_t count = rec_len / PEARL_SIGNED_PLACE_REC;
+  for (uint32_t i = 0; i < count; i++) {
+    const uint8_t* rec = records + i * PEARL_SIGNED_PLACE_REC;
+    uint32_t signer = pearl_get_u32(rec);
+    int64_t c = pearl_get_i64(rec + 4);
+    if (signer == 0 || signer > g_n) continue;
+    uint8_t msg[PEARL_INDICATOR_MSG_LEN];
+    pearl_indicator_msg(msg, PEARL_DOM_BOF_PLACEMENT, signer, id, c);
+    if (!TagValid(msg, sizeof(msg), rec + 12)) continue;
+    Announcement& a = maxima[signer];
+    if (!a.present || c > a.car) {
+      a.present = true;
+      a.car = c;
+      memcpy(a.id, id, PEARL_ID_LEN);
+      memcpy(a.tag, rec + 12, PEARL_TAG_LEN);
+    }
+  }
+
+  g_window_open->erase(open);
+  if (--(*g_open_count)[own_car] == 0) g_open_count->erase(own_car);
+  return SGX_SUCCESS;
+}
+
+/* Walks a buffer of (id, u32 count, count records of rec_size bytes). */
+template <typename Fn>
+sgx_status_t ForEachCollected(const uint8_t* buf, uint32_t len, uint32_t count,
+                              uint32_t rec_size, Fn fn) {
+  uint32_t off = 0;
+  for (uint32_t i = 0; i < count; i++) {
+    if (off + PEARL_ID_LEN + 4 > len) return SGX_ERROR_INVALID_PARAMETER;
+    const uint8_t* id = buf + off;
+    uint32_t n = pearl_get_u32(buf + off + PEARL_ID_LEN);
+    off += PEARL_ID_LEN + 4;
+    if ((uint64_t)n * rec_size > len - off) return SGX_ERROR_INVALID_PARAMETER;
+    fn(i, id, buf + off, n * rec_size);
+    off += n * rec_size;
+  }
+  return off == len ? SGX_SUCCESS : SGX_ERROR_INVALID_PARAMETER;
+}
+
+}  // namespace
 
 sgx_status_t ecall_ol_seal_car(const uint8_t* items, uint32_t items_len,
                                int64_t* index_out, int64_t* frontier_out,
@@ -272,58 +341,63 @@ sgx_status_t ecall_ol_seal_car(const uint8_t* items, uint32_t items_len,
                  index_out, car_hash_out, tag_out);
 }
 
-sgx_status_t ecall_bof_place(const uint8_t* id, int64_t* car_out,
-                             uint8_t* tag_out) {
-  if (!g_initialized || g_mode != kModeBOF) return SGX_ERROR_INVALID_STATE;
-  std::string key = Key(id);
-  if (!g_history->insert(key).second) return SGX_ERROR_INVALID_PARAMETER;
-
-  ++g_seq;
-  int64_t c = g_open_car;
-  g_open_items->push_back(std::make_pair(key, false));
-  (*g_window_open)[key] = c;
-  (*g_open_count)[c]++;
-
-  uint8_t msg[PEARL_INDICATOR_MSG_LEN];
-  pearl_indicator_msg(msg, PEARL_DOM_BOF_PLACEMENT, g_self, id, c);
-  *car_out = c;
-  return Tag(msg, sizeof(msg), tag_out);
+sgx_status_t ecall_ol_attest_batch(const uint8_t* ids, uint32_t ids_len,
+                                   const uint8_t* ts, uint32_t ts_len,
+                                   uint8_t* tags_out, uint32_t tags_len,
+                                   uint8_t* ok_out, uint32_t count) {
+  if (!g_initialized || g_mode != kModeOL) return SGX_ERROR_INVALID_STATE;
+  if (ids_len != count * PEARL_ID_LEN || ts_len != count * 8 ||
+      tags_len != count * PEARL_TAG_LEN) {
+    return SGX_ERROR_INVALID_PARAMETER;
+  }
+  for (uint32_t i = 0; i < count; i++) {
+    ok_out[i] = OlAttest(ids + i * PEARL_ID_LEN, pearl_get_i64(ts + 8 * i),
+                         tags_out + i * PEARL_TAG_LEN) == SGX_SUCCESS;
+  }
+  return SGX_SUCCESS;
 }
 
-sgx_status_t ecall_bof_record_announcements(const uint8_t* id,
-                                            const uint8_t* records,
-                                            uint32_t rec_len) {
+sgx_status_t ecall_ol_local_key_batch(const uint8_t* buf, uint32_t len,
+                                      uint8_t* keys_out, uint32_t keys_len,
+                                      uint8_t* ok_out, uint32_t count) {
+  if (!g_initialized || g_mode != kModeOL) return SGX_ERROR_INVALID_STATE;
+  if (keys_len != count * 8) return SGX_ERROR_INVALID_PARAMETER;
+  return ForEachCollected(
+      buf, len, count, PEARL_SIGNED_TS_REC,
+      [&](uint32_t i, const uint8_t* id, const uint8_t* recs, uint32_t rec_len) {
+        int64_t key = 0;
+        ok_out[i] = OlLocalKey(id, recs, rec_len, &key) == SGX_SUCCESS;
+        pearl_put_i64(keys_out + 8 * i, key);
+      });
+}
+
+sgx_status_t ecall_bof_place_batch(const uint8_t* ids, uint32_t ids_len,
+                                   uint8_t* cars_out, uint32_t cars_len,
+                                   uint8_t* tags_out, uint32_t tags_len,
+                                   uint8_t* ok_out, uint32_t count) {
   if (!g_initialized || g_mode != kModeBOF) return SGX_ERROR_INVALID_STATE;
-  if (rec_len % PEARL_SIGNED_PLACE_REC != 0) return SGX_ERROR_INVALID_PARAMETER;
-  std::string key = Key(id);
-  auto open = g_window_open->find(key);
-  if (open == g_window_open->end()) return SGX_ERROR_INVALID_PARAMETER;
-  int64_t own_car = open->second;
-
-  std::vector<Announcement>& maxima = (*g_car_max)[own_car];
-  if (maxima.empty()) maxima.resize(g_n + 1);
-
-  uint32_t count = rec_len / PEARL_SIGNED_PLACE_REC;
-  for (uint32_t i = 0; i < count; i++) {
-    const uint8_t* rec = records + i * PEARL_SIGNED_PLACE_REC;
-    uint32_t signer = pearl_get_u32(rec);
-    int64_t c = pearl_get_i64(rec + 4);
-    if (signer == 0 || signer > g_n) continue;
-    uint8_t msg[PEARL_INDICATOR_MSG_LEN];
-    pearl_indicator_msg(msg, PEARL_DOM_BOF_PLACEMENT, signer, id, c);
-    if (!TagValid(msg, sizeof(msg), rec + 12)) continue;
-    Announcement& a = maxima[signer];
-    if (!a.present || c > a.car) {
-      a.present = true;
-      a.car = c;
-      memcpy(a.id, id, PEARL_ID_LEN);
-      memcpy(a.tag, rec + 12, PEARL_TAG_LEN);
-    }
+  if (ids_len != count * PEARL_ID_LEN || cars_len != count * 8 ||
+      tags_len != count * PEARL_TAG_LEN) {
+    return SGX_ERROR_INVALID_PARAMETER;
   }
-
-  g_window_open->erase(open);
-  if (--(*g_open_count)[own_car] == 0) g_open_count->erase(own_car);
+  for (uint32_t i = 0; i < count; i++) {
+    int64_t car = 0;
+    ok_out[i] = BofPlace(ids + i * PEARL_ID_LEN, &car,
+                         tags_out + i * PEARL_TAG_LEN) == SGX_SUCCESS;
+    pearl_put_i64(cars_out + 8 * i, car);
+  }
   return SGX_SUCCESS;
+}
+
+sgx_status_t ecall_bof_record_announcements_batch(const uint8_t* buf,
+                                                  uint32_t len, uint8_t* ok_out,
+                                                  uint32_t count) {
+  if (!g_initialized || g_mode != kModeBOF) return SGX_ERROR_INVALID_STATE;
+  return ForEachCollected(
+      buf, len, count, PEARL_SIGNED_PLACE_REC,
+      [&](uint32_t i, const uint8_t* id, const uint8_t* recs, uint32_t rec_len) {
+        ok_out[i] = BofRecordAnnouncements(id, recs, rec_len) == SGX_SUCCESS;
+      });
 }
 
 sgx_status_t ecall_bof_seal_car(uint8_t* items_out, uint32_t items_cap,

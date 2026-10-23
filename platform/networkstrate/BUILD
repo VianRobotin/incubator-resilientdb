@@ -82,6 +82,7 @@ cc_library(
     hdrs = ["service_network.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":traffic",
         ":async_acceptor",
         ":service_interface",
         "//platform/common/data_comm",
@@ -89,6 +90,7 @@ cc_library(
         "//platform/common/network:tcp_socket",
         "//platform/common/queue:lock_free_queue",
         "//platform/proto:broadcast_cc_proto",
+        "//platform/proto:resdb_cc_proto",
         "//platform/rdbc:acceptor",
         "//platform/statistic:stats",
     ],
@@ -110,6 +112,7 @@ cc_library(
     srcs = ["async_replica_client.cpp"],
     hdrs = ["async_replica_client.h"],
     deps = [
+        ":traffic",
         "//common:asio",
         "//interface/rdbc:net_channel",
         "//platform/common/queue:blocking_queue",
@@ -175,4 +178,10 @@ cc_test(
         "//interface/rdbc:mock_net_channel",
         "//platform/common/network:mock_socket",
     ],
+)
+
+cc_library(
+    name = "traffic",
+    hdrs = ["traffic.h"],
+    visibility = ["//visibility:public"],
 )

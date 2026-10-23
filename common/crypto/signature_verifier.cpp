@@ -38,6 +38,9 @@
 #include <cryptopp/whrlpool.h>
 #include <glog/logging.h>
 
+#include <memory>
+#include <unordered_map>
+
 #include "common/crypto/signature_utils.h"
 
 namespace resdb {
@@ -54,14 +57,20 @@ bool ED25519verifyString(const std::string& message,
     return false;
   }
   memcpy(byteKey, public_key.c_str(), public_key.size());
-  auto verifier = CryptoPP::ed25519::Verifier(byteKey);
+  // Building a verifier decompresses the public key; cache one per key and
+  // thread.
+  thread_local std::unordered_map<std::string,
+                                  std::unique_ptr<CryptoPP::ed25519::Verifier>>
+      verifiers;
+  auto& verifier = verifiers[public_key];
+  if (verifier == nullptr) {
+    verifier = std::make_unique<CryptoPP::ed25519::Verifier>(byteKey);
+  }
 
-  bool valid = true;
-  CryptoPP::StringSource(
-      signature + message, true,
-      new CryptoPP::SignatureVerificationFilter(
-          verifier,
-          new CryptoPP::ArraySink((CryptoPP::byte*)&valid, sizeof(valid))));
+  bool valid = verifier->VerifyMessage(
+      reinterpret_cast<const CryptoPP::byte*>(message.data()), message.size(),
+      reinterpret_cast<const CryptoPP::byte*>(signature.data()),
+      signature.size());
   if (!valid) {
     LOG(ERROR) << "signature invalid. signature len:" << signature.size()
                << " message len:" << message.size();
@@ -93,7 +102,6 @@ bool CmacVerifyString(const std::string& message, const std::string& public_key,
 
 std::string ED25519signString(const std::string& message,
                               CryptoPP::ed25519::Signer* signer) {
-  CryptoPP::AutoSeededRandomPool prng;
   std::string signature;
   CryptoPP::StringSource(
       message, true,

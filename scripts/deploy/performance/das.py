@@ -177,8 +177,17 @@ def write_server_config(config_path: Path, node_ips: List[str], mode: str,
         # replicas), so with a target rate the client must run open-loop:
         # with 4096 every run sent only 4096 transactions in total.
         "max_process_txn": (1 << 30) if target_input_tps_per_client > 0 else 4096,
-        "worker_num": 10,
-        "input_worker_num": 1,
+        # Network workers verify each incoming message's Ed25519 signature
+        # (about 130 us on DAS5), i.e. several cores at 50k client tx/s.
+        "worker_num": 20,
+        # Client requests beyond this backlog are dropped, so that client
+        # overload never delays messages between replicas (synchrony).
+        "max_client_queue": 5000,
+        # Outgoing batches wait at most 1 ms to fill (ResilientDB defaults:
+        # 10 ms for broadcasts, 50 ms = Delta for single targets).
+        "tcp_batch_timeout_us": 1000,
+        # Threads reading incoming connections (about 100 MB/s at 50k tx/s).
+        "input_worker_num": 4,
         "output_worker_num": 5,
         "block_size": block_size,
         "batch_order_fairness": bof_flag,

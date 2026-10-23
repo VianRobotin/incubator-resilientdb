@@ -19,6 +19,8 @@
 
 #include "platform/networkstrate/replica_communicator.h"
 
+#include <algorithm>
+
 #include <glog/logging.h>
 
 #include <thread>
@@ -81,6 +83,17 @@ bool ReplicaCommunicator::IsInPool(const ReplicaInfo& replica_info) {
 
 bool ReplicaCommunicator::IsRunning() const { return is_running_; }
 
+// The median connection's backlog times the number of connections, so that
+// an unreachable peer, whose queue only grows, does not dominate.
+int64_t ReplicaCommunicator::PendingBytes() {
+  std::lock_guard<std::mutex> lk(mutex_);
+  std::vector<int64_t> pending;
+  for (const auto& client : client_pools_) pending.push_back(client.second->PendingBytes());
+  if (pending.empty()) return 0;
+  std::nth_element(pending.begin(), pending.begin() + pending.size() / 2, pending.end());
+  return pending[pending.size() / 2] * static_cast<int64_t>(pending.size());
+}
+
 void ReplicaCommunicator::UpdateClientReplicas(
     const std::vector<ReplicaInfo>& replicas) {
   clients_ = replicas;
@@ -106,7 +119,7 @@ void ReplicaCommunicator::StartBroadcastInBackGround() {
   broadcast_thread_ = std::thread([&]() {
     while (IsRunning()) {
       std::vector<std::unique_ptr<QueueItem>> batch_req =
-          batch_queue_.Pop(10000);
+          batch_queue_.Pop(batch_timeout_us_);
       if (batch_req.empty()) {
         continue;
       }
@@ -148,7 +161,7 @@ void ReplicaCommunicator::StartSingleInBackGround(const std::string& ip, int por
   single_thread_.push_back(std::thread([&](BatchQueue<std::unique_ptr<QueueItem>> *bq, ReplicaInfo replica_info) {
     while (IsRunning()) {
       std::vector<std::unique_ptr<QueueItem>> batch_req =
-          bq->Pop(50000);
+          bq->Pop(single_batch_timeout_us_);
       if (batch_req.empty()) {
         continue;
       }

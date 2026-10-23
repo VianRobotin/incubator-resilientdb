@@ -21,24 +21,28 @@ enclave {
             [in, size=32] const uint8_t* group_seed
         );
 
-        /* OL, OnFirstReceive: attest t with the host-provided timestamp
-         * `ts`, accepted only if it exceeds the last timestamp attested
-         * (Sec. 5.1).  Returns SGX_ERROR_INVALID_PARAMETER if t is already
-         * in H or `ts` is not fresh. */
-        public sgx_status_t ecall_ol_attest(
-            [in, size=32]  const uint8_t* id,
-            int64_t                       ts,
-            [out, size=32] uint8_t*       tag_out
+        /* OL, OnFirstReceive: attest each of `count` transactions (ids:
+         * count x 32 bytes) with its host-provided timestamp (ts: count
+         * little-endian int64), accepted only if it exceeds the last
+         * timestamp attested (Sec. 5.1).  ok_out[i] = 0 if t_i is already
+         * in H or its timestamp is not fresh. */
+        public sgx_status_t ecall_ol_attest_batch(
+            [in, size=ids_len]   const uint8_t* ids,   uint32_t ids_len,
+            [in, size=ts_len]    const uint8_t* ts,    uint32_t ts_len,
+            [out, size=tags_len] uint8_t*       tags_out, uint32_t tags_len,
+            [out, size=count]    uint8_t*       ok_out,
+            uint32_t count
         );
 
-        /* OL, AfterCollectionWindow: verify the signed timestamps collected
-         * for t (PEARL_SIGNED_TS_REC records), select the (f+1)-th smallest
-         * and certify it as the local ordering key K_r(t). */
-        public sgx_status_t ecall_ol_local_key(
-            [in, size=32]       const uint8_t* id,
-            [in, size=rec_len]  const uint8_t* records,
-            uint32_t                           rec_len,
-            [out]               int64_t*       key_out
+        /* OL, AfterCollectionWindow: for each of `count` transactions, laid
+         * out as (id, u32 n, n PEARL_SIGNED_TS_REC records), verify the
+         * signed timestamps collected, select the (f+1)-th smallest and
+         * certify it as K_r(t) (keys_out: count little-endian int64). */
+        public sgx_status_t ecall_ol_local_key_batch(
+            [in, size=len]       const uint8_t* buf, uint32_t len,
+            [out, size=keys_len] uint8_t*       keys_out, uint32_t keys_len,
+            [out, size=count]    uint8_t*       ok_out,
+            uint32_t count
         );
 
         /* OL, OnCarReady: seal the next Car of the lane.  Items are
@@ -54,21 +58,25 @@ enclave {
             [out, size=32]       uint8_t*       tag_out
         );
 
-        /* BOF, OnFirstReceive: increment s, append t to the open Car and
-         * return the placement announcement c_r(t) with its tag. */
-        public sgx_status_t ecall_bof_place(
-            [in, size=32]  const uint8_t* id,
-            [out]          int64_t*       car_out,
-            [out, size=32] uint8_t*       tag_out
+        /* BOF, OnFirstReceive: for each of `count` transactions, increment
+         * s, append t to the open Car and return the placement announcement
+         * c_r(t) (cars_out: count little-endian int64) with its tag. */
+        public sgx_status_t ecall_bof_place_batch(
+            [in, size=ids_len]   const uint8_t* ids, uint32_t ids_len,
+            [out, size=cars_len] uint8_t*       cars_out, uint32_t cars_len,
+            [out, size=tags_len] uint8_t*       tags_out, uint32_t tags_len,
+            [out, size=count]    uint8_t*       ok_out,
+            uint32_t count
         );
 
-        /* BOF, AfterCollectionWindow: verify the placement announcements
-         * collected for t (PEARL_SIGNED_PLACE_REC records) and record them;
-         * closes t's collection window, which advances (w, M). */
-        public sgx_status_t ecall_bof_record_announcements(
-            [in, size=32]      const uint8_t* id,
-            [in, size=rec_len] const uint8_t* records,
-            uint32_t                          rec_len
+        /* BOF, AfterCollectionWindow: for each of `count` transactions,
+         * laid out as (id, u32 n, n PEARL_SIGNED_PLACE_REC records), verify
+         * and record the placement announcements collected; closes t's
+         * collection window, which advances (w, M). */
+        public sgx_status_t ecall_bof_record_announcements_batch(
+            [in, size=len]    const uint8_t* buf, uint32_t len,
+            [out, size=count] uint8_t*       ok_out,
+            uint32_t count
         );
 
         /* BOF, OnCarReady: seal the open Car.  Writes the ordered item list

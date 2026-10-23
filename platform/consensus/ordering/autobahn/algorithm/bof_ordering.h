@@ -106,6 +106,7 @@ class BofOrderer {
     std::vector<int> coverers;      // first f+1 covering lanes
     std::vector<int64_t> hat;       // running max of M_r^t, then c_hat_j(t)
     bool hat_fixed = false;
+    int waiting = 0;                // once fixed: lanes not yet settled
   };
 
   bool Settled(const TxnState& t, int j) const;
@@ -117,8 +118,9 @@ class BofOrderer {
   // Per lane r: (Car index, id) of committed items not yet covered by r.
   std::vector<std::deque<std::pair<int64_t, std::string>>> uncovered_;
   std::unordered_map<std::string, TxnState> txns_;
-  std::set<std::string> hat_fixed_;          // c_hat fixed, not yet eligible
-  std::vector<std::multiset<int64_t>> unsettled_;  // per lane: open c_hat
+  // Per lane j: (c_hat_j(t), t) for fixed transactions lane j has not
+  // settled yet.  Settlement only visits the lanes that advance.
+  std::vector<std::multimap<int64_t, std::string>> unsettled_;
   std::unordered_set<std::string> executed_;
 };
 

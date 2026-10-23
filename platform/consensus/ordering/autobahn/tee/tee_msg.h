@@ -15,7 +15,7 @@
 #include <string.h>
 
 #define PEARL_ID_LEN  32
-#define PEARL_TAG_LEN 32
+#define PEARL_TAG_LEN 16  /* AES-128-CMAC */
 #define PEARL_MAX_REPLICAS 64
 
 /* Domain separators: the first byte of every authenticated message. */

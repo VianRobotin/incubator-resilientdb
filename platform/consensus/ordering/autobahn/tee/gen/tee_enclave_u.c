@@ -10,20 +10,27 @@ typedef struct ms_ecall_init_t {
 	const uint8_t* ms_group_seed;
 } ms_ecall_init_t;
 
-typedef struct ms_ecall_ol_attest_t {
+typedef struct ms_ecall_ol_attest_batch_t {
 	sgx_status_t ms_retval;
-	const uint8_t* ms_id;
-	int64_t ms_ts;
-	uint8_t* ms_tag_out;
-} ms_ecall_ol_attest_t;
+	const uint8_t* ms_ids;
+	uint32_t ms_ids_len;
+	const uint8_t* ms_ts;
+	uint32_t ms_ts_len;
+	uint8_t* ms_tags_out;
+	uint32_t ms_tags_len;
+	uint8_t* ms_ok_out;
+	uint32_t ms_count;
+} ms_ecall_ol_attest_batch_t;
 
-typedef struct ms_ecall_ol_local_key_t {
+typedef struct ms_ecall_ol_local_key_batch_t {
 	sgx_status_t ms_retval;
-	const uint8_t* ms_id;
-	const uint8_t* ms_records;
-	uint32_t ms_rec_len;
-	int64_t* ms_key_out;
-} ms_ecall_ol_local_key_t;
+	const uint8_t* ms_buf;
+	uint32_t ms_len;
+	uint8_t* ms_keys_out;
+	uint32_t ms_keys_len;
+	uint8_t* ms_ok_out;
+	uint32_t ms_count;
+} ms_ecall_ol_local_key_batch_t;
 
 typedef struct ms_ecall_ol_seal_car_t {
 	sgx_status_t ms_retval;
@@ -35,19 +42,25 @@ typedef struct ms_ecall_ol_seal_car_t {
 	uint8_t* ms_tag_out;
 } ms_ecall_ol_seal_car_t;
 
-typedef struct ms_ecall_bof_place_t {
+typedef struct ms_ecall_bof_place_batch_t {
 	sgx_status_t ms_retval;
-	const uint8_t* ms_id;
-	int64_t* ms_car_out;
-	uint8_t* ms_tag_out;
-} ms_ecall_bof_place_t;
+	const uint8_t* ms_ids;
+	uint32_t ms_ids_len;
+	uint8_t* ms_cars_out;
+	uint32_t ms_cars_len;
+	uint8_t* ms_tags_out;
+	uint32_t ms_tags_len;
+	uint8_t* ms_ok_out;
+	uint32_t ms_count;
+} ms_ecall_bof_place_batch_t;
 
-typedef struct ms_ecall_bof_record_announcements_t {
+typedef struct ms_ecall_bof_record_announcements_batch_t {
 	sgx_status_t ms_retval;
-	const uint8_t* ms_id;
-	const uint8_t* ms_records;
-	uint32_t ms_rec_len;
-} ms_ecall_bof_record_announcements_t;
+	const uint8_t* ms_buf;
+	uint32_t ms_len;
+	uint8_t* ms_ok_out;
+	uint32_t ms_count;
+} ms_ecall_bof_record_announcements_batch_t;
 
 typedef struct ms_ecall_bof_seal_car_t {
 	sgx_status_t ms_retval;
@@ -186,26 +199,33 @@ sgx_status_t ecall_init(sgx_enclave_id_t eid, sgx_status_t* retval, uint32_t sel
 	return status;
 }
 
-sgx_status_t ecall_ol_attest(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* id, int64_t ts, uint8_t* tag_out)
+sgx_status_t ecall_ol_attest_batch(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* ids, uint32_t ids_len, const uint8_t* ts, uint32_t ts_len, uint8_t* tags_out, uint32_t tags_len, uint8_t* ok_out, uint32_t count)
 {
 	sgx_status_t status;
-	ms_ecall_ol_attest_t ms;
-	ms.ms_id = id;
+	ms_ecall_ol_attest_batch_t ms;
+	ms.ms_ids = ids;
+	ms.ms_ids_len = ids_len;
 	ms.ms_ts = ts;
-	ms.ms_tag_out = tag_out;
+	ms.ms_ts_len = ts_len;
+	ms.ms_tags_out = tags_out;
+	ms.ms_tags_len = tags_len;
+	ms.ms_ok_out = ok_out;
+	ms.ms_count = count;
 	status = sgx_ecall(eid, 1, &ocall_table_tee_enclave, &ms);
 	if (status == SGX_SUCCESS && retval) *retval = ms.ms_retval;
 	return status;
 }
 
-sgx_status_t ecall_ol_local_key(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* id, const uint8_t* records, uint32_t rec_len, int64_t* key_out)
+sgx_status_t ecall_ol_local_key_batch(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* buf, uint32_t len, uint8_t* keys_out, uint32_t keys_len, uint8_t* ok_out, uint32_t count)
 {
 	sgx_status_t status;
-	ms_ecall_ol_local_key_t ms;
-	ms.ms_id = id;
-	ms.ms_records = records;
-	ms.ms_rec_len = rec_len;
-	ms.ms_key_out = key_out;
+	ms_ecall_ol_local_key_batch_t ms;
+	ms.ms_buf = buf;
+	ms.ms_len = len;
+	ms.ms_keys_out = keys_out;
+	ms.ms_keys_len = keys_len;
+	ms.ms_ok_out = ok_out;
+	ms.ms_count = count;
 	status = sgx_ecall(eid, 2, &ocall_table_tee_enclave, &ms);
 	if (status == SGX_SUCCESS && retval) *retval = ms.ms_retval;
 	return status;
@@ -226,25 +246,31 @@ sgx_status_t ecall_ol_seal_car(sgx_enclave_id_t eid, sgx_status_t* retval, const
 	return status;
 }
 
-sgx_status_t ecall_bof_place(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* id, int64_t* car_out, uint8_t* tag_out)
+sgx_status_t ecall_bof_place_batch(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* ids, uint32_t ids_len, uint8_t* cars_out, uint32_t cars_len, uint8_t* tags_out, uint32_t tags_len, uint8_t* ok_out, uint32_t count)
 {
 	sgx_status_t status;
-	ms_ecall_bof_place_t ms;
-	ms.ms_id = id;
-	ms.ms_car_out = car_out;
-	ms.ms_tag_out = tag_out;
+	ms_ecall_bof_place_batch_t ms;
+	ms.ms_ids = ids;
+	ms.ms_ids_len = ids_len;
+	ms.ms_cars_out = cars_out;
+	ms.ms_cars_len = cars_len;
+	ms.ms_tags_out = tags_out;
+	ms.ms_tags_len = tags_len;
+	ms.ms_ok_out = ok_out;
+	ms.ms_count = count;
 	status = sgx_ecall(eid, 4, &ocall_table_tee_enclave, &ms);
 	if (status == SGX_SUCCESS && retval) *retval = ms.ms_retval;
 	return status;
 }
 
-sgx_status_t ecall_bof_record_announcements(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* id, const uint8_t* records, uint32_t rec_len)
+sgx_status_t ecall_bof_record_announcements_batch(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* buf, uint32_t len, uint8_t* ok_out, uint32_t count)
 {
 	sgx_status_t status;
-	ms_ecall_bof_record_announcements_t ms;
-	ms.ms_id = id;
-	ms.ms_records = records;
-	ms.ms_rec_len = rec_len;
+	ms_ecall_bof_record_announcements_batch_t ms;
+	ms.ms_buf = buf;
+	ms.ms_len = len;
+	ms.ms_ok_out = ok_out;
+	ms.ms_count = count;
 	status = sgx_ecall(eid, 5, &ocall_table_tee_enclave, &ms);
 	if (status == SGX_SUCCESS && retval) *retval = ms.ms_retval;
 	return status;

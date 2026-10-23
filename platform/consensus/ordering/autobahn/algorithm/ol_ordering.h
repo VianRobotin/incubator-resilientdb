@@ -46,6 +46,10 @@ class OlOrderer {
   // Committed, not yet executed transactions (fixed or not).
   size_t PendingSize() const { return txns_.size(); }
   int64_t CommittedIndex(int lane) const { return committed_index_[lane]; }
+  int64_t Frontier(int lane) const { return frontier_[lane]; }
+  size_t UnfixedSize() const { return unfixed_.size(); }
+  size_t FixedSize() const { return fixed_.size(); }
+  int64_t SmallestFixedKey() const { return fixed_.empty() ? -1 : fixed_.begin()->first; }
 
  private:
   struct TxnState {

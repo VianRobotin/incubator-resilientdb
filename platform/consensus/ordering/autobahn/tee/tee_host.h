@@ -61,6 +61,28 @@ class TeeHost {
     std::vector<Announcement> m;       // BOF only: M_r[1..n] (index 0 unused)
   };
 
+  /* ---- Batched per-transaction calls (the dissemination hot path) ---- */
+  static const int kTagLen = 16;
+
+  /* OnFirstReceive for `count` transactions whose 32-byte ids are packed in
+   * `ids`.  OL: attests each with an increasing host timestamp; BOF: places
+   * each in the open Car.  values[i] = T or c_r(t), tags = count x kTagLen
+   * bytes, ok[i] = 0 if t_i was already attested. */
+  bool AttestBatch(const uint8_t* ids, uint32_t count,
+                   std::vector<int64_t>* values, std::string* tags,
+                   std::vector<uint8_t>* ok);
+
+  /* AfterCollectionWindow for `count` transactions.  `collected` holds, per
+   * transaction, AppendCollected(id, n) followed by n AppendRecord(...).
+   * OL: keys[i] = K_r(t_i); BOF: records the announcements.  ok[i] = 0 if
+   * the enclave refused (OL: fewer than f+1 genuine timestamps). */
+  bool CloseWindowsBatch(const std::string& collected, uint32_t count,
+                         std::vector<int64_t>* keys, std::vector<uint8_t>* ok);
+  static void AppendCollected(std::string* buf, const uint8_t* id,
+                              uint32_t num_records);
+  static void AppendRecord(std::string* buf, int signer, int64_t value,
+                           const char* tag);
+
   /* ---- Pearl-OL ---- */
   /* Feeds the enclave the host's clock reading (bumped past the previous
    * one) and returns it in *ts.  Returns false if t was already attested. */

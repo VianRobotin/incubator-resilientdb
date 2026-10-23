@@ -18,6 +18,7 @@
  */
 
 #include "platform/networkstrate/service_network.h"
+#include "platform/networkstrate/traffic.h"
 
 #include <glog/logging.h>
 #include <signal.h>
@@ -26,6 +27,10 @@
 
 #include "platform/common/network/tcp_socket.h"
 #include "platform/proto/broadcast.pb.h"
+#include "platform/proto/resdb.pb.h"
+
+#include <google/protobuf/io/coded_stream.h>
+#include <google/protobuf/wire_format_lite.h>
 
 namespace resdb {
 
@@ -34,7 +39,13 @@ ServiceNetwork::ServiceNetwork(const ResDBConfig& config,
     : service_(std::move(service)),
       input_queue_("input"),
       resp_queue_("resp"),
+      client_queue_("client"),
+      bulk_queue_("bulk"),
       config_(config) {
+  for (const auto& replica : config.GetReplicaInfos()) {
+    replica_ids_.insert(replica.id());
+  }
+  max_client_queue_ = config.GetConfigData().max_client_queue();
   struct sigaction sa;
   sa.sa_handler = SIG_IGN;
   sa.sa_flags = 0;
@@ -56,7 +67,32 @@ ServiceNetwork::ServiceNetwork(const ResDBConfig& config,
 
 ServiceNetwork::~ServiceNetwork() {}
 
+// Replica messages above this size go to the bulk queue.
+constexpr size_t kBulkMessageBytes = 16 << 10;
+
+// Node id of a serialized ResDBMessage's signature, read without copying
+// the (possibly large) data field; -1 if absent.
+int64_t ServiceNetwork::SignerOf(const std::string& bytes) {
+  google::protobuf::io::CodedInputStream in(
+      reinterpret_cast<const uint8_t*>(bytes.data()), static_cast<int>(bytes.size()));
+  while (true) {
+    uint32_t tag = in.ReadTag();
+    if (tag == 0) return -1;
+    if (google::protobuf::internal::WireFormatLite::GetTagFieldNumber(tag) == 2) {
+      uint32_t len;
+      if (!in.ReadVarint32(&len)) return -1;
+      std::string sig;
+      if (!in.ReadString(&sig, len)) return -1;
+      SignatureInfo info;
+      return info.ParseFromString(sig) ? info.node_id() : -1;
+    }
+    if (!google::protobuf::internal::WireFormatLite::SkipField(&in, tag)) return -1;
+  }
+}
+
 void ServiceNetwork::AcceptorHandler(const char* buffer, size_t data_len) {
+  NetworkTraffic::RxBytes().fetch_add(static_cast<int64_t>(data_len),
+                                      std::memory_order_relaxed);
   BroadcastData data;
   if (!data.ParseFromArray(buffer, data_len)) {
     LOG(ERROR) << "parse broad cast fail:" << data_len;
@@ -64,6 +100,16 @@ void ServiceNetwork::AcceptorHandler(const char* buffer, size_t data_len) {
   }
 
   for (auto& sub_data : data.data()) {
+    // Messages signed by a replica take the replica queue.
+    bool from_replica = replica_ids_.count(SignerOf(sub_data)) > 0;
+    if (!from_replica && max_client_queue_ > 0 &&
+        client_queue_size_.load(std::memory_order_relaxed) >= max_client_queue_) {
+      int64_t d = ++client_dropped_;
+      if (d % 10000 == 1) {
+        LOG(ERROR) << "overload: dropped " << d << " client requests";
+      }
+      continue;
+    }
     std::unique_ptr<DataInfo> sub_request_info = std::make_unique<DataInfo>();
     sub_request_info->data_len = sub_data.size();
     sub_request_info->buff = new char[sub_request_info->data_len];
@@ -73,7 +119,16 @@ void ServiceNetwork::AcceptorHandler(const char* buffer, size_t data_len) {
     item->data = std::move(sub_request_info);
     // LOG(ERROR) << "receve data from acceptor:" << data.is_resp()<<" data  len:"<<item->data->data_len;
     global_stats_->ServerCall();
-    input_queue_.Push(std::move(item));
+    if (from_replica && sub_data.size() > kBulkMessageBytes) {
+      bulk_queue_.Push(std::move(item));
+    } else if (from_replica) {
+      input_queue_.Push(std::move(item));
+    } else {
+      NetworkTraffic::ClientRxBytes().fetch_add(
+          static_cast<int64_t>(sub_data.size()), std::memory_order_relaxed);
+      ++client_queue_size_;
+      client_queue_.Push(std::move(item));
+    }
   }
 }
 
@@ -82,10 +137,22 @@ void ServiceNetwork::InputProcess() {
 
   int woker_num = config_.GetWorkerNum();
   LOG(ERROR) << "server:" << config_.GetSelfInfo().id() << " start running";
+  // Every worker serves replica messages first (small ones, then bulk ones);
+  // two workers serve only those, the others then serve client requests.
+  const int replica_only = std::min(2, woker_num - 1);
   for (int i = 0; i < woker_num; ++i) {
-    threads.push_back(std::thread([&]() {
+    threads.push_back(std::thread([&, i]() {
       while (IsRunning()) {
-        std::unique_ptr<QueueItem> item = input_queue_.Pop(1000);
+        std::unique_ptr<QueueItem> item = input_queue_.Pop(0);
+        if (item == nullptr) item = bulk_queue_.Pop(0);
+        if (item == nullptr) {
+          if (i < replica_only) {
+            item = input_queue_.Pop(1);
+          } else {
+            item = client_queue_.Pop(1);
+            if (item != nullptr) --client_queue_size_;
+          }
+        }
         if (item == nullptr) {
           continue;
         }

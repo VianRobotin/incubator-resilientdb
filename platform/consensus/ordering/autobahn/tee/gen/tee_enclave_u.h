@@ -38,11 +38,11 @@ int SGX_UBRIDGE(SGX_CDECL, sgx_thread_set_multiple_untrusted_events_ocall, (cons
 #endif
 
 sgx_status_t ecall_init(sgx_enclave_id_t eid, sgx_status_t* retval, uint32_t self_id, uint32_t n, uint32_t f, uint32_t mode, const uint8_t* group_seed);
-sgx_status_t ecall_ol_attest(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* id, int64_t ts, uint8_t* tag_out);
-sgx_status_t ecall_ol_local_key(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* id, const uint8_t* records, uint32_t rec_len, int64_t* key_out);
+sgx_status_t ecall_ol_attest_batch(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* ids, uint32_t ids_len, const uint8_t* ts, uint32_t ts_len, uint8_t* tags_out, uint32_t tags_len, uint8_t* ok_out, uint32_t count);
+sgx_status_t ecall_ol_local_key_batch(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* buf, uint32_t len, uint8_t* keys_out, uint32_t keys_len, uint8_t* ok_out, uint32_t count);
 sgx_status_t ecall_ol_seal_car(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* items, uint32_t items_len, int64_t* index_out, int64_t* frontier_out, uint8_t* car_hash_out, uint8_t* tag_out);
-sgx_status_t ecall_bof_place(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* id, int64_t* car_out, uint8_t* tag_out);
-sgx_status_t ecall_bof_record_announcements(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* id, const uint8_t* records, uint32_t rec_len);
+sgx_status_t ecall_bof_place_batch(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* ids, uint32_t ids_len, uint8_t* cars_out, uint32_t cars_len, uint8_t* tags_out, uint32_t tags_len, uint8_t* ok_out, uint32_t count);
+sgx_status_t ecall_bof_record_announcements_batch(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* buf, uint32_t len, uint8_t* ok_out, uint32_t count);
 sgx_status_t ecall_bof_seal_car(sgx_enclave_id_t eid, sgx_status_t* retval, uint8_t* items_out, uint32_t items_cap, uint32_t* num_items_out, int64_t* index_out, int64_t* w_out, uint8_t* m_out, uint32_t m_cap, uint8_t* car_hash_out, uint8_t* tag_out);
 sgx_status_t ecall_heartbeat(sgx_enclave_id_t eid, sgx_status_t* retval, int64_t ts, uint8_t* id_out, int64_t* value_out);
 sgx_status_t ecall_forget(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* ids, uint32_t ids_len);

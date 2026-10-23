@@ -18,6 +18,7 @@
  */
 
 #pragma once
+#include <atomic>
 #include <thread>
 
 #include "interface/rdbc/net_channel.h"
@@ -56,6 +57,15 @@ class ReplicaCommunicator {
       const ReplicaInfo& replica_info);
 
   void UpdateClientReplicas(const std::vector<ReplicaInfo>& replicas);
+
+  // How long a send batch may wait to fill before it is sent anyway.
+  void SetBatchTimeoutUs(int us) {
+    batch_timeout_us_ = us;
+    single_batch_timeout_us_ = us;
+  }
+  // Bytes queued on the outgoing connections and not yet written (robust to
+  // unreachable peers; see the definition).
+  int64_t PendingBytes();
   std::vector<ReplicaInfo> GetClientReplicas();
 
  protected:
@@ -105,6 +115,8 @@ class ReplicaCommunicator {
     std::unique_ptr<BatchQueue<std::unique_ptr<QueueItem>>>> single_bq_;
   std::vector<std::thread> single_thread_;
   int tcp_batch_;
+  std::atomic<int> batch_timeout_us_{10000};
+  std::atomic<int> single_batch_timeout_us_{50000};
   std::mutex smutex_;
 };
 

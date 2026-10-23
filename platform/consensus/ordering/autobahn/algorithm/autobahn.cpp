@@ -2,18 +2,45 @@
 
 #include <glog/logging.h>
 
+#include <pthread.h>
+
+#include <cmath>
+#include <cstdio>
+
 #include <algorithm>
 
 #include "common/crypto/signature_verifier.h"
 #include "common/utils/utils.h"
+#include "platform/networkstrate/traffic.h"
 
 namespace resdb {
 namespace autobahn {
 
 namespace {
 
-constexpr size_t kEchoFlushSize = 256;
-constexpr int64_t kEchoFlushUs = 1000;
+constexpr size_t kEchoFlushSize = 512;
+constexpr int64_t kEchoFlushUs = 2000;
+// Client transactions are shed once a shard's input queue holds this many.
+constexpr size_t kMaxInbox = 20000;
+// Bodies (and the seen-set entry) are kept this long after execution, so
+// that lagging replicas can still fetch them.
+constexpr int64_t kBodyRetentionUs = 2000000;
+constexpr size_t kBodyQueryMax = 1000;
+constexpr int kSenderThreads = 4;
+// Admission control: adjusted every period; outgoing backlog watermarks.
+constexpr int64_t kAdmissionPeriodUs = 10000;   // fast path
+constexpr int kModelPeriods = 10;                 // model: every 100 ms
+constexpr double kMinAdmitRate = 1000;            // tx/s
+constexpr double kInitialAdmitRate = 5000;        // tx/s, before any estimate
+constexpr double kLinkBudget = 0.75;              // share of line rate
+// Approximate wire sizes (bytes) of a client request, an echo and a Car
+// entry, for the capacity prior.
+constexpr double kClientBytes = 340;
+constexpr double kEchoBytes = 260;
+constexpr double kCarItemBytes = 45;
+constexpr int64_t kBacklogHigh = 1 << 20;
+constexpr int64_t kBacklogLow = 256 << 10;
+constexpr size_t kVerifiedCache = 1 << 16;
 constexpr size_t kRecentCars = 256;  // committed Cars kept to answer queries
 // Blame timers start at the first proposal, or after this many Delta if none
 // arrives (replicas of a deployment start within this window).
@@ -29,6 +56,17 @@ void PutI32(std::string* s, int32_t v) {
 }
 
 std::string ZeroHash() { return std::string(32, '\0'); }
+
+// Bytes this replica's node has read and written so far.  The co-located
+// client's outgoing traffic is not visible here; it is approximated by the
+// client traffic this replica receives (clients broadcast to every replica).
+bool ReadTraffic(int64_t* rx, int64_t* tx) {
+  *rx = NetworkTraffic::RxBytes().load(std::memory_order_relaxed);
+  *tx = NetworkTraffic::TxBytes().load(std::memory_order_relaxed) +
+        NetworkTraffic::ClientRxBytes().load(std::memory_order_relaxed);
+  return true;
+}
+
 
 }  // namespace
 
@@ -52,13 +90,18 @@ AutoBahn::AutoBahn(int id, int f, int total_num, int block_size,
   } else {
     ol_ = std::make_unique<OlOrderer>(n_, f_);
   }
+  for (int k = 0; k < std::max(1, params_.dissemination_threads); ++k) {
+    shards_.push_back(std::make_unique<Shard>());
+  }
+  own_rate_ = kInitialAdmitRate;
+  capacity_ = 1e9;
   last_car_hash_ = ZeroHash();
   int64_t now = Now();
   last_seal_ = last_activity_ = view_start_ = start_time_ = now;
 
   LOG(ERROR) << "Pearl-" << (bof_ ? "BOF" : "OL") << " replica " << id_
              << " n=" << n_ << " f=" << f_ << " block_size=" << block_size_
-             << " Delta=" << params_.delta_us << "us"
+             << " Delta=" << params_.delta_us << "us shards=" << shards_.size()
              << (bof_ ? " theta=" + std::to_string(bof_orderer_->Theta()) : "");
 }
 
@@ -66,13 +109,107 @@ AutoBahn::~AutoBahn() {
   Stop();
   event_cv_.notify_all();
   exec_cv_.notify_all();
+  send_cv_.notify_all();
+  for (auto& t : send_threads_) {
+    if (t.joinable()) t.join();
+  }
+  for (auto& s : shards_) s->in_cv.notify_all();
   if (protocol_thread_.joinable()) protocol_thread_.join();
   if (execution_thread_.joinable()) execution_thread_.join();
+  settle_cv_.notify_all();
+  if (settle_thread_.joinable()) settle_thread_.join();
+  for (auto& s : shards_) {
+    if (s->thread.joinable()) s->thread.join();
+  }
 }
 
 void AutoBahn::Start() {
   protocol_thread_ = std::thread(&AutoBahn::ProtocolLoop, this);
+  pthread_setname_np(protocol_thread_.native_handle(), "pearl-protocol");
   execution_thread_ = std::thread(&AutoBahn::ExecutionLoop, this);
+  pthread_setname_np(execution_thread_.native_handle(), "pearl-exec");
+  if (bof_) {
+    settle_thread_ = std::thread(&AutoBahn::SettleLoop, this);
+    pthread_setname_np(settle_thread_.native_handle(), "pearl-settle");
+  }
+  for (int k = 0; k < kSenderThreads; ++k) {
+    send_threads_.emplace_back(&AutoBahn::SendLoop, this);
+    pthread_setname_np(send_threads_.back().native_handle(), "pearl-send");
+  }
+  for (size_t k = 0; k < shards_.size(); ++k) {
+    shards_[k]->thread = std::thread(&AutoBahn::ShardLoop, this, shards_[k].get());
+    pthread_setname_np(shards_[k]->thread.native_handle(),
+                       ("pearl-shard-" + std::to_string(k)).c_str());
+  }
+}
+
+// ============================================================
+// Sending
+// ============================================================
+
+int AutoBahn::Broadcast(int msg_type, const google::protobuf::Message& msg) {
+  return SendMessage(msg_type, msg, 0);
+}
+
+int AutoBahn::SendMessage(int msg_type, const google::protobuf::Message& msg,
+                          int node_id) {
+  Outgoing out;
+  out.type = msg_type;
+  out.target = node_id;
+  out.queued = Now();
+  out.msg.reset(msg.New());
+  out.msg->CopyFrom(msg);
+  {
+    std::lock_guard<std::mutex> lk(send_mu_);
+    send_queue_.push_back(std::move(out));
+  }
+  send_cv_.notify_one();
+  return 0;
+}
+
+void AutoBahn::SendLoop() {
+  while (true) {
+    Outgoing out;
+    {
+      std::unique_lock<std::mutex> lk(send_mu_);
+      send_cv_.wait_for(lk, std::chrono::milliseconds(10),
+                        [&] { return !send_queue_.empty() || IsStop(); });
+      if (send_queue_.empty()) {
+        if (IsStop()) return;
+        continue;
+      }
+      out = std::move(send_queue_.front());
+      send_queue_.pop_front();
+      int64_t wait = Now() - out.queued;
+      static int64_t last_report = 0;
+      if (wait > params_.delta_us / 5 && Now() - last_report > 1000000) {
+        last_report = Now();
+        LOG(ERROR) << "send queue: " << send_queue_.size() << " waiting, oldest "
+                   << wait << "us";
+      }
+    }
+    if (out.prepare) out.prepare(out.msg.get());
+    if (out.target == 0) {
+      ProtocolBase::Broadcast(out.type, *out.msg);
+    } else {
+      ProtocolBase::SendMessage(out.type, *out.msg, out.target);
+    }
+  }
+}
+
+bool AutoBahn::CheckVerified(const std::string& key) {
+  std::lock_guard<std::mutex> lk(verified_mu_);
+  return verified_.contains(key);
+}
+
+void AutoBahn::MarkVerified(const std::string& key) {
+  std::lock_guard<std::mutex> lk(verified_mu_);
+  if (!verified_.insert(key).second) return;
+  verified_order_.push_back(key);
+  if (verified_order_.size() > kVerifiedCache) {
+    verified_.erase(verified_order_.front());
+    verified_order_.pop_front();
+  }
 }
 
 // ============================================================
@@ -114,127 +251,251 @@ void AutoBahn::ProtocolLoop() {
                          [&] { return !events_.empty() || IsStop(); });
       batch.swap(events_);
     }
+    int64_t start = Now();
     for (auto& fn : batch) fn();
+    int64_t events = Now() - start;
+    if (events > 20000) {
+      LOG(ERROR) << "protocol thread: " << batch.size() << " events took " << events << "us";
+    }
     Tick();
   }
 }
 
 void AutoBahn::Tick() {
   int64_t now = Now();
-  CloseCollectionWindows();
+  int64_t mark = now;
+  auto step = [&](const char* name) {
+    int64_t t = Now();
+    if (t - mark > 20000) LOG(ERROR) << "protocol thread: " << name << " took " << (t - mark) << "us";
+    mark = t;
+  };
+  if (now - last_admission_ >= kAdmissionPeriodUs) {
+    last_admission_ = now;
+    AdjustAdmission();
+  }
+  step("admission");
   MaybeHeartbeat();
   MaybeSealCar();
-  if (!echo_out_.empty() && now - last_echo_flush_ >= kEchoFlushUs) {
-    FlushEchoes();
-  }
+  step("seal");
+  AdvanceLanes();
   RequestMissingCars();
+  step("lanes");
   CheckDelinquencyTimers();
   ProcessPendingVotes();
+  step("votes");
   CheckCommitTimers();
   ProcessPendingCommits();
+  step("commits");
   CheckBlame();
   if (!in_view_ && now - quit_time_ >= 2 * params_.delta_us) EnterNextView();
   MaybePropose();
+  step("propose");
 }
 
 // ============================================================
 // Dissemination layer (Sec. 5.2, Alg. 1)
 // ============================================================
 
-bool AutoBahn::ReceiveTransaction(std::unique_ptr<Transaction> txn) {
-  int64_t now = Now();
-  txn->set_create_time(now);
-  {
-    std::lock_guard<std::mutex> lk(create_mutex_);
-    create_times_.emplace(txn->hash(), now);
+AutoBahn::Shard& AutoBahn::ShardOf(const TxnId& id) {
+  uint64_t v;
+  std::memcpy(&v, id.b.data() + 8, sizeof(v));  // bytes the hash maps skip
+  return *shards_[v % shards_.size()];
+}
+
+void AutoBahn::Route(std::vector<Incoming> items) {
+  if (items.empty()) return;
+  if (shards_.size() == 1) {
+    Shard& s = *shards_[0];
+    {
+      std::lock_guard<std::mutex> lk(s.in_mu);
+      for (auto& in : items) s.inbox.push_back(std::move(in));
+      s.inbox_size = s.inbox.size();
+    }
+    s.in_cv.notify_one();
+    return;
   }
-  auto t = std::make_shared<Transaction>(std::move(*txn));
-  Post([this, t] { OnFirstReceive(*t); });
+  std::vector<std::vector<Incoming>> parts(shards_.size());
+  for (auto& in : items) {
+    uint64_t v;
+    std::memcpy(&v, in.id.b.data() + 8, sizeof(v));
+    parts[v % shards_.size()].push_back(std::move(in));
+  }
+  for (size_t k = 0; k < parts.size(); ++k) {
+    if (parts[k].empty()) continue;
+    Shard& s = *shards_[k];
+    {
+      std::lock_guard<std::mutex> lk(s.in_mu);
+      for (auto& in : parts[k]) s.inbox.push_back(std::move(in));
+      s.inbox_size = s.inbox.size();
+    }
+    s.in_cv.notify_one();
+  }
+}
+
+// A transaction from a client.
+//
+// Admission control: beyond capacity, queues (outgoing connections, shard
+// inputs) would grow until messages miss the synchrony bound Delta.  A
+// replica therefore admits a client transaction only if a value derived
+// from id(t) lies below its admission threshold, which AdjustAdmission
+// lowers under backlog and raises otherwise.  The rule is the same at every
+// replica, so replicas with similar load admit nearly the same transactions
+// (the sets are nested), and a transaction that one replica sheds is not
+// still disseminated by all others.  Echoes and fetched bodies are never
+// shed.
+bool AutoBahn::ReceiveTransaction(std::string data) {
+  Incoming in;
+  in.id = TxnId::From(SignatureVerifier::CalculateHash(data));
+  client_arrivals_.fetch_add(1, std::memory_order_relaxed);
+  uint32_t rank;
+  std::memcpy(&rank, in.id.b.data() + 16, sizeof(rank));
+  if (static_cast<int>(rank % kAdmitAll) >= admit_.load(std::memory_order_relaxed) ||
+      ShardOf(in.id).inbox_size.load(std::memory_order_relaxed) > kMaxInbox) {
+    int64_t d = ++dropped_;
+    if (d % 100000 == 1) {
+      LOG(ERROR) << "overload: shed " << d << " client transactions (admitting "
+                 << admit_.load() / (kAdmitAll / 100) << "%)";
+    }
+    return false;
+  }
+  in.data = std::make_shared<const std::string>(std::move(data));
+  in.client_time = Now();
+  std::vector<Incoming> v;
+  v.push_back(std::move(in));
+  Route(std::move(v));
   return true;
 }
 
-// OnFirstReceive (Alg. 1): attest t in the TEE and echo it with the evidence.
-void AutoBahn::OnFirstReceive(const Transaction& txn) {
-  const std::string& id = txn.hash();
-  int64_t now = Now();
-  last_activity_ = now;
-  if (!seen_.insert(id).second) return;
-
-  TeeHost::SignedIndicator own;
-  own.signer = id_;
-  bool attested = bof_ ? tee_->BofPlace(id, &own.value, &own.tag)
-                       : tee_->OlAttest(id, &own.value, &own.tag);
-  if (!attested) return;  // already in the enclave's history H
-
-  TxnRecord& rec = txns_[id];
-  rec.first_seen = now;
-  rec.evidence[id_] = own;
-  bodies_[id] = txn;
-  windows_.emplace_back(now + 2 * params_.delta_us, id);
-  QueueEcho(txn, own.value, own.tag);
-
-  if (bof_ && ++open_count_ >= block_size_) SealCar();
-}
-
-void AutoBahn::QueueEcho(const Transaction& txn, int64_t value,
-                         const std::string& tag) {
-  Echo echo;
-  *echo.mutable_txn() = txn;
-  echo.set_value(value);
-  echo.set_tee_tag(tag);
-  echo_out_.push_back(std::move(echo));
-  if (echo_out_.size() >= kEchoFlushSize) FlushEchoes();
-}
-
-// Echoes are sent in small batches; each echo is still an individual
-// retransmission of t with this replica's evidence.
-void AutoBahn::FlushEchoes() {
-  if (echo_out_.empty()) return;
-  EchoBatch batch;
-  batch.set_sender_id(id_);
-  for (auto& e : echo_out_) *batch.add_echoes() = std::move(e);
-  echo_out_.clear();
-  last_echo_flush_ = Now();
-  Broadcast(MessageType::Echo_Batch, batch);
-}
-
-// OnReceiveOLEcho / OnReceiveBOFEcho: verify, then store.  Verification is
-// stateless and runs on the network thread.
+// OnReceiveOLEcho / OnReceiveBOFEcho: TEE.Verify each echo (stateless, on
+// the network thread), then hand it to the transaction's shard.
 void AutoBahn::ReceiveEchoBatch(std::unique_ptr<EchoBatch> batch) {
   const int sender = batch->sender_id();
   if (sender == id_ || sender < 1 || sender > n_) return;
-  std::vector<TeeHost::VerifyItem> items;
-  std::vector<int> index;
-  for (int i = 0; i < batch->echoes_size(); ++i) {
-    const Echo& e = batch->echoes(i);
-    if (SignatureVerifier::CalculateHash(e.txn().data()) != e.txn().hash()) {
-      continue;
-    }
-    items.push_back({bof_ ? TeeHost::BofPlacementMsg(sender, e.txn().hash(), e.value())
-                          : TeeHost::OlTimestampMsg(sender, e.txn().hash(), e.value()),
-                     e.tee_tag()});
-    index.push_back(i);
+  const int m = batch->echoes_size();
+  std::vector<Incoming> items(m);
+  std::vector<TeeHost::VerifyItem> verify(m);
+  for (int i = 0; i < m; ++i) {
+    Echo* e = batch->mutable_echoes(i);
+    std::string hash = SignatureVerifier::CalculateHash(e->data());
+    items[i].id = TxnId::From(hash);
+    verify[i].msg = bof_ ? TeeHost::BofPlacementMsg(sender, hash, e->value())
+                         : TeeHost::OlTimestampMsg(sender, hash, e->value());
+    verify[i].tag = e->tee_tag();
   }
-  std::vector<bool> ok = tee_->VerifyBatch(items);
-  auto verified = std::make_shared<EchoBatch>();
-  verified->set_sender_id(sender);
-  for (size_t k = 0; k < index.size(); ++k) {
-    if (ok[k]) *verified->add_echoes() = std::move(*batch->mutable_echoes(index[k]));
+  std::vector<bool> ok = tee_->VerifyBatch(verify);
+  std::vector<Incoming> good;
+  good.reserve(m);
+  for (int i = 0; i < m; ++i) {
+    if (!ok[i]) continue;
+    Echo* e = batch->mutable_echoes(i);
+    Incoming& in = items[i];
+    in.data = std::make_shared<const std::string>(std::move(*e->mutable_data()));
+    in.signer = sender;
+    in.value = e->value();
+    std::memcpy(in.tag.data(), e->tee_tag().data(), TeeHost::kTagLen);
+    good.push_back(std::move(in));
   }
-  if (verified->echoes_size() == 0) return;
-  Post([this, verified] { HandleEchoBatch(*verified); });
+  Route(std::move(good));
 }
 
-void AutoBahn::HandleEchoBatch(const EchoBatch& batch) {
-  for (const Echo& e : batch.echoes()) {
-    OnFirstReceive(e.txn());
-    auto it = txns_.find(e.txn().hash());
-    if (it == txns_.end()) continue;  // window already closed
-    TeeHost::SignedIndicator ind;
-    ind.signer = batch.sender_id();
-    ind.value = e.value();
-    ind.tag = e.tee_tag();
-    it->second.evidence.emplace(ind.signer, std::move(ind));
+void AutoBahn::ShardLoop(Shard* shard) {
+  Shard& s = *shard;
+  while (!IsStop() && !network_ready_) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  std::vector<Incoming> batch;
+  std::vector<TxnId> gc;
+  while (!IsStop()) {
+    {
+      std::unique_lock<std::mutex> lk(s.in_mu);
+      s.in_cv.wait_for(lk, std::chrono::milliseconds(1),
+                       [&] { return !s.inbox.empty() || IsStop(); });
+      batch.swap(s.inbox);
+      gc.swap(s.gc_inbox);
+      s.inbox_size = 0;
+    }
+    int64_t now = Now();
+    if (!gc.empty()) {
+      s.gc_pending.emplace_back(now + kBodyRetentionUs, std::move(gc));
+      gc.clear();
+    }
+    {
+      std::lock_guard<std::mutex> lk(s.mu);
+      if (!batch.empty()) ShardFirstReceive(s, batch);
+      ShardCloseWindows(s);
+      while (!s.gc_pending.empty() && s.gc_pending.front().first <= now) {
+        for (const TxnId& id : s.gc_pending.front().second) {
+          s.seen.erase(id);
+          s.bodies.erase(id);
+        }
+        s.gc_pending.pop_front();
+      }
+    }
+    batch.clear();
+    FlushEchoes(s, false);
+  }
+}
+
+// OnFirstReceive (Alg. 1) for a batch: the enclave attests every
+// transaction this replica sees for the first time (OL timestamp, BOF
+// placement), which is then echoed with that evidence; echoes received from
+// other replicas add their evidence to the collection window.
+void AutoBahn::ShardFirstReceive(Shard& s, std::vector<Incoming>& batch) {
+  const int64_t now = Now();
+  std::string ids;
+  std::vector<Incoming*> fresh;
+  for (Incoming& in : batch) {
+    if (in.client_time > 0) {
+      auto b = s.bodies.find(in.id);
+      if (b != s.bodies.end()) b->second.from_client = true;
+    }
+    if (!s.seen.insert(in.id).second) continue;
+    ids.append(reinterpret_cast<const char*>(in.id.b.data()), 32);
+    fresh.push_back(&in);
+  }
+  if (!fresh.empty()) {
+    last_activity_.store(now, std::memory_order_relaxed);
+    std::vector<int64_t> values;
+    std::vector<uint8_t> ok;
+    std::string tags;
+    tee_->AttestBatch(reinterpret_cast<const uint8_t*>(ids.data()),
+                      static_cast<uint32_t>(fresh.size()), &values, &tags, &ok);
+    int placed = 0;
+    for (size_t i = 0; i < fresh.size(); ++i) {
+      Incoming& in = *fresh[i];
+      if (!ok[i]) continue;  // already in the enclave's history H
+      ++placed;
+      Record& rec = s.open[in.id];
+      rec.first_seen = now;
+      Evidence own;
+      own.signer = id_;
+      own.value = values[i];
+      std::memcpy(own.tag.data(), tags.data() + i * TeeHost::kTagLen,
+                  TeeHost::kTagLen);
+      rec.evidence.push_back(own);
+      s.bodies[in.id] = Body{in.data, in.client_time > 0 ? in.client_time : now,
+                             in.client_time > 0};
+      s.windows.emplace_back(now + 2 * params_.delta_us, in.id);
+      Echo* e = s.echo_out.add_echoes();
+      e->set_data(*in.data);
+      e->set_value(values[i]);
+      e->set_tee_tag(tags.data() + i * TeeHost::kTagLen, TeeHost::kTagLen);
+      if (s.echo_since == 0) s.echo_since = now;
+    }
+    if (bof_ && placed > 0) bof_open_count_ += placed;
+  }
+  for (const Incoming& in : batch) {
+    if (in.signer == 0) continue;
+    auto it = s.open.find(in.id);
+    if (it == s.open.end()) continue;  // window already closed
+    bool dup = false;
+    for (const Evidence& e : it->second.evidence) dup |= e.signer == in.signer;
+    if (dup) continue;
+    Evidence e;
+    e.signer = in.signer;
+    e.value = in.value;
+    e.tag = in.tag;
+    it->second.evidence.push_back(e);
   }
 }
 
@@ -243,47 +504,287 @@ void AutoBahn::HandleEchoBatch(const EchoBatch& batch) {
 //        placed in the next Car.
 //   BOF: the enclave records the collected placement announcements, closing
 //        t's window and advancing (w_r, M_r).
-void AutoBahn::CloseCollectionWindows() {
-  int64_t now = Now();
-  auto process = [&](std::deque<std::pair<int64_t, std::string>>& queue) {
-    while (!queue.empty() && queue.front().first <= now) {
-      std::string id = queue.front().second;
-      queue.pop_front();
-      auto it = txns_.find(id);
-      if (it == txns_.end()) continue;
-      std::vector<TeeHost::SignedIndicator> ev;
-      ev.reserve(it->second.evidence.size());
-      for (const auto& e : it->second.evidence) ev.push_back(e.second);
-
+void AutoBahn::ShardCloseWindows(Shard& s) {
+  const int64_t now = Now();
+  std::vector<TxnId> due;
+  for (auto* q : {&s.windows, &s.retry}) {
+    while (!q->empty() && q->front().first <= now) {
+      due.push_back(q->front().second);
+      q->pop_front();
+    }
+  }
+  if (due.empty()) return;
+  std::string collected;
+  std::vector<TxnId> ids;
+  ids.reserve(due.size());
+  for (const TxnId& id : due) {
+    auto it = s.open.find(id);
+    if (it == s.open.end()) continue;
+    const auto& ev = it->second.evidence;
+    TeeHost::AppendCollected(&collected, id.b.data(), static_cast<uint32_t>(ev.size()));
+    for (const Evidence& e : ev) {
+      TeeHost::AppendRecord(&collected, e.signer, e.value, e.tag.data());
+    }
+    ids.push_back(id);
+  }
+  std::vector<int64_t> keys;
+  std::vector<uint8_t> ok;
+  tee_->CloseWindowsBatch(collected, static_cast<uint32_t>(ids.size()), &keys, &ok);
+  std::vector<TeeHost::OlItem> keyed;
+  for (size_t i = 0; i < ids.size(); ++i) {
+    if (!ok[i]) {
       if (bof_) {
-        if (!tee_->BofRecordAnnouncements(id, ev)) {
-          LOG(ERROR) << "BOF: enclave refused announcements for a transaction";
-        }
-        txns_.erase(it);
-        continue;
-      }
-      int64_t key = 0;
-      if (!tee_->OlLocalKey(id, ev, &key)) {
+        LOG(ERROR) << "BOF: enclave refused announcements for a transaction";
+        s.open.erase(ids[i]);
+      } else {
         // Fewer than f+1 genuine timestamps so far: not reachable when the
         // synchrony bound holds.  Keep collecting and retry; the completion
         // frontier cannot pass t meanwhile.
-        retry_windows_.emplace_back(now + params_.delta_us, id);
-        continue;
+        s.retry.emplace_back(now + params_.delta_us, ids[i]);
       }
-      txns_.erase(it);
-      ol_open_.push_back({id, key});
-      if (static_cast<int>(ol_open_.size()) >= block_size_) SealCar();
+      continue;
     }
-  };
-  process(windows_);
-  process(retry_windows_);
+    s.open.erase(ids[i]);
+    if (!bof_) keyed.push_back({ids[i].Str(), keys[i]});
+  }
+  if (!keyed.empty()) {
+    std::lock_guard<std::mutex> lk(ol_mu_);
+    for (auto& k : keyed) ol_open_.push_back(std::move(k));
+  }
+}
+
+// Echoes are sent in batches; each echo is still an individual
+// retransmission of t with this replica's evidence.
+void AutoBahn::FlushEchoes(Shard& s, bool force) {
+  if (s.echo_out.echoes_size() == 0) return;
+  if (!force && s.echo_out.echoes_size() < static_cast<int>(kEchoFlushSize) &&
+      Now() - s.echo_since < kEchoFlushUs) {
+    return;
+  }
+  s.echo_out.set_sender_id(id_);
+  echo_bytes_ += static_cast<int64_t>(s.echo_out.ByteSizeLong()) * (n_ - 1);
+  echoed_txns_ += s.echo_out.echoes_size();
+  if (bulk_send_) {
+    // Sent from the shard thread on the bulk connections, so that echoes
+    // never queue ahead of consensus and lane messages.
+    bulk_send_(MessageType::Echo_Batch, s.echo_out);
+  } else {
+    Broadcast(MessageType::Echo_Batch, s.echo_out);
+  }
+  s.echo_out.Clear();
+  s.echo_since = 0;
+}
+
+std::vector<TxnId> AutoBahn::CarTxnIds(const Car& car) const {
+  std::vector<TxnId> ids;
+  if (!bof_) {
+    ids.reserve(car.ol_items_size());
+    for (const OlCarItem& it : car.ol_items()) ids.push_back(TxnId::From(it.txn_hash()));
+  } else {
+    ids.reserve(car.bof_items_size());
+    for (int i = 0; i < car.bof_items_size(); ++i) {
+      if (!car.bof_heartbeat(i)) ids.push_back(TxnId::From(car.bof_items(i)));
+    }
+  }
+  return ids;
+}
+
+std::vector<TxnId> AutoBahn::MissingBodies(const std::vector<TxnId>& ids) {
+  std::vector<std::vector<const TxnId*>> parts(shards_.size());
+  for (const TxnId& id : ids) {
+    uint64_t v;
+    std::memcpy(&v, id.b.data() + 8, sizeof(v));
+    parts[v % shards_.size()].push_back(&id);
+  }
+  std::vector<TxnId> missing;
+  for (size_t k = 0; k < parts.size(); ++k) {
+    if (parts[k].empty()) continue;
+    Shard& s = *shards_[k];
+    std::lock_guard<std::mutex> lk(s.mu);
+    for (const TxnId* id : parts[k]) {
+      if (!s.bodies.contains(*id)) missing.push_back(*id);
+    }
+  }
+  return missing;
+}
+
+// Check (ii): this replica's own collection window closed for every given
+// transaction, i.e. it received each at least 2 Delta ago.
+bool AutoBahn::WindowsClosed(const std::vector<TxnId>& ids) {
+  const int64_t now = Now();
+  std::vector<std::vector<const TxnId*>> parts(shards_.size());
+  for (const TxnId& id : ids) {
+    uint64_t v;
+    std::memcpy(&v, id.b.data() + 8, sizeof(v));
+    parts[v % shards_.size()].push_back(&id);
+  }
+  for (size_t k = 0; k < parts.size(); ++k) {
+    if (parts[k].empty()) continue;
+    Shard& s = *shards_[k];
+    std::lock_guard<std::mutex> lk(s.mu);
+    for (const TxnId* id : parts[k]) {
+      if (!s.seen.contains(*id)) return false;
+      auto it = s.open.find(*id);
+      if (it != s.open.end() && now < it->second.first_seen + 2 * params_.delta_us) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// Fetch transaction bodies referenced by a Car: from its lane's owner
+// (target > 0) or from every replica (target == 0).
+void AutoBahn::RequestBodies(const std::vector<TxnId>& ids, int target) {
+  for (size_t i = 0; i < ids.size(); i += kBodyQueryMax) {
+    BodyQuery q;
+    q.set_requester(id_);
+    for (size_t j = i; j < ids.size() && j < i + kBodyQueryMax; ++j) {
+      q.add_ids(ids[j].Str());
+    }
+    if (target > 0) {
+      SendMessage(MessageType::Body_Query, q, target);
+    } else {
+      Broadcast(MessageType::Body_Query, q);
+    }
+  }
+}
+
+void AutoBahn::ReceiveBodyQuery(std::unique_ptr<BodyQuery> query) {
+  if (query->requester() < 1 || query->requester() > n_ ||
+      query->requester() == id_) {
+    return;
+  }
+  BodyReply reply;
+  reply.set_sender_id(id_);
+  for (const std::string& raw : query->ids()) {
+    TxnId id = TxnId::From(raw);
+    Shard& s = ShardOf(id);
+    std::lock_guard<std::mutex> lk(s.mu);
+    auto it = s.bodies.find(id);
+    if (it != s.bodies.end()) reply.add_data(*it->second.data);
+  }
+  if (reply.data_size() > 0) {
+    SendMessage(MessageType::Body_Reply, reply, query->requester());
+  }
+}
+
+// A body received in reply to a fetch is a transaction received "from
+// another replica in a Car" (Sec. 5.2): it goes through OnFirstReceive.
+void AutoBahn::ReceiveBodyReply(std::unique_ptr<BodyReply> reply) {
+  std::vector<Incoming> items;
+  items.reserve(reply->data_size());
+  for (std::string& data : *reply->mutable_data()) {
+    Incoming in;
+    in.id = TxnId::From(SignatureVerifier::CalculateHash(data));
+    in.data = std::make_shared<const std::string>(std::move(data));
+    items.push_back(std::move(in));
+  }
+  Route(std::move(items));
+}
+
+
+// Keeps the link below saturation: a saturated 1 Gbps port drops packets,
+// and TCP's retransmission timeout (>= 200 ms) then delays every message,
+// consensus included, far beyond Delta.
+//
+// Each replica controls an admitted rate R (transactions/s):
+//  - every 100 ms it estimates its capacity, the transactions per second it
+//    can disseminate while its link stays at 75% of line rate: the budget
+//    (75% of the link minus the other traffic it measures) over the bytes
+//    it sends per transaction, capped by a prior computed from message
+//    sizes.  R drops to that capacity at once, and grows towards it by at
+//    most 5% per period, and only while client demand exceeds R (slow start,
+//    so a load burst cannot saturate the link before the estimate catches
+//    up);
+//  - every 10 ms, a backed-up queue (bytes not yet on the wire, shard
+//    inputs) halves R.
+// R is reported in the replica's Cars; every replica uses the (f+1)-th
+// smallest recent R, so correct replicas agree on it and f faulty replicas
+// cannot starve admission.  The admitted fraction is that rate over the
+// client arrival rate, which all replicas observe alike (clients broadcast),
+// so correct replicas admit the same transactions.
+void AutoBahn::AdjustAdmission() {
+  const double link = static_cast<double>(params_.link_bytes_per_sec);
+  const double tick = kAdmissionPeriodUs / 1e6;
+  const int64_t arrived = client_arrivals_.exchange(0);
+  window_arrivals_ += arrived;
+  arrival_rate_ = 0.5 * arrival_rate_ + 0.5 * (arrived / tick);
+
+  int64_t backlog = outbound_backlog_ ? outbound_backlog_() : 0;
+  size_t inbox = 0;
+  for (const auto& s : shards_) inbox = std::max(inbox, s->inbox_size.load());
+  if (backlog > kBacklogHigh || inbox > kMaxInbox / 4) {
+    own_rate_ = std::max(kMinAdmitRate, own_rate_ * 0.5);
+  }
+
+  if (++admission_ticks_ >= kModelPeriods) {
+    admission_ticks_ = 0;
+    const double secs = kModelPeriods * tick;
+    const double demand = window_arrivals_ / secs;
+    window_arrivals_ = 0;
+    const double echo_rate = echo_bytes_.exchange(0) / secs;
+    const double echoed = echoed_txns_.exchange(0) / secs;
+    int64_t rx = 0, tx = 0;
+    ReadTraffic(&rx, &tx);
+    double used = 0;
+    if (nic_rx_ >= 0) used = std::max(rx - nic_rx_, tx - nic_tx_) / secs;
+    nic_rx_ = rx;
+    nic_tx_ = tx;
+    // Prior: each admitted transaction costs about (n-1) echoes and Car
+    // entries in each direction, each offered one a client copy; the
+    // measured estimate may only lower it.
+    const double prior =
+        std::max(0.0, kLinkBudget * link - demand * kClientBytes) /
+        ((n_ - 1) * (kEchoBytes + kCarItemBytes));
+    double estimate = prior;
+    if (echoed > 0) {
+      double per_txn = echo_rate / echoed * (kEchoBytes + kCarItemBytes) / kEchoBytes;
+      double budget = std::max(0.0, kLinkBudget * link - std::max(0.0, used - echo_rate));
+      estimate = std::min(prior, budget / per_txn);
+    }
+    capacity_ = std::min(prior, 0.5 * capacity_ + 0.5 * estimate);
+    if (own_rate_ > capacity_) {
+      own_rate_ = capacity_;
+    } else if (demand > own_rate_) {
+      own_rate_ = std::min(capacity_, own_rate_ * 1.05 + 100);
+    }
+    own_rate_ = std::max(kMinAdmitRate, own_rate_);
+    link_used_ = used;
+  }
+
+  const int64_t now = Now();
+  std::vector<double> rates = {own_rate_};
+  for (int j = 1; j <= n_; ++j) {
+    if (j != id_ && lanes_[j].admit_at > 0 &&
+        now - lanes_[j].admit_at <= 2 * params_.delta_us) {
+      rates.push_back(lanes_[j].admit_rate);
+    }
+  }
+  std::sort(rates.begin(), rates.end());
+  double effective = static_cast<int>(rates.size()) > f_ ? rates[f_] : rates.front();
+  int admit = arrival_rate_ <= effective
+                  ? kAdmitAll
+                  : static_cast<int>(kAdmitAll * effective / arrival_rate_);
+  admit_ = std::max(1, admit);
+  static int64_t last_report = 0;
+  if (now - last_report > 1000000) {
+    last_report = now;
+    LOG(ERROR) << "admission: " << admit_ / (kAdmitAll / 100) << "% of "
+               << static_cast<int64_t>(arrival_rate_) << " tx/s (rate "
+               << static_cast<int64_t>(effective) << ", own "
+               << static_cast<int64_t>(own_rate_) << ", capacity "
+               << static_cast<int64_t>(capacity_) << ", link "
+               << static_cast<int64_t>(link_used_ / 1000000) << " MB/s, backlog "
+               << backlog << " B)";
+  }
 }
 
 // Heartbeat (Sec. 5.2): when no transaction has arrived for a configurable
 // period, have the enclave issue a fresh indicator so frontiers keep moving.
 void AutoBahn::MaybeHeartbeat() {
   int64_t now = Now();
-  if (now - last_activity_ < params_.heartbeat_us ||
+  if (now - last_activity_.load(std::memory_order_relaxed) < params_.heartbeat_us ||
       now - last_heartbeat_ < params_.heartbeat_us) {
     return;
   }
@@ -292,7 +793,7 @@ void AutoBahn::MaybeHeartbeat() {
   if (!tee_->Heartbeat(&id, &value)) return;
   last_heartbeat_ = now;
   if (bof_) {
-    ++open_count_;
+    ++bof_open_count_;
   } else {
     heartbeat_since_seal_ = true;
   }
@@ -301,9 +802,20 @@ void AutoBahn::MaybeHeartbeat() {
 // A Car is sealed once full (checked on insertion) or once X = Delta has
 // elapsed since the previous seal.
 void AutoBahn::MaybeSealCar() {
-  bool nonempty = bof_ ? open_count_ > 0
-                       : (!ol_open_.empty() || heartbeat_since_seal_);
-  if (nonempty && Now() - last_seal_ >= params_.delta_us) SealCar();
+  const bool timer = Now() - last_seal_ >= params_.delta_us;
+  if (bof_) {
+    int open = bof_open_count_.load();
+    if (open >= block_size_ || (open > 0 && timer)) SealCar();
+    return;
+  }
+  size_t open;
+  {
+    std::lock_guard<std::mutex> lk(ol_mu_);
+    open = ol_open_.size();
+  }
+  // A backlog is sealed one full Car at a time.
+  for (; open >= static_cast<size_t>(block_size_); open -= block_size_) SealCar();
+  if ((open > 0 || heartbeat_since_seal_) && timer) SealCar();
 }
 
 // OnCarReady (Alg. 1): the enclave seals the Car and its frontier; the Car
@@ -313,7 +825,15 @@ void AutoBahn::SealCar() {
   Car car;
   if (!bof_) {
     std::vector<TeeHost::OlItem> items;
-    items.swap(ol_open_);
+    {
+      std::lock_guard<std::mutex> lk(ol_mu_);
+      size_t take = std::min(ol_open_.size(), static_cast<size_t>(block_size_));
+      items.reserve(take);
+      for (size_t i = 0; i < take; ++i) {
+        items.push_back(std::move(ol_open_.front()));
+        ol_open_.pop_front();
+      }
+    }
     if (!tee_->OlSealCar(items, &sealed)) {
       LOG(ERROR) << "OL: enclave refused to seal a Car";
       return;
@@ -322,10 +842,6 @@ void AutoBahn::SealCar() {
       OlCarItem* item = car.add_ol_items();
       item->set_txn_hash(it.id);
       item->set_key(it.key);
-      auto body = bodies_.find(it.id);
-      CHECK(body != bodies_.end());
-      *car.add_txns() = std::move(body->second);
-      bodies_.erase(body);
     }
     heartbeat_since_seal_ = false;
   } else {
@@ -336,11 +852,6 @@ void AutoBahn::SealCar() {
     for (const auto& it : sealed.bof_items) {
       car.add_bof_items(it.id);
       car.add_bof_heartbeat(it.heartbeat);
-      if (it.heartbeat) continue;
-      auto body = bodies_.find(it.id);
-      CHECK(body != bodies_.end());
-      *car.add_txns() = std::move(body->second);
-      bodies_.erase(body);
     }
     for (int j = 1; j <= n_; ++j) {
       Announcement* a = car.add_m();
@@ -351,7 +862,7 @@ void AutoBahn::SealCar() {
       a->set_txn_hash(m.id);
       a->set_tee_tag(m.tag);
     }
-    open_count_ = 0;
+    bof_open_count_ -= static_cast<int>(sealed.bof_items.size());
   }
 
   car.set_lane(id_);
@@ -361,6 +872,7 @@ void AutoBahn::SealCar() {
   car.set_tee_tag(sealed.tag);
   car.set_frontier(sealed.frontier);
   car.set_seal_time(Now());
+  car.set_admit(static_cast<int32_t>(own_rate_));
   if (own_poa_.index() > 0) {
     *car.mutable_poa() = own_poa_;
     Lane& own = lanes_[id_];
@@ -375,6 +887,7 @@ void AutoBahn::SealCar() {
 
   Lane& lane = lanes_[id_];
   lane.hashes[car.index()] = car.hash();
+  lane.bodies_held.insert(car.index());
   lane.acked = car.index();
   CarAck self;
   self.set_lane(id_);
@@ -396,6 +909,9 @@ SignInfo AutoBahn::SignAck(const Car& car) {
 }
 
 bool AutoBahn::VerifyPoa(int lane, const Poa& poa) {
+  std::string key = "poa" + poa.car_hash();
+  PutI64(&key, poa.index());
+  if (CheckVerified(key)) return true;
   std::set<int> signers;
   for (const SignInfo& ack : poa.acks()) {
     if (ack.hash() != poa.car_hash() || ack.local_id() != poa.index()) continue;
@@ -404,23 +920,20 @@ bool AutoBahn::VerifyPoa(int lane, const Poa& poa) {
     if (!verifier_->VerifyMessage(poa.car_hash(), ack.sign())) continue;
     signers.insert(ack.sender_id());
   }
-  return static_cast<int>(signers.size()) >= f_ + 1;
+  if (static_cast<int>(signers.size()) < f_ + 1) return false;
+  MarkVerified(key);
+  return true;
 }
 
 // Stateless checks of a received Car: its hash matches its content, the
-// lane's enclave sealed it, bodies match their identifiers, and the embedded
-// PoA holds f+1 acknowledgments.
+// lane's enclave sealed it, and the embedded PoA holds f+1 acknowledgments.
 bool AutoBahn::VerifyCar(const Car& car) {
   if (car.lane() < 1 || car.lane() > n_ || car.index() < 1) return false;
   std::string hash;
   if (!bof_) {
-    if (car.txns_size() != car.ol_items_size()) return false;
     std::vector<TeeHost::OlItem> items;
-    for (int i = 0; i < car.ol_items_size(); ++i) {
-      const auto& it = car.ol_items(i);
-      if (car.txns(i).hash() != it.txn_hash()) return false;
-      items.push_back({it.txn_hash(), it.key()});
-    }
+    items.reserve(car.ol_items_size());
+    for (const OlCarItem& it : car.ol_items()) items.push_back({it.txn_hash(), it.key()});
     hash = TeeHost::OlCarHash(car.lane(), car.index(), car.prev_hash(), items,
                               car.frontier());
   } else {
@@ -429,16 +942,10 @@ bool AutoBahn::VerifyCar(const Car& car) {
       return false;
     }
     std::vector<TeeHost::BofItem> items;
-    int body = 0;
+    items.reserve(car.bof_items_size());
     for (int i = 0; i < car.bof_items_size(); ++i) {
       items.push_back({car.bof_items(i), car.bof_heartbeat(i)});
-      if (car.bof_heartbeat(i)) continue;
-      if (body >= car.txns_size() || car.txns(body).hash() != car.bof_items(i)) {
-        return false;
-      }
-      ++body;
     }
-    if (body != car.txns_size()) return false;
     std::vector<TeeHost::Announcement> m(n_ + 1);
     for (int j = 1; j <= n_; ++j) {
       const Announcement& a = car.m(j - 1);
@@ -451,9 +958,6 @@ bool AutoBahn::VerifyCar(const Car& car) {
                                car.frontier(), m, n_);
   }
   if (hash != car.hash()) return false;
-  for (const Transaction& txn : car.txns()) {
-    if (SignatureVerifier::CalculateHash(txn.data()) != txn.hash()) return false;
-  }
   if (car.poa().index() > 0 &&
       (car.poa().index() >= car.index() || !VerifyPoa(car.lane(), car.poa()))) {
     return false;
@@ -477,31 +981,99 @@ void AutoBahn::ReceiveCar(std::unique_ptr<Car> car) {
 void AutoBahn::HandleCar(const Car& car) {
   Lane& lane = lanes_[car.lane()];
   if (car.poa().index() > 0) LearnCertified(car.lane(), car.poa());
+  if (car.admit() > 0) {
+    lane.admit_rate = car.admit();
+    lane.admit_at = Now();
+  }
   const int64_t idx = car.index();
   if (idx <= lane.acked || lane.buffered.count(idx)) return;
-  // Transactions received for the first time in a Car (Sec. 5.2).
-  for (const Transaction& txn : car.txns()) OnFirstReceive(txn);
   lane.buffered.emplace(idx, car);
+  AdvanceLane(lane);
+}
+
+// Acknowledges buffered Cars in lane order.  A replica acknowledges a Car
+// only once it holds the bodies of all its transactions, so that a PoA's
+// f+1 acknowledgments include a correct replica able to serve them.
+// Missing bodies (transactions received for the first time in a Car,
+// Sec. 5.2) are fetched from the lane's owner, then from every replica.
+void AutoBahn::AdvanceLane(Lane& lane) {
   while (!lane.buffered.empty() && lane.buffered.begin()->first == lane.acked + 1) {
-    Car next = std::move(lane.buffered.begin()->second);
-    lane.buffered.erase(lane.buffered.begin());
+    Car& next = lane.buffered.begin()->second;
     std::string prev = next.index() == 1 ? ZeroHash() : lane.hashes[next.index() - 1];
     if (next.prev_hash() != prev) {
       LOG(ERROR) << "lane " << next.lane() << " Car " << next.index()
                  << " does not extend the acknowledged prefix";
+      lane.buffered.erase(lane.buffered.begin());
       continue;
     }
-    AcceptCar(lane, std::move(next));
+    int64_t now = Now();
+    if (lane.head_index != next.index()) {
+      lane.head_index = next.index();
+      lane.head_missing = MissingBodies(CarTxnIds(next));
+      if (!lane.head_missing.empty()) {
+        RequestBodies(lane.head_missing, next.lane());
+        lane.head_requested = now;
+      }
+    } else if (!lane.head_missing.empty()) {
+      lane.head_missing = MissingBodies(lane.head_missing);
+      if (!lane.head_missing.empty() &&
+          now - lane.head_requested >= 2 * params_.delta_us) {
+        RequestBodies(lane.head_missing, 0);
+        lane.head_requested = now;
+      }
+    }
+    if (!lane.head_missing.empty()) return;
+    if (lane.head_requested > 0) {
+      static int64_t last_report = 0;
+      if (now - lane.head_requested > params_.delta_us / 2 && now - last_report > 1000000) {
+        last_report = now;
+        LOG(ERROR) << "lane " << next.lane() << " Car " << next.index()
+                   << " waited " << (now - lane.head_requested) << "us for bodies";
+      }
+      lane.head_requested = 0;
+    }
+    Car car = std::move(next);
+    lane.buffered.erase(lane.buffered.begin());
+    AcceptCar(lane, std::move(car));
+  }
+}
+
+void AutoBahn::AdvanceLanes() {
+  for (int j = 1; j <= n_; ++j) {
+    Lane& lane = lanes_[j];
+    if (j != id_ && !lane.head_missing.empty()) AdvanceLane(lane);
   }
 }
 
 void AutoBahn::AcceptCar(Lane& lane, Car car) {
-  CarAck ack;
-  ack.set_lane(car.lane());
-  ack.set_index(car.index());
-  ack.set_car_hash(car.hash());
-  *ack.mutable_sign() = SignAck(car);
-  SendMessage(MessageType::Car_Ack, ack, car.lane());
+  // Signed and sent by a sender thread.
+  auto ack = std::make_unique<CarAck>();
+  ack->set_lane(car.lane());
+  ack->set_index(car.index());
+  ack->set_car_hash(car.hash());
+  const int owner = car.lane();
+  const int64_t index = car.index();
+  const std::string hash = car.hash();
+  Outgoing out;
+  out.type = MessageType::Car_Ack;
+  out.target = owner;
+  out.queued = Now();
+  out.prepare = [this, index, hash](google::protobuf::Message* msg) {
+    SignInfo info;
+    info.set_hash(hash);
+    info.set_sender_id(id_);
+    info.set_local_id(index);
+    auto sig = verifier_->SignMessage(hash);
+    if (sig.ok()) *info.mutable_sign() = *sig;
+    *static_cast<CarAck*>(msg)->mutable_sign() = info;
+  };
+  out.msg = std::move(ack);
+  {
+    std::lock_guard<std::mutex> lk(send_mu_);
+    send_queue_.push_back(std::move(out));
+  }
+  send_cv_.notify_one();
+  lane.bodies_held.insert(car.index());
   lane.acked = car.index();
   lane.hashes[car.index()] = car.hash();
   lane.cars.emplace(car.index(), std::move(car));
@@ -594,7 +1166,7 @@ void AutoBahn::ReceiveCarQuery(std::unique_ptr<CarQuery> query) {
     auto it = lane.cars.find(q->index());
     if (it != lane.cars.end()) car = &it->second;
     auto rt = lane.recent.find(q->index());
-    if (car == nullptr && rt != lane.recent.end()) car = &rt->second;
+    if (car == nullptr && rt != lane.recent.end()) car = rt->second.get();
     if (car != nullptr) SendMessage(MessageType::Car_Prop, *car, q->requester());
   });
 }
@@ -604,7 +1176,7 @@ const Car* AutoBahn::FindCar(int lane_id, int64_t index) const {
   auto it = lane.cars.find(index);
   if (it != lane.cars.end()) return &it->second;
   auto rt = lane.recent.find(index);
-  if (rt != lane.recent.end()) return &rt->second;
+  if (rt != lane.recent.end()) return rt->second.get();
   return nullptr;
 }
 
@@ -681,7 +1253,11 @@ bool AutoBahn::VerifyQc(const QuorumCert& qc) {
 // certificate, and the PoA of every tip.
 bool AutoBahn::VerifyBlock(const ConsensusBlock& b) {
   if (b.proposer() < 1 || b.proposer() > n_ || b.height() < 1) return false;
+  // The digest binds the content, so a copy of a block already verified
+  // needs no further signature checks.
   if (BlockDigest(b) != b.hash()) return false;
+  const std::string key = "block" + b.hash();
+  if (CheckVerified(key)) return true;
   const QuorumCert& qc = b.parent_qc();
   if (qc.height() != b.height() - 1 || qc.block_hash() != b.parent_hash() ||
       !VerifyQc(qc)) {
@@ -700,9 +1276,13 @@ bool AutoBahn::VerifyBlock(const ConsensusBlock& b) {
   for (const Claim& c : b.claims()) {
     if (!bof_ || c.lane() < 1 || c.lane() > n_) return false;
   }
-  return tee_->VerifyBatch({{TeeHost::BlockMsg(b.proposer(), b.view(), b.height(),
-                                               b.hash()),
-                             b.tee_tag()}})[0];
+  if (!tee_->VerifyBatch({{TeeHost::BlockMsg(b.proposer(), b.view(), b.height(),
+                                             b.hash()),
+                           b.tee_tag()}})[0]) {
+    return false;
+  }
+  MarkVerified(key);
+  return true;
 }
 
 const Tip* AutoBahn::TipOf(const ConsensusBlock& b, int lane) const {
@@ -721,12 +1301,29 @@ int64_t AutoBahn::TipIndex(const std::string& block_hash, int lane) const {
 }
 
 void AutoBahn::ReceiveProposal(std::unique_ptr<Proposal> proposal) {
+  {
+    int64_t delay = Now() - proposal->block().propose_time();
+    static std::atomic<int64_t> last_report{0};
+    if (delay > params_.delta_us / 5 && Now() - last_report > 1000000) {
+      last_report = Now();
+      LOG(ERROR) << "proposal " << proposal->block().height() << " from "
+                 << proposal->forwarder() << " reached the network thread "
+                 << delay << "us after it was proposed";
+    }
+  }
   if (!VerifyBlock(proposal->block())) return;
   bool with_parent = proposal->has_parent() &&
                      proposal->parent().hash() == proposal->block().parent_hash() &&
                      VerifyBlock(proposal->parent());
   auto p = std::make_shared<Proposal>(std::move(*proposal));
-  Post([this, p, with_parent] {
+  int64_t posted = Now();
+  Post([this, p, with_parent, posted] {
+    int64_t wait = Now() - posted;
+    static int64_t last_report = 0;
+    if (wait > params_.delta_us / 5 && Now() - last_report > 1000000) {
+      last_report = Now();
+      LOG(ERROR) << "protocol queue: proposal waited " << wait << "us";
+    }
     if (with_parent) StoreKnownBlock(p->parent());
     HandleProposal(p->block());
   });
@@ -777,22 +1374,39 @@ void AutoBahn::HandleProposal(const ConsensusBlock& b) {
 }
 
 // Check (i): every tip is certified (verified on receipt), no lane regresses
-// below its last committed position, and every tip is at least the highest
-// certified tip of its lane the voter had held for Delta when the proposal
-// arrived (freshness).
+// below its last committed position, and every tip is fresh: at least the
+// highest certified tip of its lane the voter held Delta before the proposal
+// was made (Sec. 5.3: "a correct leader proposing at time t has received
+// every certified tip that a correct replica held at t - Delta").  The
+// proposal time is the leader's claim, so the voter uses the bound it
+// implies under synchrony: receipt <= t + Delta, i.e. tips held since
+// receipt - 2 Delta.
 bool AutoBahn::ValidTipCut(const BlockState& st) {
   const ConsensusBlock& b = st.block;
   for (int j = 1; j <= n_; ++j) {
     const Tip* t = TipOf(b, j);
     int64_t tip = t == nullptr ? 0 : t->index();
     if (tip < lanes_[j].committed || tip < TipIndex(b.parent_hash(), j)) {
+      LOG(ERROR) << "tip cut of block " << b.height() << ": lane " << j
+                 << " regresses (tip " << tip << ", committed "
+                 << lanes_[j].committed << ", parent tip "
+                 << TipIndex(b.parent_hash(), j) << ")";
       return false;
     }
-    int64_t held = 0;
+    int64_t held = 0, held_since = 0;
     for (const auto& c : lanes_[j].certified_at) {
-      if (c.second <= st.receive_time - params_.delta_us) held = c.first;
+      if (c.second <= st.receive_time - 2 * params_.delta_us) {
+        held = c.first;
+        held_since = c.second;
+      }
     }
-    if (tip < held) return false;
+    if (tip < held) {
+      LOG(ERROR) << "tip cut of block " << b.height() << " (proposed "
+                 << (st.receive_time - b.propose_time()) << "us before receipt)"
+                 << ": lane " << j << " tip " << tip << " is staler than "
+                 << held << ", held for " << (st.receive_time - held_since) << "us";
+      return false;
+    }
   }
   return true;
 }
@@ -803,7 +1417,6 @@ bool AutoBahn::VoteWaitsOver(const BlockState& st) {
   if (!bof_) {
     // (ii) OL: the collection window closed for every transaction newly
     // referenced by the tip cut.
-    int64_t now = Now();
     for (const Tip& t : b.tips()) {
       for (int64_t idx = TipIndex(b.parent_hash(), t.lane()) + 1; idx <= t.index();
            ++idx) {
@@ -813,14 +1426,16 @@ bool AutoBahn::VoteWaitsOver(const BlockState& st) {
           RequestCar(t.lane(), idx);
           return false;
         }
-        for (const OlCarItem& item : car->ol_items()) {
-          auto it = txns_.find(item.txn_hash());
-          if (it != txns_.end() &&
-              now < it->second.first_seen + 2 * params_.delta_us) {
-            return false;
-          }
-          if (!seen_.count(item.txn_hash())) return false;
+        std::vector<TxnId> ids = CarTxnIds(*car);
+        if (WindowsClosed(ids)) continue;
+        // A transaction never received (the Car was fetched): get it.
+        int64_t& asked = body_requests_[{t.lane(), idx}];
+        if (Now() - asked >= 2 * params_.delta_us) {
+          std::vector<TxnId> missing = MissingBodies(ids);
+          if (!missing.empty()) RequestBodies(missing, 0);
+          asked = Now();
         }
+        return false;
       }
     }
     return true;
@@ -925,12 +1540,25 @@ void AutoBahn::CheckCommitTimers() {
 
 void AutoBahn::EnqueueCommitChain(const std::string& hash) {
   std::vector<std::string> chain;
-  for (std::string h = hash; !h.empty() && h != committed_hash_;) {
+  std::string h = hash;
+  while (h != committed_hash_) {
+    if (h.empty()) break;
     auto it = blocks_.find(h);
-    if (it == blocks_.end() || it->second.committed || it->second.queued) break;
+    if (it == blocks_.end()) break;
+    // Under synchrony Sync HotStuff never commits two blocks at one height;
+    // reaching a committed block other than the committed tip means the
+    // Delta bound was violated.  Stop rather than diverge.
+    LOG_IF(FATAL, it->second.committed)
+        << "safety violation: block " << it->second.block.height()
+        << " conflicts with the committed chain (tip height " << committed_height_
+        << "); the synchrony bound Delta was violated";
+    if (it->second.queued) break;
     chain.push_back(h);
     h = it->second.block.parent_hash();
   }
+  LOG_IF(FATAL, h.empty() && !committed_hash_.empty() && !chain.empty())
+      << "safety violation: a block to commit does not extend the committed "
+         "chain; the synchrony bound Delta was violated";
   for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
     blocks_[*it].queued = true;
     commit_queue_.push_back(*it);
@@ -954,6 +1582,22 @@ void AutoBahn::ProcessPendingCommits() {
       }
     }
     if (!complete) return;
+    // Execution needs every committed transaction's body.
+    for (const Tip& t : b.tips()) {
+      const Lane& lane = lanes_[t.lane()];
+      for (int64_t idx = lane.committed + 1; idx <= t.index(); ++idx) {
+        if (lane.bodies_held.count(idx)) continue;  // checked when acknowledged
+        std::vector<TxnId> missing = MissingBodies(CarTxnIds(*FindCar(t.lane(), idx)));
+        if (missing.empty()) continue;
+        complete = false;
+        int64_t& asked = body_requests_[{t.lane(), idx}];
+        if (Now() - asked >= 2 * params_.delta_us) {
+          RequestBodies(missing, 0);
+          asked = Now();
+        }
+      }
+    }
+    if (!complete) return;
 
     CommittedBlock out;
     out.height = b.height();
@@ -963,13 +1607,22 @@ void AutoBahn::ProcessPendingCommits() {
       Lane& lane = lanes_[j];
       for (int64_t idx = lane.committed + 1; idx <= t->index(); ++idx) {
         auto it = lane.cars.find(idx);
-        Car car = it != lane.cars.end() ? it->second : lane.recent[idx];
-        if (it != lane.cars.end()) lane.cars.erase(it);
+        std::shared_ptr<const Car> car;
+        if (it != lane.cars.end()) {
+          car = std::make_shared<const Car>(std::move(it->second));
+          lane.cars.erase(it);
+        } else {
+          car = lane.recent[idx];
+        }
         out.cars.push_back(car);
         lane.recent.emplace(idx, std::move(car));
         while (lane.recent.size() > kRecentCars) lane.recent.erase(lane.recent.begin());
       }
+      lane.bodies_held.erase(lane.bodies_held.begin(),
+                             lane.bodies_held.upper_bound(t->index()));
       if (t->index() > lane.committed) {
+        body_requests_.erase(body_requests_.lower_bound({j, 0}),
+                             body_requests_.upper_bound({j, t->index()}));
         lane.committed = t->index();
         lane.hashes.erase(lane.hashes.begin(), lane.hashes.lower_bound(lane.committed));
         lane.buffered.erase(lane.buffered.begin(),
@@ -989,14 +1642,51 @@ void AutoBahn::ProcessPendingCommits() {
                    << ": lane " << c.lane() << " is ignored from now on";
       }
     }
-    if (bof_) SettleBof(claims, &out);
+    LOG_IF(FATAL, b.parent_hash() != committed_hash_)
+        << "safety violation: block " << b.height()
+        << " does not extend the committed chain (tip height " << committed_height_
+        << "); the synchrony bound Delta was violated";
     st.committed = true;
     committed_height_ = b.height();
     committed_hash_ = b.hash();
     commit_queue_.pop_front();
+    if (bof_) {
+      // Settlement runs on its own thread, right behind commit.
+      out.claims = std::move(claims);
+      {
+        std::lock_guard<std::mutex> lk(settle_mutex_);
+        settle_queue_.push_back(std::move(out));
+      }
+      settle_cv_.notify_one();
+      continue;
+    }
     {
       std::lock_guard<std::mutex> lk(exec_mutex_);
       exec_queue_.push_back(std::move(out));
+    }
+    exec_cv_.notify_one();
+  }
+}
+
+// BOF settlement (Sec. 7.1) of each committed block, in commit order, on a
+// dedicated thread: a large block would otherwise stall the protocol thread.
+// The delinquency timers it arms and the claim targets are handed back to the
+// protocol thread at once; the block then goes to execution.
+void AutoBahn::SettleLoop() {
+  while (!IsStop()) {
+    CommittedBlock block;
+    {
+      std::unique_lock<std::mutex> lk(settle_mutex_);
+      settle_cv_.wait_for(lk, std::chrono::milliseconds(10),
+                          [&] { return !settle_queue_.empty() || IsStop(); });
+      if (settle_queue_.empty()) continue;
+      block = std::move(settle_queue_.front());
+      settle_queue_.pop_front();
+    }
+    SettleBof(block.claims, &block);
+    {
+      std::lock_guard<std::mutex> lk(exec_mutex_);
+      exec_queue_.push_back(std::move(block));
     }
     exec_cv_.notify_one();
   }
@@ -1249,11 +1939,11 @@ void AutoBahn::ReceiveStatus(std::unique_ptr<Status> status) {
 // Armed when the block fixing c_hat_j(t) commits; expires after
 // D = 2X + 3 Delta = 5 Delta unless a certified Car of lane j at position
 // c_hat_j(t) or beyond was received.  Expiry is final.
-// Settlement is a function of the committed prefix only; running it here
-// arms each delinquency timer when the block that fixes c_hat_j(t) commits.
+// Settlement is a function of the committed prefix only.
 void AutoBahn::SettleBof(const std::vector<int>& claims, CommittedBlock* out) {
   std::vector<BofCommittedCar> cars;
-  for (const Car& car : out->cars) {
+  for (const auto& car_ptr : out->cars) {
+    const Car& car = *car_ptr;
     BofCommittedCar c;
     c.lane = car.lane();
     c.index = car.index();
@@ -1268,8 +1958,12 @@ void AutoBahn::SettleBof(const std::vector<int>& claims, CommittedBlock* out) {
     cars.push_back(std::move(c));
   }
   BofSettleResult res = bof_orderer_->Settle(cars, claims);
-  ArmDelinquencyTimers(res.armed);
-  claim_targets_ = bof_orderer_->ClaimTargets();
+  auto armed = std::make_shared<std::vector<std::pair<int, int64_t>>>(std::move(res.armed));
+  auto targets = std::make_shared<std::map<int, int64_t>>(bof_orderer_->ClaimTargets());
+  Post([this, armed, targets] {
+    ArmDelinquencyTimers(*armed);
+    claim_targets_ = *targets;
+  });
   out->bof_eligible = std::move(res.eligible);
   out->bof_pending = bof_orderer_->PendingSize();
 }
@@ -1317,34 +2011,54 @@ void AutoBahn::ExecutionLoop() {
   }
 }
 
+std::vector<AutoBahn::Body> AutoBahn::GetBodies(const std::vector<TxnId>& ids) {
+  std::vector<Body> out(ids.size());
+  std::vector<std::vector<size_t>> parts(shards_.size());
+  for (size_t i = 0; i < ids.size(); ++i) {
+    uint64_t v;
+    std::memcpy(&v, ids[i].b.data() + 8, sizeof(v));
+    parts[v % shards_.size()].push_back(i);
+  }
+  for (size_t k = 0; k < parts.size(); ++k) {
+    if (parts[k].empty()) continue;
+    Shard& s = *shards_[k];
+    std::lock_guard<std::mutex> lk(s.mu);
+    for (size_t i : parts[k]) {
+      auto it = s.bodies.find(ids[i]);
+      if (it != s.bodies.end()) out[i] = it->second;
+    }
+  }
+  return out;
+}
+
 void AutoBahn::Execute(const CommittedBlock& block) {
   int64_t now = Now();
 
-  // Bodies of the newly committed transactions, and consensus latency over
-  // those this replica received directly from a client.
-  int new_txns = 0, samples = 0;
-  int64_t latency_sum = 0;
-  for (const Car& car : block.cars) {
-    for (const Transaction& txn : car.txns()) {
-      if (!exec_committed_.insert(txn.hash()).second) continue;
-      ++new_txns;
-      exec_bodies_.emplace(txn.hash(), txn);
-      std::lock_guard<std::mutex> lk(create_mutex_);
-      auto it = create_times_.find(txn.hash());
-      if (it != create_times_.end()) {
-        latency_sum += now - it->second;
-        ++samples;
-      }
+  // Newly committed transactions, and consensus latency over those this
+  // replica received directly from a client.
+  std::vector<TxnId> fresh;
+  for (const auto& car_ptr : block.cars) {
+    const Car& car = *car_ptr;
+    for (const TxnId& id : CarTxnIds(car)) {
+      if (exec_committed_.insert(id).second) fresh.push_back(id);
     }
   }
-  LOG(ERROR) << "slot_committed slot:" << block.height << " txns:" << new_txns
+  int samples = 0;
+  int64_t latency_sum = 0;
+  for (const Body& body : GetBodies(fresh)) {
+    if (!body.from_client) continue;
+    latency_sum += now - body.first_seen;
+    ++samples;
+  }
+  LOG(ERROR) << "slot_committed slot:" << block.height << " txns:" << fresh.size()
              << " consensus_latency_us:" << (samples ? latency_sum / samples : 0);
 
   std::vector<std::string> order;
   size_t pending = 0;
   if (!bof_) {
     std::vector<OlCommittedCar> cars;
-    for (const Car& car : block.cars) {
+    for (const auto& car_ptr : block.cars) {
+    const Car& car = *car_ptr;
       OlCommittedCar c;
       c.lane = car.lane();
       c.index = car.index();
@@ -1354,8 +2068,29 @@ void AutoBahn::Execute(const CommittedBlock& block) {
     }
     order = ol_->Commit(cars);
     pending = ol_->PendingSize();
+    static int64_t last_report = 0;
+    if (Now() - last_report > 1000000) {
+      last_report = Now();
+      std::string g;
+      for (int j = 1; j <= n_; ++j) {
+        g += " " + std::to_string(ol_->Frontier(j) % 100000000) + "@" +
+             std::to_string(ol_->CommittedIndex(j));
+      }
+      LOG(ERROR) << "ol: tau=" << ol_->Threshold() % 100000000
+                 << " smallest fixed key=" << ol_->SmallestFixedKey() % 100000000
+                 << " unfixed=" << ol_->UnfixedSize() << " fixed=" << ol_->FixedSize()
+                 << " G@index:" << g;
+    }
   } else if (!block.bof_eligible.empty()) {
+    int64_t start = Now();
     auto batches = BofOrderer::Order(block.bof_eligible, n_, bof_theta_);
+    int64_t took = Now() - start;
+    static int64_t last_report = 0;
+    if (took > 10000 && Now() - last_report > 1000000) {
+      last_report = Now();
+      LOG(ERROR) << "bof: ordering " << block.bof_eligible.size() << " transactions took "
+                 << took << "us (" << batches.size() << " batches)";
+    }
     for (auto& batch : batches) {
       for (auto& id : batch) order.push_back(std::move(id));
     }
@@ -1363,30 +2098,44 @@ void AutoBahn::Execute(const CommittedBlock& block) {
   } else {
     pending = block.bof_pending;
   }
-  // Enclave garbage collection (Sec. 5.1): executed transactions leave H.
-  tee_->Forget(order);
 
+  std::vector<TxnId> ids;
+  ids.reserve(order.size());
+  for (const std::string& id : order) ids.push_back(TxnId::From(id));
+  std::vector<Body> bodies = GetBodies(ids);
   int64_t exec_now = Now();
   int64_t lat_sum = 0, lat_max = 0;
   int lat_samples = 0;
-  for (const std::string& id : order) {
-    auto body = exec_bodies_.find(id);
-    if (body == exec_bodies_.end()) continue;
-    Transaction& txn = body->second;
+  for (size_t i = 0; i < order.size(); ++i) {
+    const Body& body = bodies[i];
+    CHECK(body.data != nullptr) << "executing a transaction without its body";
+    Transaction txn;
+    txn.set_data(*body.data);
+    txn.set_hash(order[i]);
     txn.set_id(execute_id_++);
     Commit(txn);
-    {
-      std::lock_guard<std::mutex> lk(create_mutex_);
-      auto it = create_times_.find(id);
-      if (it != create_times_.end()) {
-        int64_t lat = exec_now - it->second;
-        lat_sum += lat;
-        lat_max = std::max(lat_max, lat);
-        ++lat_samples;
-        create_times_.erase(it);
-      }
+    if (body.from_client) {
+      int64_t lat = exec_now - body.first_seen;
+      lat_sum += lat;
+      lat_max = std::max(lat_max, lat);
+      ++lat_samples;
     }
-    exec_bodies_.erase(body);
+  }
+  if (!ids.empty()) {
+    // Enclave garbage collection (Sec. 5.1): executed transactions leave H.
+    tee_->Forget(order);
+    std::vector<std::vector<TxnId>> parts(shards_.size());
+    for (const TxnId& id : ids) {
+      uint64_t v;
+      std::memcpy(&v, id.b.data() + 8, sizeof(v));
+      parts[v % shards_.size()].push_back(id);
+    }
+    for (size_t k = 0; k < parts.size(); ++k) {
+      if (parts[k].empty()) continue;
+      std::lock_guard<std::mutex> lk(shards_[k]->in_mu);
+      auto& gc = shards_[k]->gc_inbox;
+      gc.insert(gc.end(), parts[k].begin(), parts[k].end());
+    }
   }
   // Rolling digest of the execution order, to check agreement across replicas.
   if (!order.empty()) {

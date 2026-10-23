@@ -36,20 +36,27 @@ typedef struct ms_ecall_init_t {
 	const uint8_t* ms_group_seed;
 } ms_ecall_init_t;
 
-typedef struct ms_ecall_ol_attest_t {
+typedef struct ms_ecall_ol_attest_batch_t {
 	sgx_status_t ms_retval;
-	const uint8_t* ms_id;
-	int64_t ms_ts;
-	uint8_t* ms_tag_out;
-} ms_ecall_ol_attest_t;
+	const uint8_t* ms_ids;
+	uint32_t ms_ids_len;
+	const uint8_t* ms_ts;
+	uint32_t ms_ts_len;
+	uint8_t* ms_tags_out;
+	uint32_t ms_tags_len;
+	uint8_t* ms_ok_out;
+	uint32_t ms_count;
+} ms_ecall_ol_attest_batch_t;
 
-typedef struct ms_ecall_ol_local_key_t {
+typedef struct ms_ecall_ol_local_key_batch_t {
 	sgx_status_t ms_retval;
-	const uint8_t* ms_id;
-	const uint8_t* ms_records;
-	uint32_t ms_rec_len;
-	int64_t* ms_key_out;
-} ms_ecall_ol_local_key_t;
+	const uint8_t* ms_buf;
+	uint32_t ms_len;
+	uint8_t* ms_keys_out;
+	uint32_t ms_keys_len;
+	uint8_t* ms_ok_out;
+	uint32_t ms_count;
+} ms_ecall_ol_local_key_batch_t;
 
 typedef struct ms_ecall_ol_seal_car_t {
 	sgx_status_t ms_retval;
@@ -61,19 +68,25 @@ typedef struct ms_ecall_ol_seal_car_t {
 	uint8_t* ms_tag_out;
 } ms_ecall_ol_seal_car_t;
 
-typedef struct ms_ecall_bof_place_t {
+typedef struct ms_ecall_bof_place_batch_t {
 	sgx_status_t ms_retval;
-	const uint8_t* ms_id;
-	int64_t* ms_car_out;
-	uint8_t* ms_tag_out;
-} ms_ecall_bof_place_t;
+	const uint8_t* ms_ids;
+	uint32_t ms_ids_len;
+	uint8_t* ms_cars_out;
+	uint32_t ms_cars_len;
+	uint8_t* ms_tags_out;
+	uint32_t ms_tags_len;
+	uint8_t* ms_ok_out;
+	uint32_t ms_count;
+} ms_ecall_bof_place_batch_t;
 
-typedef struct ms_ecall_bof_record_announcements_t {
+typedef struct ms_ecall_bof_record_announcements_batch_t {
 	sgx_status_t ms_retval;
-	const uint8_t* ms_id;
-	const uint8_t* ms_records;
-	uint32_t ms_rec_len;
-} ms_ecall_bof_record_announcements_t;
+	const uint8_t* ms_buf;
+	uint32_t ms_len;
+	uint8_t* ms_ok_out;
+	uint32_t ms_count;
+} ms_ecall_bof_record_announcements_batch_t;
 
 typedef struct ms_ecall_bof_seal_car_t {
 	sgx_status_t ms_retval;
@@ -199,183 +212,237 @@ err:
 	return status;
 }
 
-static sgx_status_t SGX_CDECL sgx_ecall_ol_attest(void* pms)
+static sgx_status_t SGX_CDECL sgx_ecall_ol_attest_batch(void* pms)
 {
-	CHECK_REF_POINTER(pms, sizeof(ms_ecall_ol_attest_t));
+	CHECK_REF_POINTER(pms, sizeof(ms_ecall_ol_attest_batch_t));
 	//
 	// fence after pointer checks
 	//
 	sgx_lfence();
-	ms_ecall_ol_attest_t* ms = SGX_CAST(ms_ecall_ol_attest_t*, pms);
-	ms_ecall_ol_attest_t __in_ms;
-	if (memcpy_s(&__in_ms, sizeof(ms_ecall_ol_attest_t), ms, sizeof(ms_ecall_ol_attest_t))) {
+	ms_ecall_ol_attest_batch_t* ms = SGX_CAST(ms_ecall_ol_attest_batch_t*, pms);
+	ms_ecall_ol_attest_batch_t __in_ms;
+	if (memcpy_s(&__in_ms, sizeof(ms_ecall_ol_attest_batch_t), ms, sizeof(ms_ecall_ol_attest_batch_t))) {
 		return SGX_ERROR_UNEXPECTED;
 	}
 	sgx_status_t status = SGX_SUCCESS;
-	const uint8_t* _tmp_id = __in_ms.ms_id;
-	size_t _len_id = 32;
-	uint8_t* _in_id = NULL;
-	uint8_t* _tmp_tag_out = __in_ms.ms_tag_out;
-	size_t _len_tag_out = 32;
-	uint8_t* _in_tag_out = NULL;
+	const uint8_t* _tmp_ids = __in_ms.ms_ids;
+	uint32_t _tmp_ids_len = __in_ms.ms_ids_len;
+	size_t _len_ids = _tmp_ids_len;
+	uint8_t* _in_ids = NULL;
+	const uint8_t* _tmp_ts = __in_ms.ms_ts;
+	uint32_t _tmp_ts_len = __in_ms.ms_ts_len;
+	size_t _len_ts = _tmp_ts_len;
+	uint8_t* _in_ts = NULL;
+	uint8_t* _tmp_tags_out = __in_ms.ms_tags_out;
+	uint32_t _tmp_tags_len = __in_ms.ms_tags_len;
+	size_t _len_tags_out = _tmp_tags_len;
+	uint8_t* _in_tags_out = NULL;
+	uint8_t* _tmp_ok_out = __in_ms.ms_ok_out;
+	uint32_t _tmp_count = __in_ms.ms_count;
+	size_t _len_ok_out = _tmp_count;
+	uint8_t* _in_ok_out = NULL;
 	sgx_status_t _in_retval;
 
-	CHECK_UNIQUE_POINTER(_tmp_id, _len_id);
-	CHECK_UNIQUE_POINTER(_tmp_tag_out, _len_tag_out);
+	CHECK_UNIQUE_POINTER(_tmp_ids, _len_ids);
+	CHECK_UNIQUE_POINTER(_tmp_ts, _len_ts);
+	CHECK_UNIQUE_POINTER(_tmp_tags_out, _len_tags_out);
+	CHECK_UNIQUE_POINTER(_tmp_ok_out, _len_ok_out);
 
 	//
 	// fence after pointer checks
 	//
 	sgx_lfence();
 
-	if (_tmp_id != NULL && _len_id != 0) {
-		if ( _len_id % sizeof(*_tmp_id) != 0)
+	if (_tmp_ids != NULL && _len_ids != 0) {
+		if ( _len_ids % sizeof(*_tmp_ids) != 0)
 		{
 			status = SGX_ERROR_INVALID_PARAMETER;
 			goto err;
 		}
-		_in_id = (uint8_t*)malloc(_len_id);
-		if (_in_id == NULL) {
+		_in_ids = (uint8_t*)malloc(_len_ids);
+		if (_in_ids == NULL) {
 			status = SGX_ERROR_OUT_OF_MEMORY;
 			goto err;
 		}
 
-		if (memcpy_s(_in_id, _len_id, _tmp_id, _len_id)) {
+		if (memcpy_s(_in_ids, _len_ids, _tmp_ids, _len_ids)) {
 			status = SGX_ERROR_UNEXPECTED;
 			goto err;
 		}
 
 	}
-	if (_tmp_tag_out != NULL && _len_tag_out != 0) {
-		if ( _len_tag_out % sizeof(*_tmp_tag_out) != 0)
+	if (_tmp_ts != NULL && _len_ts != 0) {
+		if ( _len_ts % sizeof(*_tmp_ts) != 0)
 		{
 			status = SGX_ERROR_INVALID_PARAMETER;
 			goto err;
 		}
-		if ((_in_tag_out = (uint8_t*)malloc(_len_tag_out)) == NULL) {
+		_in_ts = (uint8_t*)malloc(_len_ts);
+		if (_in_ts == NULL) {
 			status = SGX_ERROR_OUT_OF_MEMORY;
 			goto err;
 		}
 
-		memset((void*)_in_tag_out, 0, _len_tag_out);
+		if (memcpy_s(_in_ts, _len_ts, _tmp_ts, _len_ts)) {
+			status = SGX_ERROR_UNEXPECTED;
+			goto err;
+		}
+
 	}
-	_in_retval = ecall_ol_attest((const uint8_t*)_in_id, __in_ms.ms_ts, _in_tag_out);
+	if (_tmp_tags_out != NULL && _len_tags_out != 0) {
+		if ( _len_tags_out % sizeof(*_tmp_tags_out) != 0)
+		{
+			status = SGX_ERROR_INVALID_PARAMETER;
+			goto err;
+		}
+		if ((_in_tags_out = (uint8_t*)malloc(_len_tags_out)) == NULL) {
+			status = SGX_ERROR_OUT_OF_MEMORY;
+			goto err;
+		}
+
+		memset((void*)_in_tags_out, 0, _len_tags_out);
+	}
+	if (_tmp_ok_out != NULL && _len_ok_out != 0) {
+		if ( _len_ok_out % sizeof(*_tmp_ok_out) != 0)
+		{
+			status = SGX_ERROR_INVALID_PARAMETER;
+			goto err;
+		}
+		if ((_in_ok_out = (uint8_t*)malloc(_len_ok_out)) == NULL) {
+			status = SGX_ERROR_OUT_OF_MEMORY;
+			goto err;
+		}
+
+		memset((void*)_in_ok_out, 0, _len_ok_out);
+	}
+	_in_retval = ecall_ol_attest_batch((const uint8_t*)_in_ids, _tmp_ids_len, (const uint8_t*)_in_ts, _tmp_ts_len, _in_tags_out, _tmp_tags_len, _in_ok_out, _tmp_count);
 	if (memcpy_verw_s(&ms->ms_retval, sizeof(ms->ms_retval), &_in_retval, sizeof(_in_retval))) {
 		status = SGX_ERROR_UNEXPECTED;
 		goto err;
 	}
-	if (_in_tag_out) {
-		if (memcpy_verw_s(_tmp_tag_out, _len_tag_out, _in_tag_out, _len_tag_out)) {
+	if (_in_tags_out) {
+		if (memcpy_verw_s(_tmp_tags_out, _len_tags_out, _in_tags_out, _len_tags_out)) {
+			status = SGX_ERROR_UNEXPECTED;
+			goto err;
+		}
+	}
+	if (_in_ok_out) {
+		if (memcpy_verw_s(_tmp_ok_out, _len_ok_out, _in_ok_out, _len_ok_out)) {
 			status = SGX_ERROR_UNEXPECTED;
 			goto err;
 		}
 	}
 
 err:
-	if (_in_id) free(_in_id);
-	if (_in_tag_out) free(_in_tag_out);
+	if (_in_ids) free(_in_ids);
+	if (_in_ts) free(_in_ts);
+	if (_in_tags_out) free(_in_tags_out);
+	if (_in_ok_out) free(_in_ok_out);
 	return status;
 }
 
-static sgx_status_t SGX_CDECL sgx_ecall_ol_local_key(void* pms)
+static sgx_status_t SGX_CDECL sgx_ecall_ol_local_key_batch(void* pms)
 {
-	CHECK_REF_POINTER(pms, sizeof(ms_ecall_ol_local_key_t));
+	CHECK_REF_POINTER(pms, sizeof(ms_ecall_ol_local_key_batch_t));
 	//
 	// fence after pointer checks
 	//
 	sgx_lfence();
-	ms_ecall_ol_local_key_t* ms = SGX_CAST(ms_ecall_ol_local_key_t*, pms);
-	ms_ecall_ol_local_key_t __in_ms;
-	if (memcpy_s(&__in_ms, sizeof(ms_ecall_ol_local_key_t), ms, sizeof(ms_ecall_ol_local_key_t))) {
+	ms_ecall_ol_local_key_batch_t* ms = SGX_CAST(ms_ecall_ol_local_key_batch_t*, pms);
+	ms_ecall_ol_local_key_batch_t __in_ms;
+	if (memcpy_s(&__in_ms, sizeof(ms_ecall_ol_local_key_batch_t), ms, sizeof(ms_ecall_ol_local_key_batch_t))) {
 		return SGX_ERROR_UNEXPECTED;
 	}
 	sgx_status_t status = SGX_SUCCESS;
-	const uint8_t* _tmp_id = __in_ms.ms_id;
-	size_t _len_id = 32;
-	uint8_t* _in_id = NULL;
-	const uint8_t* _tmp_records = __in_ms.ms_records;
-	uint32_t _tmp_rec_len = __in_ms.ms_rec_len;
-	size_t _len_records = _tmp_rec_len;
-	uint8_t* _in_records = NULL;
-	int64_t* _tmp_key_out = __in_ms.ms_key_out;
-	size_t _len_key_out = sizeof(int64_t);
-	int64_t* _in_key_out = NULL;
+	const uint8_t* _tmp_buf = __in_ms.ms_buf;
+	uint32_t _tmp_len = __in_ms.ms_len;
+	size_t _len_buf = _tmp_len;
+	uint8_t* _in_buf = NULL;
+	uint8_t* _tmp_keys_out = __in_ms.ms_keys_out;
+	uint32_t _tmp_keys_len = __in_ms.ms_keys_len;
+	size_t _len_keys_out = _tmp_keys_len;
+	uint8_t* _in_keys_out = NULL;
+	uint8_t* _tmp_ok_out = __in_ms.ms_ok_out;
+	uint32_t _tmp_count = __in_ms.ms_count;
+	size_t _len_ok_out = _tmp_count;
+	uint8_t* _in_ok_out = NULL;
 	sgx_status_t _in_retval;
 
-	CHECK_UNIQUE_POINTER(_tmp_id, _len_id);
-	CHECK_UNIQUE_POINTER(_tmp_records, _len_records);
-	CHECK_UNIQUE_POINTER(_tmp_key_out, _len_key_out);
+	CHECK_UNIQUE_POINTER(_tmp_buf, _len_buf);
+	CHECK_UNIQUE_POINTER(_tmp_keys_out, _len_keys_out);
+	CHECK_UNIQUE_POINTER(_tmp_ok_out, _len_ok_out);
 
 	//
 	// fence after pointer checks
 	//
 	sgx_lfence();
 
-	if (_tmp_id != NULL && _len_id != 0) {
-		if ( _len_id % sizeof(*_tmp_id) != 0)
+	if (_tmp_buf != NULL && _len_buf != 0) {
+		if ( _len_buf % sizeof(*_tmp_buf) != 0)
 		{
 			status = SGX_ERROR_INVALID_PARAMETER;
 			goto err;
 		}
-		_in_id = (uint8_t*)malloc(_len_id);
-		if (_in_id == NULL) {
+		_in_buf = (uint8_t*)malloc(_len_buf);
+		if (_in_buf == NULL) {
 			status = SGX_ERROR_OUT_OF_MEMORY;
 			goto err;
 		}
 
-		if (memcpy_s(_in_id, _len_id, _tmp_id, _len_id)) {
+		if (memcpy_s(_in_buf, _len_buf, _tmp_buf, _len_buf)) {
 			status = SGX_ERROR_UNEXPECTED;
 			goto err;
 		}
 
 	}
-	if (_tmp_records != NULL && _len_records != 0) {
-		if ( _len_records % sizeof(*_tmp_records) != 0)
+	if (_tmp_keys_out != NULL && _len_keys_out != 0) {
+		if ( _len_keys_out % sizeof(*_tmp_keys_out) != 0)
 		{
 			status = SGX_ERROR_INVALID_PARAMETER;
 			goto err;
 		}
-		_in_records = (uint8_t*)malloc(_len_records);
-		if (_in_records == NULL) {
+		if ((_in_keys_out = (uint8_t*)malloc(_len_keys_out)) == NULL) {
 			status = SGX_ERROR_OUT_OF_MEMORY;
 			goto err;
 		}
 
-		if (memcpy_s(_in_records, _len_records, _tmp_records, _len_records)) {
-			status = SGX_ERROR_UNEXPECTED;
-			goto err;
-		}
-
+		memset((void*)_in_keys_out, 0, _len_keys_out);
 	}
-	if (_tmp_key_out != NULL && _len_key_out != 0) {
-		if ( _len_key_out % sizeof(*_tmp_key_out) != 0)
+	if (_tmp_ok_out != NULL && _len_ok_out != 0) {
+		if ( _len_ok_out % sizeof(*_tmp_ok_out) != 0)
 		{
 			status = SGX_ERROR_INVALID_PARAMETER;
 			goto err;
 		}
-		if ((_in_key_out = (int64_t*)malloc(_len_key_out)) == NULL) {
+		if ((_in_ok_out = (uint8_t*)malloc(_len_ok_out)) == NULL) {
 			status = SGX_ERROR_OUT_OF_MEMORY;
 			goto err;
 		}
 
-		memset((void*)_in_key_out, 0, _len_key_out);
+		memset((void*)_in_ok_out, 0, _len_ok_out);
 	}
-	_in_retval = ecall_ol_local_key((const uint8_t*)_in_id, (const uint8_t*)_in_records, _tmp_rec_len, _in_key_out);
+	_in_retval = ecall_ol_local_key_batch((const uint8_t*)_in_buf, _tmp_len, _in_keys_out, _tmp_keys_len, _in_ok_out, _tmp_count);
 	if (memcpy_verw_s(&ms->ms_retval, sizeof(ms->ms_retval), &_in_retval, sizeof(_in_retval))) {
 		status = SGX_ERROR_UNEXPECTED;
 		goto err;
 	}
-	if (_in_key_out) {
-		if (memcpy_verw_s(_tmp_key_out, _len_key_out, _in_key_out, _len_key_out)) {
+	if (_in_keys_out) {
+		if (memcpy_verw_s(_tmp_keys_out, _len_keys_out, _in_keys_out, _len_keys_out)) {
+			status = SGX_ERROR_UNEXPECTED;
+			goto err;
+		}
+	}
+	if (_in_ok_out) {
+		if (memcpy_verw_s(_tmp_ok_out, _len_ok_out, _in_ok_out, _len_ok_out)) {
 			status = SGX_ERROR_UNEXPECTED;
 			goto err;
 		}
 	}
 
 err:
-	if (_in_id) free(_in_id);
-	if (_in_records) free(_in_records);
-	if (_in_key_out) free(_in_key_out);
+	if (_in_buf) free(_in_buf);
+	if (_in_keys_out) free(_in_keys_out);
+	if (_in_ok_out) free(_in_ok_out);
 	return status;
 }
 
@@ -530,183 +597,213 @@ err:
 	return status;
 }
 
-static sgx_status_t SGX_CDECL sgx_ecall_bof_place(void* pms)
+static sgx_status_t SGX_CDECL sgx_ecall_bof_place_batch(void* pms)
 {
-	CHECK_REF_POINTER(pms, sizeof(ms_ecall_bof_place_t));
+	CHECK_REF_POINTER(pms, sizeof(ms_ecall_bof_place_batch_t));
 	//
 	// fence after pointer checks
 	//
 	sgx_lfence();
-	ms_ecall_bof_place_t* ms = SGX_CAST(ms_ecall_bof_place_t*, pms);
-	ms_ecall_bof_place_t __in_ms;
-	if (memcpy_s(&__in_ms, sizeof(ms_ecall_bof_place_t), ms, sizeof(ms_ecall_bof_place_t))) {
+	ms_ecall_bof_place_batch_t* ms = SGX_CAST(ms_ecall_bof_place_batch_t*, pms);
+	ms_ecall_bof_place_batch_t __in_ms;
+	if (memcpy_s(&__in_ms, sizeof(ms_ecall_bof_place_batch_t), ms, sizeof(ms_ecall_bof_place_batch_t))) {
 		return SGX_ERROR_UNEXPECTED;
 	}
 	sgx_status_t status = SGX_SUCCESS;
-	const uint8_t* _tmp_id = __in_ms.ms_id;
-	size_t _len_id = 32;
-	uint8_t* _in_id = NULL;
-	int64_t* _tmp_car_out = __in_ms.ms_car_out;
-	size_t _len_car_out = sizeof(int64_t);
-	int64_t* _in_car_out = NULL;
-	uint8_t* _tmp_tag_out = __in_ms.ms_tag_out;
-	size_t _len_tag_out = 32;
-	uint8_t* _in_tag_out = NULL;
+	const uint8_t* _tmp_ids = __in_ms.ms_ids;
+	uint32_t _tmp_ids_len = __in_ms.ms_ids_len;
+	size_t _len_ids = _tmp_ids_len;
+	uint8_t* _in_ids = NULL;
+	uint8_t* _tmp_cars_out = __in_ms.ms_cars_out;
+	uint32_t _tmp_cars_len = __in_ms.ms_cars_len;
+	size_t _len_cars_out = _tmp_cars_len;
+	uint8_t* _in_cars_out = NULL;
+	uint8_t* _tmp_tags_out = __in_ms.ms_tags_out;
+	uint32_t _tmp_tags_len = __in_ms.ms_tags_len;
+	size_t _len_tags_out = _tmp_tags_len;
+	uint8_t* _in_tags_out = NULL;
+	uint8_t* _tmp_ok_out = __in_ms.ms_ok_out;
+	uint32_t _tmp_count = __in_ms.ms_count;
+	size_t _len_ok_out = _tmp_count;
+	uint8_t* _in_ok_out = NULL;
 	sgx_status_t _in_retval;
 
-	CHECK_UNIQUE_POINTER(_tmp_id, _len_id);
-	CHECK_UNIQUE_POINTER(_tmp_car_out, _len_car_out);
-	CHECK_UNIQUE_POINTER(_tmp_tag_out, _len_tag_out);
+	CHECK_UNIQUE_POINTER(_tmp_ids, _len_ids);
+	CHECK_UNIQUE_POINTER(_tmp_cars_out, _len_cars_out);
+	CHECK_UNIQUE_POINTER(_tmp_tags_out, _len_tags_out);
+	CHECK_UNIQUE_POINTER(_tmp_ok_out, _len_ok_out);
 
 	//
 	// fence after pointer checks
 	//
 	sgx_lfence();
 
-	if (_tmp_id != NULL && _len_id != 0) {
-		if ( _len_id % sizeof(*_tmp_id) != 0)
+	if (_tmp_ids != NULL && _len_ids != 0) {
+		if ( _len_ids % sizeof(*_tmp_ids) != 0)
 		{
 			status = SGX_ERROR_INVALID_PARAMETER;
 			goto err;
 		}
-		_in_id = (uint8_t*)malloc(_len_id);
-		if (_in_id == NULL) {
+		_in_ids = (uint8_t*)malloc(_len_ids);
+		if (_in_ids == NULL) {
 			status = SGX_ERROR_OUT_OF_MEMORY;
 			goto err;
 		}
 
-		if (memcpy_s(_in_id, _len_id, _tmp_id, _len_id)) {
+		if (memcpy_s(_in_ids, _len_ids, _tmp_ids, _len_ids)) {
 			status = SGX_ERROR_UNEXPECTED;
 			goto err;
 		}
 
 	}
-	if (_tmp_car_out != NULL && _len_car_out != 0) {
-		if ( _len_car_out % sizeof(*_tmp_car_out) != 0)
+	if (_tmp_cars_out != NULL && _len_cars_out != 0) {
+		if ( _len_cars_out % sizeof(*_tmp_cars_out) != 0)
 		{
 			status = SGX_ERROR_INVALID_PARAMETER;
 			goto err;
 		}
-		if ((_in_car_out = (int64_t*)malloc(_len_car_out)) == NULL) {
+		if ((_in_cars_out = (uint8_t*)malloc(_len_cars_out)) == NULL) {
 			status = SGX_ERROR_OUT_OF_MEMORY;
 			goto err;
 		}
 
-		memset((void*)_in_car_out, 0, _len_car_out);
+		memset((void*)_in_cars_out, 0, _len_cars_out);
 	}
-	if (_tmp_tag_out != NULL && _len_tag_out != 0) {
-		if ( _len_tag_out % sizeof(*_tmp_tag_out) != 0)
+	if (_tmp_tags_out != NULL && _len_tags_out != 0) {
+		if ( _len_tags_out % sizeof(*_tmp_tags_out) != 0)
 		{
 			status = SGX_ERROR_INVALID_PARAMETER;
 			goto err;
 		}
-		if ((_in_tag_out = (uint8_t*)malloc(_len_tag_out)) == NULL) {
+		if ((_in_tags_out = (uint8_t*)malloc(_len_tags_out)) == NULL) {
 			status = SGX_ERROR_OUT_OF_MEMORY;
 			goto err;
 		}
 
-		memset((void*)_in_tag_out, 0, _len_tag_out);
+		memset((void*)_in_tags_out, 0, _len_tags_out);
 	}
-	_in_retval = ecall_bof_place((const uint8_t*)_in_id, _in_car_out, _in_tag_out);
+	if (_tmp_ok_out != NULL && _len_ok_out != 0) {
+		if ( _len_ok_out % sizeof(*_tmp_ok_out) != 0)
+		{
+			status = SGX_ERROR_INVALID_PARAMETER;
+			goto err;
+		}
+		if ((_in_ok_out = (uint8_t*)malloc(_len_ok_out)) == NULL) {
+			status = SGX_ERROR_OUT_OF_MEMORY;
+			goto err;
+		}
+
+		memset((void*)_in_ok_out, 0, _len_ok_out);
+	}
+	_in_retval = ecall_bof_place_batch((const uint8_t*)_in_ids, _tmp_ids_len, _in_cars_out, _tmp_cars_len, _in_tags_out, _tmp_tags_len, _in_ok_out, _tmp_count);
 	if (memcpy_verw_s(&ms->ms_retval, sizeof(ms->ms_retval), &_in_retval, sizeof(_in_retval))) {
 		status = SGX_ERROR_UNEXPECTED;
 		goto err;
 	}
-	if (_in_car_out) {
-		if (memcpy_verw_s(_tmp_car_out, _len_car_out, _in_car_out, _len_car_out)) {
+	if (_in_cars_out) {
+		if (memcpy_verw_s(_tmp_cars_out, _len_cars_out, _in_cars_out, _len_cars_out)) {
 			status = SGX_ERROR_UNEXPECTED;
 			goto err;
 		}
 	}
-	if (_in_tag_out) {
-		if (memcpy_verw_s(_tmp_tag_out, _len_tag_out, _in_tag_out, _len_tag_out)) {
+	if (_in_tags_out) {
+		if (memcpy_verw_s(_tmp_tags_out, _len_tags_out, _in_tags_out, _len_tags_out)) {
+			status = SGX_ERROR_UNEXPECTED;
+			goto err;
+		}
+	}
+	if (_in_ok_out) {
+		if (memcpy_verw_s(_tmp_ok_out, _len_ok_out, _in_ok_out, _len_ok_out)) {
 			status = SGX_ERROR_UNEXPECTED;
 			goto err;
 		}
 	}
 
 err:
-	if (_in_id) free(_in_id);
-	if (_in_car_out) free(_in_car_out);
-	if (_in_tag_out) free(_in_tag_out);
+	if (_in_ids) free(_in_ids);
+	if (_in_cars_out) free(_in_cars_out);
+	if (_in_tags_out) free(_in_tags_out);
+	if (_in_ok_out) free(_in_ok_out);
 	return status;
 }
 
-static sgx_status_t SGX_CDECL sgx_ecall_bof_record_announcements(void* pms)
+static sgx_status_t SGX_CDECL sgx_ecall_bof_record_announcements_batch(void* pms)
 {
-	CHECK_REF_POINTER(pms, sizeof(ms_ecall_bof_record_announcements_t));
+	CHECK_REF_POINTER(pms, sizeof(ms_ecall_bof_record_announcements_batch_t));
 	//
 	// fence after pointer checks
 	//
 	sgx_lfence();
-	ms_ecall_bof_record_announcements_t* ms = SGX_CAST(ms_ecall_bof_record_announcements_t*, pms);
-	ms_ecall_bof_record_announcements_t __in_ms;
-	if (memcpy_s(&__in_ms, sizeof(ms_ecall_bof_record_announcements_t), ms, sizeof(ms_ecall_bof_record_announcements_t))) {
+	ms_ecall_bof_record_announcements_batch_t* ms = SGX_CAST(ms_ecall_bof_record_announcements_batch_t*, pms);
+	ms_ecall_bof_record_announcements_batch_t __in_ms;
+	if (memcpy_s(&__in_ms, sizeof(ms_ecall_bof_record_announcements_batch_t), ms, sizeof(ms_ecall_bof_record_announcements_batch_t))) {
 		return SGX_ERROR_UNEXPECTED;
 	}
 	sgx_status_t status = SGX_SUCCESS;
-	const uint8_t* _tmp_id = __in_ms.ms_id;
-	size_t _len_id = 32;
-	uint8_t* _in_id = NULL;
-	const uint8_t* _tmp_records = __in_ms.ms_records;
-	uint32_t _tmp_rec_len = __in_ms.ms_rec_len;
-	size_t _len_records = _tmp_rec_len;
-	uint8_t* _in_records = NULL;
+	const uint8_t* _tmp_buf = __in_ms.ms_buf;
+	uint32_t _tmp_len = __in_ms.ms_len;
+	size_t _len_buf = _tmp_len;
+	uint8_t* _in_buf = NULL;
+	uint8_t* _tmp_ok_out = __in_ms.ms_ok_out;
+	uint32_t _tmp_count = __in_ms.ms_count;
+	size_t _len_ok_out = _tmp_count;
+	uint8_t* _in_ok_out = NULL;
 	sgx_status_t _in_retval;
 
-	CHECK_UNIQUE_POINTER(_tmp_id, _len_id);
-	CHECK_UNIQUE_POINTER(_tmp_records, _len_records);
+	CHECK_UNIQUE_POINTER(_tmp_buf, _len_buf);
+	CHECK_UNIQUE_POINTER(_tmp_ok_out, _len_ok_out);
 
 	//
 	// fence after pointer checks
 	//
 	sgx_lfence();
 
-	if (_tmp_id != NULL && _len_id != 0) {
-		if ( _len_id % sizeof(*_tmp_id) != 0)
+	if (_tmp_buf != NULL && _len_buf != 0) {
+		if ( _len_buf % sizeof(*_tmp_buf) != 0)
 		{
 			status = SGX_ERROR_INVALID_PARAMETER;
 			goto err;
 		}
-		_in_id = (uint8_t*)malloc(_len_id);
-		if (_in_id == NULL) {
+		_in_buf = (uint8_t*)malloc(_len_buf);
+		if (_in_buf == NULL) {
 			status = SGX_ERROR_OUT_OF_MEMORY;
 			goto err;
 		}
 
-		if (memcpy_s(_in_id, _len_id, _tmp_id, _len_id)) {
+		if (memcpy_s(_in_buf, _len_buf, _tmp_buf, _len_buf)) {
 			status = SGX_ERROR_UNEXPECTED;
 			goto err;
 		}
 
 	}
-	if (_tmp_records != NULL && _len_records != 0) {
-		if ( _len_records % sizeof(*_tmp_records) != 0)
+	if (_tmp_ok_out != NULL && _len_ok_out != 0) {
+		if ( _len_ok_out % sizeof(*_tmp_ok_out) != 0)
 		{
 			status = SGX_ERROR_INVALID_PARAMETER;
 			goto err;
 		}
-		_in_records = (uint8_t*)malloc(_len_records);
-		if (_in_records == NULL) {
+		if ((_in_ok_out = (uint8_t*)malloc(_len_ok_out)) == NULL) {
 			status = SGX_ERROR_OUT_OF_MEMORY;
 			goto err;
 		}
 
-		if (memcpy_s(_in_records, _len_records, _tmp_records, _len_records)) {
-			status = SGX_ERROR_UNEXPECTED;
-			goto err;
-		}
-
+		memset((void*)_in_ok_out, 0, _len_ok_out);
 	}
-	_in_retval = ecall_bof_record_announcements((const uint8_t*)_in_id, (const uint8_t*)_in_records, _tmp_rec_len);
+	_in_retval = ecall_bof_record_announcements_batch((const uint8_t*)_in_buf, _tmp_len, _in_ok_out, _tmp_count);
 	if (memcpy_verw_s(&ms->ms_retval, sizeof(ms->ms_retval), &_in_retval, sizeof(_in_retval))) {
 		status = SGX_ERROR_UNEXPECTED;
 		goto err;
 	}
+	if (_in_ok_out) {
+		if (memcpy_verw_s(_tmp_ok_out, _len_ok_out, _in_ok_out, _len_ok_out)) {
+			status = SGX_ERROR_UNEXPECTED;
+			goto err;
+		}
+	}
 
 err:
-	if (_in_id) free(_in_id);
-	if (_in_records) free(_in_records);
+	if (_in_buf) free(_in_buf);
+	if (_in_ok_out) free(_in_ok_out);
 	return status;
 }
 
@@ -1210,11 +1307,11 @@ SGX_EXTERNC const struct {
 	11,
 	{
 		{(void*)(uintptr_t)sgx_ecall_init, 0, 0},
-		{(void*)(uintptr_t)sgx_ecall_ol_attest, 0, 0},
-		{(void*)(uintptr_t)sgx_ecall_ol_local_key, 0, 0},
+		{(void*)(uintptr_t)sgx_ecall_ol_attest_batch, 0, 0},
+		{(void*)(uintptr_t)sgx_ecall_ol_local_key_batch, 0, 0},
 		{(void*)(uintptr_t)sgx_ecall_ol_seal_car, 0, 0},
-		{(void*)(uintptr_t)sgx_ecall_bof_place, 0, 0},
-		{(void*)(uintptr_t)sgx_ecall_bof_record_announcements, 0, 0},
+		{(void*)(uintptr_t)sgx_ecall_bof_place_batch, 0, 0},
+		{(void*)(uintptr_t)sgx_ecall_bof_record_announcements_batch, 0, 0},
 		{(void*)(uintptr_t)sgx_ecall_bof_seal_car, 0, 0},
 		{(void*)(uintptr_t)sgx_ecall_heartbeat, 0, 0},
 		{(void*)(uintptr_t)sgx_ecall_forget, 0, 0},

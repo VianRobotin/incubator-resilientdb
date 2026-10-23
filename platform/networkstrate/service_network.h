@@ -18,6 +18,9 @@
  */
 
 #pragma once
+
+#include <atomic>
+#include <set>
 #include <memory>
 
 #include "platform/common/data_comm/data_comm.h"
@@ -54,12 +57,24 @@ class ServiceNetwork {
   bool IsRunning();
   void InputProcess();
   void AcceptorHandler(const char* buffer, size_t data_len);
+  static int64_t SignerOf(const std::string& bytes);
 
  private:
   std::unique_ptr<Acceptor> acceptor_;
   std::unique_ptr<ServiceInterface> service_;
   bool is_running = false;
   LockFreeQueue<QueueItem> input_queue_, resp_queue_;
+  // Requests from clients wait in their own queue, so that messages between
+  // replicas are never delayed behind client load; with max_client_queue > 0
+  // client requests beyond that backlog are dropped.
+  LockFreeQueue<QueueItem> client_queue_;
+  // Large replica messages (bulk dissemination) are served after the
+  // others, so that consensus messages never wait behind them.
+  LockFreeQueue<QueueItem> bulk_queue_;
+  std::atomic<int64_t> client_queue_size_{0};
+  std::atomic<int64_t> client_dropped_{0};
+  std::set<int64_t> replica_ids_;
+  int64_t max_client_queue_ = 0;
   std::unique_ptr<AsyncAcceptor> async_acceptor_;
   ResDBConfig config_;
   Stats* global_stats_;

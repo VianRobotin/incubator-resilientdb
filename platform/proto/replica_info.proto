@@ -56,6 +56,18 @@ message ResConfigData{
   optional int32 delta_ms = 29;
   optional int32 heartbeat_ms = 30;
   optional int32 blame_p = 31;
+  // Pearl: threads handling transaction intake, echoes and collection
+  // windows (default 4).
+  optional int32 dissemination_threads = 32;
+  // Client requests waiting beyond this backlog are dropped (0 = unbounded),
+  // so that client overload never delays messages between replicas.
+  optional int32 max_client_queue = 33;
+  // How long an outgoing message batch may wait to fill before it is sent
+  // (microseconds; unset: 10 ms for broadcasts, 50 ms for single targets).
+  optional int32 tcp_batch_timeout_us = 34;
+  // Pearl admission control: line rate of the replicas' links (Mbit/s,
+  // default 1000); admission keeps traffic below 80% of it.
+  optional int32 link_mbps = 35;
 }
 
 message ReplicaStates {

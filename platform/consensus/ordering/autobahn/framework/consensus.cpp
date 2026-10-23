@@ -89,6 +89,12 @@ Consensus::Consensus(const ResDBConfig& config,
                               ? 1000LL * cfg.heartbeat_ms()
                               : params.delta_us;
     params.blame_p = cfg.has_blame_p() && cfg.blame_p() > 0 ? cfg.blame_p() : 1;
+    params.link_bytes_per_sec =
+        125000LL * (cfg.has_link_mbps() && cfg.link_mbps() > 0 ? cfg.link_mbps() : 1000);
+    params.dissemination_threads =
+        cfg.has_dissemination_threads() && cfg.dissemination_threads() > 0
+            ? cfg.dissemination_threads()
+            : 4;
     const char* enclave = getenv("TEE_ENCLAVE_PATH");
     params.enclave_path =
         enclave ? enclave
@@ -104,6 +110,30 @@ Consensus::Consensus(const ResDBConfig& config,
         config_.GetSelfInfo().id(), f, total_replicas, cfg.block_size(),
         GetSignatureVerifier(), params);
     InitProtocol(autobahn_.get());
+
+    // Latency of the send path: a batch is sent once full or after this.
+    const int batch_timeout_us =
+        cfg.has_tcp_batch_timeout_us() ? cfg.tcp_batch_timeout_us() : 0;
+    if (batch_timeout_us > 0) GetBroadCastClient()->SetBatchTimeoutUs(batch_timeout_us);
+    LOG(ERROR) << "Pearl: send batch timeout " << batch_timeout_us << "us";
+    bulk_communicator_ = std::make_unique<ReplicaCommunicator>(
+        config_.GetReplicaInfos(), GetSignatureVerifier(),
+        /*is_use_long_conn=*/true, config_.GetOutputWorkerNum(),
+        config_.GetTcpBatchNum());
+    if (batch_timeout_us > 0) bulk_communicator_->SetBatchTimeoutUs(batch_timeout_us);
+    autobahn_->SetBulkChannel(
+        [this](int type, const google::protobuf::Message& msg) {
+          Request request;
+          msg.SerializeToString(request.mutable_data());
+          request.set_type(Request::TYPE_CUSTOM_CONSENSUS);
+          request.set_user_type(type);
+          request.set_sender_id(config_.GetSelfInfo().id());
+          bulk_communicator_->BroadCast(request);
+        },
+        [this]() {
+          return bulk_communicator_->PendingBytes() +
+                 GetBroadCastClient()->PendingBytes();
+        });
     autobahn_->Start();
   }
 }
@@ -136,6 +166,12 @@ int Consensus::ProcessCustomConsensus(std::unique_ptr<Request> request) {
     case MessageType::Car_Query:
       if (auto m = Parse<CarQuery>(*request)) autobahn_->ReceiveCarQuery(std::move(m));
       break;
+    case MessageType::Body_Query:
+      if (auto m = Parse<BodyQuery>(*request)) autobahn_->ReceiveBodyQuery(std::move(m));
+      break;
+    case MessageType::Body_Reply:
+      if (auto m = Parse<BodyReply>(*request)) autobahn_->ReceiveBodyReply(std::move(m));
+      break;
     case MessageType::SyncHS_Propose:
       if (auto m = Parse<Proposal>(*request)) autobahn_->ReceiveProposal(std::move(m));
       break;
@@ -159,11 +195,7 @@ int Consensus::ProcessCustomConsensus(std::unique_ptr<Request> request) {
 }
 
 int Consensus::ProcessNewTransaction(std::unique_ptr<Request> request) {
-  std::unique_ptr<Transaction> txn = std::make_unique<Transaction>();
-  txn->set_data(request->data());
-  txn->set_hash(request->hash());
-  txn->set_proxy_id(request->proxy_id());
-  return autobahn_->ReceiveTransaction(std::move(txn));
+  return autobahn_->ReceiveTransaction(std::move(*request->mutable_data()));
 }
 
 int Consensus::CommitMsg(const google::protobuf::Message& msg) {

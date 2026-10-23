@@ -25,8 +25,9 @@ message Transaction {
 
 // Retransmission of t with the sender's TEE evidence (BroadcastOLEcho /
 // BroadcastBOFEcho): value = T (OL timestamp) or c_r(t) (BOF placement).
+// `data` is the client request; receivers derive id(t) = SHA-256(data).
 message Echo {
-  Transaction txn = 1;
+  bytes data = 1;
   int64 value = 2;
   bytes tee_tag = 3;
 }
@@ -62,9 +63,11 @@ message Car {
   bytes prev_hash = 3;
   bytes hash = 4;
   bytes tee_tag = 5;
-  // Transaction bodies.  OL: one per ol_item, same order.  BOF: one per
-  // non-heartbeat bof_item, same order.
-  repeated Transaction txns = 6;
+  // Cars reference transactions by id(t); every replica holds the bodies
+  // from the echoes, fetches missing ones (BodyQuery) and acknowledges a Car
+  // only once it holds all of them, so a certified Car's transactions are
+  // retrievable from a correct replica.
+  reserved 6;
   repeated OlCarItem ol_items = 7;
   int64 frontier = 8;                 // G_r (OL) or w_r (BOF)
   repeated bytes bof_items = 9;       // enclave order
@@ -72,6 +75,9 @@ message Car {
   repeated Announcement m = 11;       // m[j-1] = M_r[j]
   Poa poa = 12;                       // latest certified Car of this lane
   int64 seal_time = 13;
+  // Admission level proposed by the lane's owner (flow control only; not
+  // part of the Car hash).  See AutoBahn::AdjustAdmission.
+  int32 admit = 14;
 }
 
 message CarAck {
@@ -85,6 +91,17 @@ message CarQuery {
   int32 lane = 1;
   int64 index = 2;
   int32 requester = 3;
+}
+
+// Request for the bodies of transactions referenced by a Car.
+message BodyQuery {
+  int32 requester = 1;
+  repeated bytes ids = 2;
+}
+
+message BodyReply {
+  int32 sender_id = 1;
+  repeated bytes data = 2;   // client requests; id(t) = SHA-256(data)
 }
 
 // ---------------------------------------------------------------------------
@@ -185,4 +202,6 @@ enum MessageType {
   SyncHS_Blame = 7;
   SyncHS_QuitView = 8;
   SyncHS_Status = 9;
+  Body_Query = 10;
+  Body_Reply = 11;
 }

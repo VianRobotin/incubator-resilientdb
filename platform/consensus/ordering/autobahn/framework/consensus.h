@@ -52,6 +52,8 @@ class Consensus : public common::Consensus {
 
  protected:
   std::unique_ptr<AutoBahn> autobahn_;
+  // Separate connections for echo traffic (see AutoBahn::SetBulkChannel).
+  std::unique_ptr<ReplicaCommunicator> bulk_communicator_;
   Stats* global_stats_;
   int64_t start_;
   std::mutex mutex_;

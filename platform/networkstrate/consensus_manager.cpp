@@ -176,11 +176,6 @@ int ConsensusManager::Process(std::unique_ptr<Context> context,
     return -1;
   }
 
-  std::string tmp;
-  if (!request->SerializeToString(&tmp)) {
-    return -1;
-  }
-
   // forward the signature to the request so that it can be included in the
   // request/response set if needed.
   context->signature = message.signature();

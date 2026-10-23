@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <boost/asio.hpp>
 
 #include "interface/rdbc/net_channel.h"
@@ -34,6 +35,9 @@ class AsyncReplicaClient {
   virtual ~AsyncReplicaClient();
 
   virtual int SendMessage(const std::string& data);
+  // Bytes queued on this connection and not yet written to the socket.
+  // Includes the bytes still in the kernel's send buffer.
+  int64_t PendingBytes();
 
  private:
   void ReConnect();
@@ -45,9 +49,12 @@ class AsyncReplicaClient {
   LockFreeQueue<std::string> queue_;
   std::unique_ptr<NetChannel> client_;
   boost::asio::ip::tcp::socket socket_;
+  // Delays reconnection attempts without blocking an I/O thread.
+  boost::asio::steady_timer retry_timer_;
   boost::asio::ip::tcp::endpoint endpoint_;
   std::mutex mutex_;
   std::atomic<bool> in_process_;
+  std::atomic<int64_t> pending_bytes_{0};
 
   // ===== for async send =====
   std::unique_ptr<std::string> pending_data_;

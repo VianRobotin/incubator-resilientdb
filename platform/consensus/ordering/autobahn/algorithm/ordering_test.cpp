@@ -1,4 +1,10 @@
 #include <gtest/gtest.h>
+#include <set>
+#include <queue>
+
+#include <algorithm>
+#include <random>
+#include <numeric>
 
 #include "platform/consensus/ordering/autobahn/algorithm/bof_ordering.h"
 #include "platform/consensus/ordering/autobahn/algorithm/ol_ordering.h"
@@ -168,6 +174,156 @@ TEST(BofOrdererTest, CoverageNeedsFPlusOneLanes) {
   EXPECT_TRUE(res.batches.empty());
   res = bof.Commit({Heartbeat(n, 2, 2, 1, {1, 1, 1})}, {});
   ASSERT_EQ(res.batches, (Batches{{"t"}}));
+}
+
+
+// The straightforward Alg. 3 (adjacency lists, recursive-free Tarjan), kept
+// as the reference the optimized BofOrderer::Order must match exactly.
+Batches ReferenceOrder(
+    std::vector<BofEligibleTxn> txns, int n, int theta) {
+  std::sort(txns.begin(), txns.end(),
+            [](const BofEligibleTxn& a, const BofEligibleTxn& b) {
+              return a.id < b.id;
+            });
+  const int m = static_cast<int>(txns.size());
+
+  // Dependency graph (Alg. 3, edge rule Eq. 2).
+  std::vector<std::vector<int>> adj(m);
+  for (int a = 0; a < m; ++a) {
+    for (int b = a + 1; b < m; ++b) {
+      int size = 0, ab = 0;
+      for (int r = 1; r <= n; ++r) {
+        const auto& pa = txns[a].attest[r];
+        const auto& pb = txns[b].attest[r];
+        if (pa.first < 0 || pb.first < 0) continue;
+        ++size;
+        if (pa < pb) ++ab;
+      }
+      if (ab >= theta) {
+        adj[a].push_back(b);
+      } else if (size - ab >= theta) {
+        adj[b].push_back(a);
+      }
+    }
+  }
+
+  // Tarjan's SCC algorithm, iterative to bound stack depth.
+  std::vector<int> index(m, -1), low(m, 0), comp(m, -1);
+  std::vector<bool> on_stack(m, false);
+  std::vector<int> stack;
+  int next_index = 0, num_comp = 0;
+  for (int root = 0; root < m; ++root) {
+    if (index[root] != -1) continue;
+    std::vector<std::pair<int, size_t>> call = {{root, 0}};
+    index[root] = low[root] = next_index++;
+    stack.push_back(root);
+    on_stack[root] = true;
+    while (!call.empty()) {
+      int v = call.back().first;
+      size_t& e = call.back().second;
+      if (e < adj[v].size()) {
+        int w = adj[v][e++];
+        if (index[w] == -1) {
+          index[w] = low[w] = next_index++;
+          stack.push_back(w);
+          on_stack[w] = true;
+          call.emplace_back(w, 0);
+        } else if (on_stack[w]) {
+          low[v] = std::min(low[v], index[w]);
+        }
+        continue;
+      }
+      if (low[v] == index[v]) {
+        int w;
+        do {
+          w = stack.back();
+          stack.pop_back();
+          on_stack[w] = false;
+          comp[w] = num_comp;
+        } while (w != v);
+        ++num_comp;
+      }
+      call.pop_back();
+      if (!call.empty()) {
+        int parent = call.back().first;
+        low[parent] = std::min(low[parent], low[v]);
+      }
+    }
+  }
+
+  // Condensation DAG; txns are sorted, so the first member of a component is
+  // its lexicographically smallest digest.
+  std::vector<std::vector<std::string>> members(num_comp);
+  std::vector<int> smallest(num_comp, -1);
+  for (int i = 0; i < m; ++i) {
+    members[comp[i]].push_back(std::move(txns[i].id));
+    if (smallest[comp[i]] == -1) smallest[comp[i]] = i;
+  }
+  std::vector<std::set<int>> cadj(num_comp);
+  std::vector<int> indeg(num_comp, 0);
+  for (int u = 0; u < m; ++u) {
+    for (int v : adj[u]) {
+      if (comp[u] != comp[v] && cadj[comp[u]].insert(comp[v]).second) {
+        ++indeg[comp[v]];
+      }
+    }
+  }
+
+  // Deterministic topological sort: among ready components, the one with the
+  // smallest digest first.
+  using Entry = std::pair<int, int>;  // (smallest member index, component)
+  std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> ready;
+  for (int c = 0; c < num_comp; ++c) {
+    if (indeg[c] == 0) ready.emplace(smallest[c], c);
+  }
+  std::vector<std::vector<std::string>> batches;
+  batches.reserve(num_comp);
+  while (!ready.empty()) {
+    int c = ready.top().second;
+    ready.pop();
+    batches.push_back(std::move(members[c]));
+    for (int d : cadj[c]) {
+      if (--indeg[d] == 0) ready.emplace(smallest[d], d);
+    }
+  }
+  return batches;
+}
+
+
+// The optimized ordering must produce exactly the reference batches, on
+// random attestations including absent lanes, ties and Condorcet cycles.
+TEST(BofOrdererTest, OptimizedOrderMatchesReference) {
+  std::mt19937 rng(42);
+  for (int trial = 0; trial < 200; ++trial) {
+    const int n = 3 + 2 * (trial % 7);          // 3 .. 15
+    const int f = (n - 1) / 2;
+    const int theta = (trial % 3 == 0) ? f + 1 : n - f;
+    const int m = 1 + static_cast<int>(rng() % 300);
+    std::vector<BofEligibleTxn> txns(m);
+    std::vector<std::vector<int>> perm(n + 1);
+    for (int r = 1; r <= n; ++r) {
+      perm[r].resize(m);
+      std::iota(perm[r].begin(), perm[r].end(), 0);
+      // Mostly agreeing lanes with local swaps, so both DAGs and cycles occur.
+      for (int k = 0; k < m / 4; ++k) {
+        int i = rng() % m, j = std::min(m - 1, i + static_cast<int>(rng() % 4));
+        std::swap(perm[r][i], perm[r][j]);
+      }
+    }
+    for (int i = 0; i < m; ++i) {
+      txns[i].id = "t" + std::to_string(rng() % 100000) + "_" + std::to_string(i);
+      txns[i].attest.assign(n + 1, {-1, -1});
+    }
+    for (int r = 1; r <= n; ++r) {
+      for (int k = 0; k < m; ++k) {
+        if (rng() % 10 == 0) continue;  // lane holds no attestation
+        int i = perm[r][k];
+        txns[i].attest[r] = {k / 50, static_cast<int32_t>(k % 50)};
+      }
+    }
+    EXPECT_EQ(BofOrderer::Order(txns, n, theta), ReferenceOrder(txns, n, theta))
+        << "trial " << trial << " n=" << n << " m=" << m;
+  }
 }
 
 }  // namespace

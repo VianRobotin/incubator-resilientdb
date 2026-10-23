@@ -54,5 +54,8 @@ cc_library(
         "//platform/consensus/ordering/autobahn/proto:proposal_cc_proto",
         "//platform/common/queue:lock_free_queue",
         "//platform/consensus/ordering/autobahn/tee:tee_host",
+        "//platform/networkstrate:traffic",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
     ],
 )

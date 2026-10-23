@@ -47,7 +47,7 @@ Enclave_CXX_Flags := \
     -nostdinc -fvisibility=hidden -fpie \
     -ffunction-sections -fdata-sections \
     -fstack-protector-strong \
-    -std=c++11 -O2
+    -std=c++11 -O2 -maes
 
 Enclave_Link_Flags := \
     -Wl,--no-undefined -nostdlib -nodefaultlibs -nostartfiles \
@@ -99,7 +99,7 @@ $(GEN_DIR)/tee_enclave_t.h $(GEN_DIR)/tee_enclave_u.h: tee_enclave.edl $(SGX_EDG
 # ---- Step 2: Build enclave .so ----
 enclave: $(Signed_Enclave_So)
 
-$(ENCLAVE_DIR)/tee_enclave.o: $(ENCLAVE_DIR)/tee_enclave.cpp tee_msg.h $(GEN_DIR)/tee_enclave_t.h
+$(ENCLAVE_DIR)/tee_enclave.o: $(ENCLAVE_DIR)/tee_enclave.cpp tee_msg.h aes_cmac.h $(GEN_DIR)/tee_enclave_t.h
 	$(CXX) $(Enclave_CXX_Flags) -I$(GEN_DIR) -c $< -o $@
 
 $(GEN_DIR)/tee_enclave_t.o: $(GEN_DIR)/tee_enclave_t.c $(GEN_DIR)/tee_enclave_t.h

@@ -17,8 +17,12 @@
 #include <cstring>
 #include <memory>
 
+static_assert(PEARL_SIGNED_TS_REC == PEARL_SIGNED_PLACE_REC, "one record layout");
+
 namespace resdb {
 namespace autobahn {
+
+static_assert(TeeHost::kTagLen == PEARL_TAG_LEN, "tag length");
 
 namespace {
 int64_t WallClockUs() {
@@ -49,17 +53,6 @@ bool Check(const char* what, sgx_status_t ret, sgx_status_t ecall_ret) {
   return ecall_ret == SGX_SUCCESS;
 }
 
-std::string PackIndicators(const std::vector<TeeHost::SignedIndicator>& recs) {
-  std::string out(recs.size() * PEARL_SIGNED_TS_REC, '\0');
-  uint8_t* p = reinterpret_cast<uint8_t*>(&out[0]);
-  for (const auto& r : recs) {
-    pearl_put_u32(p, static_cast<uint32_t>(r.signer));
-    pearl_put_i64(p + 4, r.value);
-    std::memcpy(p + 12, r.tag.data(), std::min<size_t>(r.tag.size(), PEARL_TAG_LEN));
-    p += PEARL_SIGNED_TS_REC;
-  }
-  return out;
-}
 
 std::string OlItemBytes(const std::vector<TeeHost::OlItem>& items) {
   std::string out(items.size() * PEARL_OL_ITEM_REC, '\0');
@@ -150,39 +143,132 @@ bool TeeHost::Initialize(const std::string& enclave_path, int self_id, int n,
   return true;
 }
 
-/* ---- Pearl-OL ---- */
+/* ---- Per-transaction attestation and collection (batched) ---- */
+
+bool TeeHost::AttestBatch(const uint8_t* ids, uint32_t count,
+                          std::vector<int64_t>* values, std::string* tags,
+                          std::vector<uint8_t>* ok) {
+  values->assign(count, 0);
+  tags->assign(static_cast<size_t>(count) * PEARL_TAG_LEN, '\0');
+  ok->assign(count, 0);
+  if (!ok_ || count == 0) return ok_;
+  std::string out(static_cast<size_t>(count) * 8, '\0');
+  uint8_t* o = reinterpret_cast<uint8_t*>(&out[0]);
+  uint8_t* t = reinterpret_cast<uint8_t*>(&(*tags)[0]);
+  sgx_status_t ecall_ret, ret;
+  std::unique_lock<std::mutex> lk(mu_);
+  if (!bof_) {
+    /* The host's clock reading, bumped past the last timestamp it fed the
+     * enclave, which accepts only strictly increasing values. */
+    int64_t ts = std::max(WallClockUs(), last_ts_ + 1);
+    for (uint32_t i = 0; i < count; i++) pearl_put_i64(o + 8 * i, ts + i);
+    ret = ecall_ol_attest_batch(static_cast<sgx_enclave_id_t>(eid_), &ecall_ret,
+                                ids, count * PEARL_ID_LEN, o, count * 8, t,
+                                count * PEARL_TAG_LEN, ok->data(), count);
+    if (ret == SGX_SUCCESS && ecall_ret == SGX_SUCCESS) last_ts_ = ts + count - 1;
+  } else {
+    ret = ecall_bof_place_batch(static_cast<sgx_enclave_id_t>(eid_), &ecall_ret,
+                                ids, count * PEARL_ID_LEN, o, count * 8, t,
+                                count * PEARL_TAG_LEN, ok->data(), count);
+  }
+  lk.unlock();
+  if (!Check(bof_ ? "ecall_bof_place_batch" : "ecall_ol_attest_batch", ret,
+             ecall_ret)) {
+    ok->assign(count, 0);
+    return false;
+  }
+  for (uint32_t i = 0; i < count; i++) (*values)[i] = pearl_get_i64(o + 8 * i);
+  return true;
+}
+
+void TeeHost::AppendCollected(std::string* buf, const uint8_t* id,
+                              uint32_t num_records) {
+  buf->append(reinterpret_cast<const char*>(id), PEARL_ID_LEN);
+  uint8_t n[4];
+  pearl_put_u32(n, num_records);
+  buf->append(reinterpret_cast<const char*>(n), 4);
+}
+
+void TeeHost::AppendRecord(std::string* buf, int signer, int64_t value,
+                           const char* tag) {
+  uint8_t rec[PEARL_SIGNED_TS_REC];
+  pearl_put_u32(rec, static_cast<uint32_t>(signer));
+  pearl_put_i64(rec + 4, value);
+  std::memcpy(rec + 12, tag, PEARL_TAG_LEN);
+  buf->append(reinterpret_cast<const char*>(rec), sizeof(rec));
+}
+
+bool TeeHost::CloseWindowsBatch(const std::string& collected, uint32_t count,
+                                std::vector<int64_t>* keys,
+                                std::vector<uint8_t>* ok) {
+  keys->assign(count, 0);
+  ok->assign(count, 0);
+  if (!ok_ || count == 0) return ok_;
+  sgx_status_t ecall_ret, ret;
+  std::string out(static_cast<size_t>(count) * 8, '\0');
+  std::unique_lock<std::mutex> lk(mu_);
+  if (!bof_) {
+    ret = ecall_ol_local_key_batch(
+        static_cast<sgx_enclave_id_t>(eid_), &ecall_ret, U8(collected),
+        static_cast<uint32_t>(collected.size()),
+        reinterpret_cast<uint8_t*>(&out[0]), count * 8, ok->data(), count);
+  } else {
+    ret = ecall_bof_record_announcements_batch(
+        static_cast<sgx_enclave_id_t>(eid_), &ecall_ret, U8(collected),
+        static_cast<uint32_t>(collected.size()), ok->data(), count);
+  }
+  lk.unlock();
+  if (!Check(bof_ ? "ecall_bof_record_announcements_batch"
+                  : "ecall_ol_local_key_batch",
+             ret, ecall_ret)) {
+    ok->assign(count, 0);
+    return false;
+  }
+  for (uint32_t i = 0; i < count; i++) {
+    (*keys)[i] = pearl_get_i64(U8(out) + 8 * i);
+  }
+  return true;
+}
+
+namespace {
+std::string PackCollected(const std::string& id,
+                          const std::vector<TeeHost::SignedIndicator>& recs) {
+  std::string buf;
+  std::string id32 = Id32(id);
+  TeeHost::AppendCollected(&buf, U8(id32), static_cast<uint32_t>(recs.size()));
+  for (const auto& r : recs) {
+    std::string tag(PEARL_TAG_LEN, '\0');
+    std::memcpy(&tag[0], r.tag.data(), std::min<size_t>(r.tag.size(), PEARL_TAG_LEN));
+    TeeHost::AppendRecord(&buf, r.signer, r.value, tag.data());
+  }
+  return buf;
+}
+}  // namespace
+
+/* ---- Single-transaction forms (used by tee_host_check) ---- */
 
 bool TeeHost::OlAttest(const std::string& id, int64_t* ts, std::string* tag) {
-  if (!ok_) return false;
   std::string id32 = Id32(id);
-  uint8_t out_tag[PEARL_TAG_LEN];
-  sgx_status_t ecall_ret;
-  std::unique_lock<std::mutex> lk(mu_);
-  /* The host's clock reading, bumped past the last timestamp it fed the
-   * enclave, which accepts only strictly increasing values. */
-  *ts = std::max(WallClockUs(), last_ts_ + 1);
-  sgx_status_t ret = ecall_ol_attest(static_cast<sgx_enclave_id_t>(eid_),
-                                     &ecall_ret, U8(id32), *ts, out_tag);
-  if (ret == SGX_SUCCESS && ecall_ret == SGX_SUCCESS) last_ts_ = *ts;
-  lk.unlock();
-  if (!Check("ecall_ol_attest", ret, ecall_ret)) return false;
-  tag->assign(reinterpret_cast<char*>(out_tag), PEARL_TAG_LEN);
+  std::vector<int64_t> values;
+  std::vector<uint8_t> ok;
+  std::string tags;
+  if (bof_ || !AttestBatch(U8(id32), 1, &values, &tags, &ok) || !ok[0]) return false;
+  *ts = values[0];
+  *tag = tags;
   return true;
 }
 
 bool TeeHost::OlLocalKey(const std::string& id,
                          const std::vector<SignedIndicator>& timestamps,
                          int64_t* key) {
-  if (!ok_) return false;
-  std::string id32 = Id32(id);
-  std::string recs = PackIndicators(timestamps);
-  sgx_status_t ecall_ret;
-  std::unique_lock<std::mutex> lk(mu_);
-  sgx_status_t ret = ecall_ol_local_key(
-      static_cast<sgx_enclave_id_t>(eid_), &ecall_ret, U8(id32), U8(recs),
-      static_cast<uint32_t>(recs.size()), key);
-  lk.unlock();
-  return Check("ecall_ol_local_key", ret, ecall_ret);
+  std::vector<int64_t> keys;
+  std::vector<uint8_t> ok;
+  if (bof_ || !CloseWindowsBatch(PackCollected(id, timestamps), 1, &keys, &ok) ||
+      !ok[0]) {
+    return false;
+  }
+  *key = keys[0];
+  return true;
 }
 
 bool TeeHost::OlSealCar(const std::vector<OlItem>& items, SealedCar* out) {
@@ -205,31 +291,22 @@ bool TeeHost::OlSealCar(const std::vector<OlItem>& items, SealedCar* out) {
 /* ---- Pearl-BOF ---- */
 
 bool TeeHost::BofPlace(const std::string& id, int64_t* car, std::string* tag) {
-  if (!ok_) return false;
   std::string id32 = Id32(id);
-  uint8_t out_tag[PEARL_TAG_LEN];
-  sgx_status_t ecall_ret;
-  std::unique_lock<std::mutex> lk(mu_);
-  sgx_status_t ret = ecall_bof_place(static_cast<sgx_enclave_id_t>(eid_),
-                                     &ecall_ret, U8(id32), car, out_tag);
-  lk.unlock();
-  if (!Check("ecall_bof_place", ret, ecall_ret)) return false;
-  tag->assign(reinterpret_cast<char*>(out_tag), PEARL_TAG_LEN);
+  std::vector<int64_t> values;
+  std::vector<uint8_t> ok;
+  std::string tags;
+  if (!bof_ || !AttestBatch(U8(id32), 1, &values, &tags, &ok) || !ok[0]) return false;
+  *car = values[0];
+  *tag = tags;
   return true;
 }
 
 bool TeeHost::BofRecordAnnouncements(
     const std::string& id, const std::vector<SignedIndicator>& placements) {
-  if (!ok_) return false;
-  std::string id32 = Id32(id);
-  std::string recs = PackIndicators(placements);
-  sgx_status_t ecall_ret;
-  std::unique_lock<std::mutex> lk(mu_);
-  sgx_status_t ret = ecall_bof_record_announcements(
-      static_cast<sgx_enclave_id_t>(eid_), &ecall_ret, U8(id32), U8(recs),
-      static_cast<uint32_t>(recs.size()));
-  lk.unlock();
-  return Check("ecall_bof_record_announcements", ret, ecall_ret);
+  std::vector<int64_t> keys;
+  std::vector<uint8_t> ok;
+  return bof_ && CloseWindowsBatch(PackCollected(id, placements), 1, &keys, &ok) &&
+         ok[0];
 }
 
 bool TeeHost::BofSealCar(SealedCar* out) {
@@ -336,12 +413,12 @@ std::vector<bool> TeeHost::VerifyBatch(const std::vector<VerifyItem>& items) {
   }
   std::vector<uint8_t> ok(items.size(), 0);
   sgx_status_t ecall_ret;
-  std::unique_lock<std::mutex> lk(mu_);
+  /* Verification only reads the enclave's key: no host lock, so network
+   * threads verify concurrently. */
   sgx_status_t ret = ecall_verify_batch(
       static_cast<sgx_enclave_id_t>(eid_), &ecall_ret, U8(recs),
       static_cast<uint32_t>(recs.size()), ok.data(),
       static_cast<uint32_t>(ok.size()));
-  lk.unlock();
   if (!Check("ecall_verify_batch", ret, ecall_ret)) return result;
   for (size_t i = 0; i < items.size(); i++) result[i] = ok[i] != 0;
   return result;

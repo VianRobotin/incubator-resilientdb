@@ -235,10 +235,13 @@ int PerformanceManager::BatchProposeMsg() {
       uint64_t now = GetCurrentTime();
       if (now < next_send_us) {
         usleep(next_send_us - now);
-      } else {
-        // We're behind schedule; reset to avoid a burst of catch-up sends.
+      } else if (now - next_send_us > 1000000) {
+        // More than a second behind schedule: the client cannot sustain the
+        // target rate; restart the schedule rather than burst.
         next_send_us = now;
       }
+      // Otherwise catch up without sleeping, so that sleep overshoot does
+      // not lower the offered rate.
     }
   }
   return 0;

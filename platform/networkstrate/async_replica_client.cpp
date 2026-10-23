@@ -18,6 +18,10 @@
  */
 
 #include "platform/networkstrate/async_replica_client.h"
+#include "platform/networkstrate/traffic.h"
+
+#include <linux/sockios.h>
+#include <sys/ioctl.h>
 
 #include <boost/bind/bind.hpp>
 
@@ -26,16 +30,36 @@
 
 namespace resdb {
 
+namespace {
+constexpr int64_t kMaxPendingBytes = 256LL << 20;
+}  // namespace
+
 AsyncReplicaClient::AsyncReplicaClient(boost::asio::io_service* io_service,
                                        const std::string& ip, int port,
                                        bool is_use_long_conn)
     : socket_(*io_service),
+      retry_timer_(*io_service),
       endpoint_(boost::asio::ip::address::from_string(ip), port),
       in_process_(false) {}
 
 AsyncReplicaClient::~AsyncReplicaClient() {}
 
+int64_t AsyncReplicaClient::PendingBytes() {
+  int64_t pending = pending_bytes_.load();
+  int unsent = 0;
+  if (socket_.is_open() && ioctl(socket_.native_handle(), SIOCOUTQ, &unsent) == 0) {
+    pending += unsent;
+  }
+  return pending;
+}
+
 int AsyncReplicaClient::SendMessage(const std::string& data) {
+  // A peer that has not accepted data for this long is unreachable: drop
+  // rather than queue without bound.
+  if (pending_bytes_.load() > kMaxPendingBytes) return -1;
+  pending_bytes_ += static_cast<int64_t>(data.size());
+  NetworkTraffic::TxBytes().fetch_add(static_cast<int64_t>(data.size()),
+                                      std::memory_order_relaxed);
   queue_.Push(std::make_unique<std::string>(data));
   if (!in_process_.load()) {
     bool old_value = false;
@@ -75,6 +99,7 @@ void AsyncReplicaClient::OnSendMessage() {
     OnSend();
   } else {
     status_ = 0;
+    pending_bytes_ -= static_cast<int64_t>(pending_data_->size());
     OnSendNewMessage();
   }
 }
@@ -103,8 +128,8 @@ void AsyncReplicaClient::ReConnect() {
       status_ = 0;
       OnSendMessage();
     } else {
-      usleep(10000);
-      ReConnect();
+      retry_timer_.expires_from_now(std::chrono::milliseconds(10));
+      retry_timer_.async_wait([&](const boost::system::error_code&) { ReConnect(); });
     }
   });
 }
