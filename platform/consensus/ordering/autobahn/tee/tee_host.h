@@ -62,7 +62,8 @@ class TeeHost {
   };
 
   /* ---- Pearl-OL ---- */
-  /* Returns false if t was already attested. */
+  /* Feeds the enclave the host's clock reading (bumped past the previous
+   * one) and returns it in *ts.  Returns false if t was already attested. */
   bool OlAttest(const std::string& id, int64_t* ts, std::string* tag);
   bool OlLocalKey(const std::string& id,
                   const std::vector<SignedIndicator>& timestamps,
@@ -79,6 +80,9 @@ class TeeHost {
   /* Heartbeat: OL returns the new timestamp in *value; BOF returns the no-op
    * item's identifier in *id and its Car index in *value. */
   bool Heartbeat(std::string* id, int64_t* value);
+
+  /* Enclave garbage collection: drop executed transactions from H. */
+  bool Forget(const std::vector<std::string>& ids);
 
   /* TEE.SignBlock; refuses a second block at the same (view, height). */
   bool SignBlock(int64_t view, int64_t height, const std::string& digest,
@@ -115,6 +119,8 @@ class TeeHost {
   uint64_t eid_ = 0; /* sgx_enclave_id_t is typedef uint64_t */
   bool ok_ = false;
   int n_ = 0;
+  bool bof_ = false;
+  int64_t last_ts_ = 0;  /* OL: last timestamp fed to the enclave */
   std::mutex mu_;
 };
 

@@ -26,7 +26,18 @@ bool BofOrderer::Settled(const TxnState& t, int j) const {
 
 BofCommitResult BofOrderer::Commit(const std::vector<BofCommittedCar>& cars,
                                    const std::vector<int>& claimed_lanes) {
+  BofSettleResult settled = Settle(cars, claimed_lanes);
   BofCommitResult result;
+  result.armed = std::move(settled.armed);
+  if (!settled.eligible.empty()) {
+    result.batches = Order(std::move(settled.eligible), n_, theta_);
+  }
+  return result;
+}
+
+BofSettleResult BofOrderer::Settle(const std::vector<BofCommittedCar>& cars,
+                                   const std::vector<int>& claimed_lanes) {
+  BofSettleResult result;
 
   // A lane named by a committed claim contributes no ordering report
   // thereafter, including through the Cars committed by this same block.
@@ -55,10 +66,10 @@ BofCommitResult BofOrderer::Commit(const std::vector<BofCommittedCar>& cars,
       if (executed_.count(id)) continue;
       TxnState& t = txns_[id];
       if (t.attest.empty()) {
-        t.attest.assign(n_ + 1, Pos());
+        t.attest.assign(n_ + 1, kNoPos);
         t.hat.assign(n_ + 1, 0);
       }
-      if (t.attest[r].valid()) continue;
+      if (t.attest[r] != kNoPos) continue;
       t.attest[r] = Pos{car.index, static_cast<int32_t>(p)};
       uncovered_[r].emplace_back(car.index, id);
     }
@@ -94,54 +105,53 @@ BofCommitResult BofOrderer::Commit(const std::vector<BofCommittedCar>& cars,
     }
   }
 
-  // Eligible: c_hat fixed and every lane settled.
-  std::vector<std::string> eligible;
+  // Eligible: c_hat fixed and every lane settled.  The edge rule counts
+  // only lanes not discarded as of this block.
   for (auto it = hat_fixed_.begin(); it != hat_fixed_.end();) {
-    const TxnState& t = txns_[*it];
+    auto st = txns_.find(*it);
     bool all = true;
-    for (int j = 1; j <= n_ && all; ++j) all = Settled(t, j);
-    if (all) {
-      eligible.push_back(*it);
-      it = hat_fixed_.erase(it);
-    } else {
+    for (int j = 1; j <= n_ && all; ++j) all = Settled(st->second, j);
+    if (!all) {
       ++it;
+      continue;
     }
-  }
-  if (eligible.empty()) return result;
-
-  result.batches = Order(std::move(eligible));
-  for (const auto& batch : result.batches) {
-    for (const std::string& id : batch) {
-      txns_.erase(id);
-      executed_.insert(id);
+    BofEligibleTxn e;
+    e.id = *it;
+    e.attest = std::move(st->second.attest);
+    for (int r = 1; r <= n_; ++r) {
+      if (discarded_[r]) e.attest[r] = kNoPos;
     }
+    result.eligible.push_back(std::move(e));
+    executed_.insert(*it);
+    txns_.erase(st);
+    it = hat_fixed_.erase(it);
   }
   return result;
 }
 
 std::vector<std::vector<std::string>> BofOrderer::Order(
-    std::vector<std::string> txns) {
-  std::sort(txns.begin(), txns.end());
+    std::vector<BofEligibleTxn> txns, int n, int theta) {
+  std::sort(txns.begin(), txns.end(),
+            [](const BofEligibleTxn& a, const BofEligibleTxn& b) {
+              return a.id < b.id;
+            });
   const int m = static_cast<int>(txns.size());
-  std::vector<const TxnState*> st(m);
-  for (int i = 0; i < m; ++i) st[i] = &txns_[txns[i]];
 
   // Dependency graph (Alg. 3, edge rule Eq. 2).
   std::vector<std::vector<int>> adj(m);
   for (int a = 0; a < m; ++a) {
     for (int b = a + 1; b < m; ++b) {
       int size = 0, ab = 0;
-      for (int r = 1; r <= n_; ++r) {
-        if (discarded_[r]) continue;
-        const Pos& pa = st[a]->attest[r];
-        const Pos& pb = st[b]->attest[r];
-        if (!pa.valid() || !pb.valid()) continue;
+      for (int r = 1; r <= n; ++r) {
+        const auto& pa = txns[a].attest[r];
+        const auto& pb = txns[b].attest[r];
+        if (pa.first < 0 || pb.first < 0) continue;
         ++size;
         if (pa < pb) ++ab;
       }
-      if (ab >= theta_) {
+      if (ab >= theta) {
         adj[a].push_back(b);
-      } else if (size - ab >= theta_) {
+      } else if (size - ab >= theta) {
         adj[b].push_back(a);
       }
     }
@@ -196,7 +206,7 @@ std::vector<std::vector<std::string>> BofOrderer::Order(
   std::vector<std::vector<std::string>> members(num_comp);
   std::vector<int> smallest(num_comp, -1);
   for (int i = 0; i < m; ++i) {
-    members[comp[i]].push_back(txns[i]);
+    members[comp[i]].push_back(std::move(txns[i].id));
     if (smallest[comp[i]] == -1) smallest[comp[i]] = i;
   }
   std::vector<std::set<int>> cadj(num_comp);

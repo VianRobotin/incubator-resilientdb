@@ -2,8 +2,9 @@
  *
  * The enclave keeps, in memory its host can neither read nor modify:
  *   - H: identifiers of the transactions it has attested (one attestation
- *     per transaction, so a host cannot equivocate on indicators);
- *   - OL: its monotonic clock, the transactions whose local ordering key is
+ *     per transaction, so a host cannot equivocate on indicators), pruned
+ *     once a transaction is executed;
+ *   - OL: the last timestamp it attested (host timestamps must exceed it), the transactions whose local ordering key is
  *     not yet sealed into a Car, and the keys it certified; from these it
  *     derives the completion frontier G_r;
  *   - BOF: its sequence counter, the open Car, and the placement
@@ -69,6 +70,9 @@ int64_t g_clock = 0;                                   /* last attested T   */
 std::map<int64_t, std::string>* g_ol_unsealed = nullptr;     /* T -> id      */
 std::unordered_map<std::string, int64_t>* g_ol_own_ts = nullptr;  /* id -> T */
 std::unordered_map<std::string, int64_t>* g_ol_keys = nullptr;    /* id -> K */
+/* Executed transactions whose own key is not sealed yet: they leave H at
+ * the seal, so the frontier still cannot pass them. */
+std::unordered_set<std::string>* g_forget_on_seal = nullptr;
 
 /* ---- BOF ---- */
 int64_t g_seq = 0;                                     /* s                 */
@@ -139,12 +143,12 @@ int64_t CompletionFrontier() {
   return g_ol_unsealed->begin()->first - 1;
 }
 
-int64_t NextTimestamp() {
-  int64_t t = 0;
-  ocall_get_time(&t);
-  if (t <= g_clock) t = g_clock + 1;
-  g_clock = t;
-  return t;
+/* OL: the host chooses the timestamps fed to its enclave, subject only to
+ * the monotonicity check (Sec. 5.1). */
+bool FreshTimestamp(int64_t ts) {
+  if (ts <= g_clock) return false;
+  g_clock = ts;
+  return true;
 }
 
 }  // namespace
@@ -171,6 +175,7 @@ sgx_status_t ecall_init(uint32_t self_id, uint32_t n, uint32_t f,
   g_ol_unsealed = new std::map<int64_t, std::string>();
   g_ol_own_ts = new std::unordered_map<std::string, int64_t>();
   g_ol_keys = new std::unordered_map<std::string, int64_t>();
+  g_forget_on_seal = new std::unordered_set<std::string>();
   g_open_items = new std::vector<std::pair<std::string, bool>>();
   g_window_open = new std::unordered_map<std::string, int64_t>();
   g_open_count = new std::map<int64_t, int>();
@@ -180,19 +185,19 @@ sgx_status_t ecall_init(uint32_t self_id, uint32_t n, uint32_t f,
   return SGX_SUCCESS;
 }
 
-sgx_status_t ecall_ol_attest(const uint8_t* id, int64_t* ts_out,
+sgx_status_t ecall_ol_attest(const uint8_t* id, int64_t ts,
                              uint8_t* tag_out) {
   if (!g_initialized || g_mode != kModeOL) return SGX_ERROR_INVALID_STATE;
   std::string key = Key(id);
-  if (!g_history->insert(key).second) return SGX_ERROR_INVALID_PARAMETER;
-
-  int64_t t = NextTimestamp();
-  (*g_ol_unsealed)[t] = key;
-  (*g_ol_own_ts)[key] = t;
+  if (g_history->count(key) || !FreshTimestamp(ts)) {
+    return SGX_ERROR_INVALID_PARAMETER;
+  }
+  g_history->insert(key);
+  (*g_ol_unsealed)[ts] = key;
+  (*g_ol_own_ts)[key] = ts;
 
   uint8_t msg[PEARL_INDICATOR_MSG_LEN];
-  pearl_indicator_msg(msg, PEARL_DOM_OL_TIMESTAMP, g_self, id, t);
-  *ts_out = t;
+  pearl_indicator_msg(msg, PEARL_DOM_OL_TIMESTAMP, g_self, id, ts);
   return Tag(msg, sizeof(msg), tag_out);
 }
 
@@ -253,6 +258,7 @@ sgx_status_t ecall_ol_seal_car(const uint8_t* items, uint32_t items_len,
     g_ol_unsealed->erase(ts->second);
     g_ol_own_ts->erase(ts);
     g_ol_keys->erase(key);
+    if (g_forget_on_seal->erase(key)) g_history->erase(key);
   }
 
   uint8_t items_digest[PEARL_ID_LEN];
@@ -380,12 +386,14 @@ sgx_status_t ecall_bof_seal_car(uint8_t* items_out, uint32_t items_cap,
                  index_out, car_hash_out, tag_out);
 }
 
-sgx_status_t ecall_heartbeat(uint8_t* id_out, int64_t* value_out) {
+sgx_status_t ecall_heartbeat(int64_t ts, uint8_t* id_out,
+                             int64_t* value_out) {
   if (!g_initialized) return SGX_ERROR_INVALID_STATE;
   memset(id_out, 0, PEARL_ID_LEN);
   if (g_mode == kModeOL) {
     /* A fresh indicator with no transaction behind it: G_r may pass it. */
-    *value_out = NextTimestamp();
+    if (!FreshTimestamp(ts)) return SGX_ERROR_INVALID_PARAMETER;
+    *value_out = ts;
     return SGX_SUCCESS;
   }
   /* BOF: an enclave-generated no-op item, whose window is trivially closed
@@ -414,6 +422,24 @@ sgx_status_t ecall_sign_block(int64_t view, int64_t height,
   uint8_t msg[PEARL_BLOCK_MSG_LEN];
   pearl_block_msg(msg, g_self, view, height, digest);
   return Tag(msg, sizeof(msg), tag_out);
+}
+
+/* Enclave garbage collection (Sec. 5.1): once a transaction has been
+ * executed, its digest leaves H, so the enclave state stays proportional to
+ * the pending transactions.  A resubmission would get a fresh, larger
+ * indicator and is discarded against the committed history. */
+sgx_status_t ecall_forget(const uint8_t* ids, uint32_t ids_len) {
+  if (!g_initialized) return SGX_ERROR_INVALID_STATE;
+  if (ids_len % PEARL_ID_LEN != 0) return SGX_ERROR_INVALID_PARAMETER;
+  for (uint32_t i = 0; i < ids_len / PEARL_ID_LEN; i++) {
+    std::string key = Key(ids + i * PEARL_ID_LEN);
+    if (g_mode == kModeOL && g_ol_own_ts->count(key)) {
+      g_forget_on_seal->insert(key);
+    } else {
+      g_history->erase(key);
+    }
+  }
+  return SGX_SUCCESS;
 }
 
 sgx_status_t ecall_verify_batch(const uint8_t* records, uint32_t rec_len,

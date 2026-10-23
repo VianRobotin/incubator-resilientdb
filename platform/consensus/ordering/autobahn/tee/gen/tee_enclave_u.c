@@ -13,7 +13,7 @@ typedef struct ms_ecall_init_t {
 typedef struct ms_ecall_ol_attest_t {
 	sgx_status_t ms_retval;
 	const uint8_t* ms_id;
-	int64_t* ms_ts_out;
+	int64_t ms_ts;
 	uint8_t* ms_tag_out;
 } ms_ecall_ol_attest_t;
 
@@ -64,9 +64,16 @@ typedef struct ms_ecall_bof_seal_car_t {
 
 typedef struct ms_ecall_heartbeat_t {
 	sgx_status_t ms_retval;
+	int64_t ms_ts;
 	uint8_t* ms_id_out;
 	int64_t* ms_value_out;
 } ms_ecall_heartbeat_t;
+
+typedef struct ms_ecall_forget_t {
+	sgx_status_t ms_retval;
+	const uint8_t* ms_ids;
+	uint32_t ms_ids_len;
+} ms_ecall_forget_t;
 
 typedef struct ms_ecall_sign_block_t {
 	sgx_status_t ms_retval;
@@ -83,10 +90,6 @@ typedef struct ms_ecall_verify_batch_t {
 	uint8_t* ms_ok_out;
 	uint32_t ms_count;
 } ms_ecall_verify_batch_t;
-
-typedef struct ms_ocall_get_time_t {
-	int64_t* ms_t;
-} ms_ocall_get_time_t;
 
 typedef struct ms_sgx_oc_cpuidex_t {
 	int* ms_cpuinfo;
@@ -115,14 +118,6 @@ typedef struct ms_sgx_thread_set_multiple_untrusted_events_ocall_t {
 	const void** ms_waiters;
 	size_t ms_total;
 } ms_sgx_thread_set_multiple_untrusted_events_ocall_t;
-
-static sgx_status_t SGX_CDECL tee_enclave_ocall_get_time(void* pms)
-{
-	ms_ocall_get_time_t* ms = SGX_CAST(ms_ocall_get_time_t*, pms);
-	ocall_get_time(ms->ms_t);
-
-	return SGX_SUCCESS;
-}
 
 static sgx_status_t SGX_CDECL tee_enclave_sgx_oc_cpuidex(void* pms)
 {
@@ -166,11 +161,10 @@ static sgx_status_t SGX_CDECL tee_enclave_sgx_thread_set_multiple_untrusted_even
 
 static const struct {
 	size_t nr_ocall;
-	void * table[6];
+	void * table[5];
 } ocall_table_tee_enclave = {
-	6,
+	5,
 	{
-		(void*)tee_enclave_ocall_get_time,
 		(void*)tee_enclave_sgx_oc_cpuidex,
 		(void*)tee_enclave_sgx_thread_wait_untrusted_event_ocall,
 		(void*)tee_enclave_sgx_thread_set_untrusted_event_ocall,
@@ -192,12 +186,12 @@ sgx_status_t ecall_init(sgx_enclave_id_t eid, sgx_status_t* retval, uint32_t sel
 	return status;
 }
 
-sgx_status_t ecall_ol_attest(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* id, int64_t* ts_out, uint8_t* tag_out)
+sgx_status_t ecall_ol_attest(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* id, int64_t ts, uint8_t* tag_out)
 {
 	sgx_status_t status;
 	ms_ecall_ol_attest_t ms;
 	ms.ms_id = id;
-	ms.ms_ts_out = ts_out;
+	ms.ms_ts = ts;
 	ms.ms_tag_out = tag_out;
 	status = sgx_ecall(eid, 1, &ocall_table_tee_enclave, &ms);
 	if (status == SGX_SUCCESS && retval) *retval = ms.ms_retval;
@@ -274,13 +268,25 @@ sgx_status_t ecall_bof_seal_car(sgx_enclave_id_t eid, sgx_status_t* retval, uint
 	return status;
 }
 
-sgx_status_t ecall_heartbeat(sgx_enclave_id_t eid, sgx_status_t* retval, uint8_t* id_out, int64_t* value_out)
+sgx_status_t ecall_heartbeat(sgx_enclave_id_t eid, sgx_status_t* retval, int64_t ts, uint8_t* id_out, int64_t* value_out)
 {
 	sgx_status_t status;
 	ms_ecall_heartbeat_t ms;
+	ms.ms_ts = ts;
 	ms.ms_id_out = id_out;
 	ms.ms_value_out = value_out;
 	status = sgx_ecall(eid, 7, &ocall_table_tee_enclave, &ms);
+	if (status == SGX_SUCCESS && retval) *retval = ms.ms_retval;
+	return status;
+}
+
+sgx_status_t ecall_forget(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* ids, uint32_t ids_len)
+{
+	sgx_status_t status;
+	ms_ecall_forget_t ms;
+	ms.ms_ids = ids;
+	ms.ms_ids_len = ids_len;
+	status = sgx_ecall(eid, 8, &ocall_table_tee_enclave, &ms);
 	if (status == SGX_SUCCESS && retval) *retval = ms.ms_retval;
 	return status;
 }
@@ -293,7 +299,7 @@ sgx_status_t ecall_sign_block(sgx_enclave_id_t eid, sgx_status_t* retval, int64_
 	ms.ms_height = height;
 	ms.ms_digest = digest;
 	ms.ms_tag_out = tag_out;
-	status = sgx_ecall(eid, 8, &ocall_table_tee_enclave, &ms);
+	status = sgx_ecall(eid, 9, &ocall_table_tee_enclave, &ms);
 	if (status == SGX_SUCCESS && retval) *retval = ms.ms_retval;
 	return status;
 }
@@ -306,7 +312,7 @@ sgx_status_t ecall_verify_batch(sgx_enclave_id_t eid, sgx_status_t* retval, cons
 	ms.ms_rec_len = rec_len;
 	ms.ms_ok_out = ok_out;
 	ms.ms_count = count;
-	status = sgx_ecall(eid, 9, &ocall_table_tee_enclave, &ms);
+	status = sgx_ecall(eid, 10, &ocall_table_tee_enclave, &ms);
 	if (status == SGX_SUCCESS && retval) *retval = ms.ms_retval;
 	return status;
 }

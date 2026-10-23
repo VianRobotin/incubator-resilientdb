@@ -120,11 +120,14 @@ class AutoBahn : public common::ProtocolBase {
     int64_t view = 0;
   };
 
-  // A committed block as handed to the execution thread.
+  // A committed block as handed to the execution thread.  In BOF,
+  // settlement already ran at commit (it arms the delinquency timers), so the
+  // block carries the transactions it made eligible.
   struct CommittedBlock {
     int64_t height = 0;
     std::vector<Car> cars;     // commitment order
-    std::vector<int> claims;   // lanes named by newly committed claims
+    std::vector<BofEligibleTxn> bof_eligible;
+    size_t bof_pending = 0;
   };
 
   // Protocol-thread plumbing.
@@ -182,7 +185,8 @@ class AutoBahn : public common::ProtocolBase {
   void QuitCurrentView();
   void EnterNextView();
 
-  // BOF delinquency timers (Sec. 7.1).
+  // BOF settlement at commit and delinquency timers (Sec. 7.1).
+  void SettleBof(const std::vector<int>& claims, CommittedBlock* out);
   void ArmDelinquencyTimers(const std::vector<std::pair<int, int64_t>>& armed);
   void CheckDelinquencyTimers();
 
@@ -195,6 +199,7 @@ class AutoBahn : public common::ProtocolBase {
   const int block_size_;
   const Params params_;
   const bool bof_;
+  int bof_theta_ = 0;  // theta = ceil(gamma (n - f)), fixed at construction
   SignatureVerifier* verifier_;
   Stats* global_stats_;
   std::unique_ptr<TeeHost> tee_;
@@ -262,9 +267,11 @@ class AutoBahn : public common::ProtocolBase {
   std::set<int> claimed_lanes_;    // claimed in this view, not yet committed
   std::set<int> discarded_lanes_;  // named by a committed claim
 
+  // BOF settlement state (protocol thread).
+  std::unique_ptr<BofOrderer> bof_orderer_;
+
   // ---- Execution state (execution thread) ----
   std::unique_ptr<OlOrderer> ol_;
-  std::unique_ptr<BofOrderer> bof_orderer_;
   std::unordered_map<std::string, Transaction> exec_bodies_;
   std::unordered_set<std::string> exec_committed_;
   int64_t execute_id_ = 1;

@@ -21,11 +21,13 @@ enclave {
             [in, size=32] const uint8_t* group_seed
         );
 
-        /* OL, OnFirstReceive: attest t with a monotonic host timestamp.
-         * Returns SGX_ERROR_INVALID_PARAMETER if t is already in H. */
+        /* OL, OnFirstReceive: attest t with the host-provided timestamp
+         * `ts`, accepted only if it exceeds the last timestamp attested
+         * (Sec. 5.1).  Returns SGX_ERROR_INVALID_PARAMETER if t is already
+         * in H or `ts` is not fresh. */
         public sgx_status_t ecall_ol_attest(
             [in, size=32]  const uint8_t* id,
-            [out]          int64_t*       ts_out,
+            int64_t                       ts,
             [out, size=32] uint8_t*       tag_out
         );
 
@@ -85,12 +87,22 @@ enclave {
         );
 
         /* Heartbeat (Sec. 5.2): issue a fresh indicator when client traffic
-         * pauses.  OL: advances the attested clock (value_out = timestamp).
-         * BOF: places an enclave-generated no-op item in the open Car
-         * (id_out = its identifier, value_out = its Car index). */
+         * pauses.  OL: attests the host-provided timestamp `ts` (same
+         * freshness rule as ecall_ol_attest) with no transaction behind it.
+         * BOF: ignores `ts` and places an enclave-generated no-op item in the
+         * open Car (id_out = its identifier, value_out = its Car index). */
         public sgx_status_t ecall_heartbeat(
+            int64_t                 ts,
             [out, size=32] uint8_t* id_out,
             [out]          int64_t* value_out
+        );
+
+        /* Enclave garbage collection (Sec. 5.1): remove executed
+         * transactions (count PEARL_ID_LEN identifiers) from H.  In OL, an
+         * identifier whose local key is not sealed yet leaves H when it is. */
+        public sgx_status_t ecall_forget(
+            [in, size=ids_len] const uint8_t* ids,
+            uint32_t                          ids_len
         );
 
         /* TEE.SignBlock (Alg. 2): sign a consensus block digest.  Refuses a
@@ -109,12 +121,5 @@ enclave {
             [out, size=count]   uint8_t*       ok_out,
             uint32_t                           count
         );
-    };
-
-    untrusted {
-        /* Host-provided wall-clock time (microseconds since epoch).  The
-         * enclave only enforces that attested values strictly increase
-         * (Sec. 2: TEEs have no trusted clock). */
-        void ocall_get_time([out] int64_t* t);
     };
 };

@@ -30,6 +30,21 @@ struct BofCommittedCar {
   std::vector<Announcement> m;
 };
 
+// An eligible transaction with the committed attestations the edge rule
+// counts: attest[r] = (Car index, position in Car) of lane r's attestation,
+// or (-1, -1) if the lane has none or is discarded (index 0 unused).
+struct BofEligibleTxn {
+  std::string id;
+  std::vector<std::pair<int64_t, int32_t>> attest;
+};
+
+struct BofSettleResult {
+  std::vector<BofEligibleTxn> eligible;
+  // (lane j, c_hat_j(t)) pairs fixed by this block for lanes not yet settled:
+  // each arms a delinquency timer (Sec. 7.1).
+  std::vector<std::pair<int, int64_t>> armed;
+};
+
 struct BofCommitResult {
   // Batches to execute, in order; transactions inside a batch sorted by digest.
   std::vector<std::vector<std::string>> batches;
@@ -58,8 +73,18 @@ class BofOrderer {
  public:
   BofOrderer(int n, int f, double gamma);
 
-  // Processes one committed block: its delinquency claims (`claimed_lanes`)
-  // and its newly committed Cars, in commitment order.
+  // Settlement of one committed block: its delinquency claims
+  // (`claimed_lanes`) and its newly committed Cars, in commitment order.
+  // Cheap; run at commit so that delinquency timers are armed then.
+  BofSettleResult Settle(const std::vector<BofCommittedCar>& cars,
+                         const std::vector<int>& claimed_lanes);
+
+  // Alg. 3 over the transactions a Settle() call made eligible: a pure
+  // function of its input, so it can run on another thread.
+  static std::vector<std::vector<std::string>> Order(
+      std::vector<BofEligibleTxn> txns, int n, int theta);
+
+  // Settle() followed by Order().
   BofCommitResult Commit(const std::vector<BofCommittedCar>& cars,
                          const std::vector<int>& claimed_lanes);
 
@@ -74,14 +99,8 @@ class BofOrderer {
   size_t PendingSize() const { return txns_.size(); }
 
  private:
-  struct Pos {
-    int64_t car = -1;
-    int32_t pos = -1;
-    bool valid() const { return car >= 0; }
-    bool operator<(const Pos& o) const {
-      return car != o.car ? car < o.car : pos < o.pos;
-    }
-  };
+  using Pos = std::pair<int64_t, int32_t>;  // (Car index, position in Car)
+  static constexpr Pos kNoPos{-1, -1};
   struct TxnState {
     std::vector<Pos> attest;        // per lane; committed position s_R(t)
     std::vector<int> coverers;      // first f+1 covering lanes
@@ -90,7 +109,6 @@ class BofOrderer {
   };
 
   bool Settled(const TxnState& t, int j) const;
-  std::vector<std::vector<std::string>> Order(std::vector<std::string> txns);
 
   int n_, f_;
   int theta_;

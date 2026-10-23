@@ -110,6 +110,19 @@ void CheckOl() {
   CHECK(tees[1]->OlSealCar({}, &car3));
   CHECK(car3.frontier == hb_ts);
   CHECK(car3.hash == TeeHost::OlCarHash(1, 3, car2.hash, {}, hb_ts));
+  // Timestamps the host feeds the enclave strictly increase.
+  CHECK(hb_ts > ts[2][0].value);
+
+  // Garbage collection: an executed, sealed transaction leaves H, and a
+  // resubmission gets a fresh, larger timestamp.
+  CHECK(tees[1]->Forget({Id(1)}));
+  int64_t again = 0;
+  std::string again_tag;
+  CHECK(tees[1]->OlAttest(Id(1), &again, &again_tag));
+  CHECK(again > hb_ts);
+  // One whose own key is not sealed yet stays in H until it is.
+  CHECK(tees[1]->Forget({Id(1)}));
+  CHECK(!tees[1]->OlAttest(Id(1), &again, &again_tag));
 }
 
 void CheckBof() {
@@ -167,6 +180,13 @@ void CheckBof() {
       {{TeeHost::BofPlacementMsg(2, c3.m[2].id, c3.m[2].car), c3.m[2].tag},
        {TeeHost::CarSigMsg(1, c3.hash), c3.tag}});
   CHECK(ok[0] && ok[1]);
+
+  // Garbage collection: an executed transaction leaves H.
+  int64_t c = 0;
+  std::string ptag;
+  CHECK(!tees[1]->BofPlace(Id(1), &c, &ptag));
+  CHECK(tees[1]->Forget({Id(1)}));
+  CHECK(tees[1]->BofPlace(Id(1), &c, &ptag));
 
   // Block signing refuses equivocation at the same height.
   std::string tag;

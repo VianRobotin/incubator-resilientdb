@@ -48,6 +48,7 @@ AutoBahn::AutoBahn(int id, int f, int total_num, int block_size,
       << "Pearl requires its enclave (" << params_.enclave_path << ")";
   if (bof_) {
     bof_orderer_ = std::make_unique<BofOrderer>(n_, f_, params_.bof_gamma);
+    bof_theta_ = bof_orderer_->Theta();
   } else {
     ol_ = std::make_unique<OlOrderer>(n_, f_);
   }
@@ -979,14 +980,16 @@ void AutoBahn::ProcessPendingCommits() {
         if (lane.acked < lane.committed) lane.acked = lane.committed;
       }
     }
+    std::vector<int> claims;
     for (const Claim& c : b.claims()) {
       if (discarded_lanes_.insert(c.lane()).second) {
-        out.claims.push_back(c.lane());
+        claims.push_back(c.lane());
         LOG(ERROR) << "committed delinquency claim <" << c.lane() << ", "
                    << c.position() << "> in block " << b.height()
                    << ": lane " << c.lane() << " is ignored from now on";
       }
     }
+    if (bof_) SettleBof(claims, &out);
     st.committed = true;
     committed_height_ = b.height();
     committed_hash_ = b.hash();
@@ -1246,6 +1249,31 @@ void AutoBahn::ReceiveStatus(std::unique_ptr<Status> status) {
 // Armed when the block fixing c_hat_j(t) commits; expires after
 // D = 2X + 3 Delta = 5 Delta unless a certified Car of lane j at position
 // c_hat_j(t) or beyond was received.  Expiry is final.
+// Settlement is a function of the committed prefix only; running it here
+// arms each delinquency timer when the block that fixes c_hat_j(t) commits.
+void AutoBahn::SettleBof(const std::vector<int>& claims, CommittedBlock* out) {
+  std::vector<BofCommittedCar> cars;
+  for (const Car& car : out->cars) {
+    BofCommittedCar c;
+    c.lane = car.lane();
+    c.index = car.index();
+    c.w = car.frontier();
+    c.items.assign(car.bof_items().begin(), car.bof_items().end());
+    c.heartbeat.assign(car.bof_heartbeat().begin(), car.bof_heartbeat().end());
+    c.m.assign(n_ + 1, BofCommittedCar::Announcement());
+    for (int j = 1; j <= n_ && j <= car.m_size(); ++j) {
+      c.m[j].present = car.m(j - 1).present();
+      c.m[j].car = car.m(j - 1).car();
+    }
+    cars.push_back(std::move(c));
+  }
+  BofSettleResult res = bof_orderer_->Settle(cars, claims);
+  ArmDelinquencyTimers(res.armed);
+  claim_targets_ = bof_orderer_->ClaimTargets();
+  out->bof_eligible = std::move(res.eligible);
+  out->bof_pending = bof_orderer_->PendingSize();
+}
+
 void AutoBahn::ArmDelinquencyTimers(
     const std::vector<std::pair<int, int64_t>>& armed) {
   int64_t now = Now();
@@ -1326,34 +1354,17 @@ void AutoBahn::Execute(const CommittedBlock& block) {
     }
     order = ol_->Commit(cars);
     pending = ol_->PendingSize();
-  } else {
-    std::vector<BofCommittedCar> cars;
-    for (const Car& car : block.cars) {
-      BofCommittedCar c;
-      c.lane = car.lane();
-      c.index = car.index();
-      c.w = car.frontier();
-      c.items.assign(car.bof_items().begin(), car.bof_items().end());
-      c.heartbeat.assign(car.bof_heartbeat().begin(), car.bof_heartbeat().end());
-      c.m.assign(n_ + 1, BofCommittedCar::Announcement());
-      for (int j = 1; j <= n_ && j <= car.m_size(); ++j) {
-        c.m[j].present = car.m(j - 1).present();
-        c.m[j].car = car.m(j - 1).car();
-      }
-      cars.push_back(std::move(c));
-    }
-    BofCommitResult res = bof_orderer_->Commit(cars, block.claims);
-    for (auto& batch : res.batches) {
+  } else if (!block.bof_eligible.empty()) {
+    auto batches = BofOrderer::Order(block.bof_eligible, n_, bof_theta_);
+    for (auto& batch : batches) {
       for (auto& id : batch) order.push_back(std::move(id));
     }
-    pending = bof_orderer_->PendingSize();
-    auto armed = std::make_shared<std::vector<std::pair<int, int64_t>>>(std::move(res.armed));
-    auto targets = std::make_shared<std::map<int, int64_t>>(bof_orderer_->ClaimTargets());
-    Post([this, armed, targets] {
-      ArmDelinquencyTimers(*armed);
-      claim_targets_ = *targets;
-    });
+    pending = block.bof_pending;
+  } else {
+    pending = block.bof_pending;
   }
+  // Enclave garbage collection (Sec. 5.1): executed transactions leave H.
+  tee_->Forget(order);
 
   int64_t exec_now = Now();
   int64_t lat_sum = 0, lat_max = 0;

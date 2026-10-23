@@ -12,19 +12,21 @@
 #include <sgx_urts.h>
 #include <sys/time.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 
-/* ---- OCALL implementation — must have C linkage (called by generated stub) ---- */
-extern "C" void ocall_get_time(int64_t* t) {
-  struct timeval tv;
-  gettimeofday(&tv, nullptr);
-  *t = static_cast<int64_t>(tv.tv_sec) * 1000000 + tv.tv_usec;
-}
-
 namespace resdb {
 namespace autobahn {
+
+namespace {
+int64_t WallClockUs() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  return static_cast<int64_t>(tv.tv_sec) * 1000000 + tv.tv_usec;
+}
+}  // namespace
 
 namespace {
 
@@ -143,6 +145,7 @@ bool TeeHost::Initialize(const std::string& enclave_path, int self_id, int n,
     return false;
   }
   n_ = n;
+  bof_ = bof;
   ok_ = true;
   return true;
 }
@@ -155,8 +158,12 @@ bool TeeHost::OlAttest(const std::string& id, int64_t* ts, std::string* tag) {
   uint8_t out_tag[PEARL_TAG_LEN];
   sgx_status_t ecall_ret;
   std::unique_lock<std::mutex> lk(mu_);
+  /* The host's clock reading, bumped past the last timestamp it fed the
+   * enclave, which accepts only strictly increasing values. */
+  *ts = std::max(WallClockUs(), last_ts_ + 1);
   sgx_status_t ret = ecall_ol_attest(static_cast<sgx_enclave_id_t>(eid_),
-                                     &ecall_ret, U8(id32), ts, out_tag);
+                                     &ecall_ret, U8(id32), *ts, out_tag);
+  if (ret == SGX_SUCCESS && ecall_ret == SGX_SUCCESS) last_ts_ = *ts;
   lk.unlock();
   if (!Check("ecall_ol_attest", ret, ecall_ret)) return false;
   tag->assign(reinterpret_cast<char*>(out_tag), PEARL_TAG_LEN);
@@ -275,12 +282,28 @@ bool TeeHost::Heartbeat(std::string* id, int64_t* value) {
   uint8_t out_id[PEARL_ID_LEN];
   sgx_status_t ecall_ret;
   std::unique_lock<std::mutex> lk(mu_);
+  int64_t ts = std::max(WallClockUs(), last_ts_ + 1);
   sgx_status_t ret = ecall_heartbeat(static_cast<sgx_enclave_id_t>(eid_),
-                                     &ecall_ret, out_id, value);
+                                     &ecall_ret, ts, out_id, value);
+  if (ret == SGX_SUCCESS && ecall_ret == SGX_SUCCESS && !bof_) last_ts_ = ts;
   lk.unlock();
   if (!Check("ecall_heartbeat", ret, ecall_ret)) return false;
   id->assign(reinterpret_cast<char*>(out_id), PEARL_ID_LEN);
   return true;
+}
+
+bool TeeHost::Forget(const std::vector<std::string>& ids) {
+  if (!ok_) return false;
+  if (ids.empty()) return true;
+  std::string buf;
+  buf.reserve(ids.size() * PEARL_ID_LEN);
+  for (const std::string& id : ids) buf += Id32(id);
+  sgx_status_t ecall_ret;
+  std::unique_lock<std::mutex> lk(mu_);
+  sgx_status_t ret = ecall_forget(static_cast<sgx_enclave_id_t>(eid_), &ecall_ret,
+                                  U8(buf), static_cast<uint32_t>(buf.size()));
+  lk.unlock();
+  return Check("ecall_forget", ret, ecall_ret);
 }
 
 bool TeeHost::SignBlock(int64_t view, int64_t height, const std::string& digest,

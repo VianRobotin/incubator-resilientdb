@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
     KVRequest request;
     request.set_cmd(KVRequest::SET);
     request.set_key(GetRandomKey());
-    request.set_value("helloworld");
+    request.set_value(std::string(128, 'x'));
     std::string request_data;
     request.SerializeToString(&request_data);
     return request_data;

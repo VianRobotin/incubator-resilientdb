@@ -353,7 +353,9 @@ def run_experiment(
     total_secs = runtime + 120
     duration_str = str(datetime.timedelta(seconds=total_secs))
     pm = PreserveManager(USERNAME)
-    total_machines = num_replicas + num_clients
+    # Each node hosts one replica and up to one co-located client (paper
+    # Sec. 8.1).
+    total_machines = max(num_replicas, num_clients)
     per_client_tps = (target_tps // num_clients) if target_tps > 0 else 0
 
     if dry_run:
@@ -381,7 +383,7 @@ def run_experiment(
             raise RuntimeError(f"Timed out waiting for {total_machines} machines")
 
         replica_hosts = hostnames[:num_replicas]
-        client_hosts  = hostnames[num_replicas:]
+        client_hosts  = [hostnames[j % total_machines] for j in range(num_clients)]
         replica_ips   = [socket.gethostbyname(h) for h in replica_hosts]
         client_ips    = [socket.gethostbyname(h) for h in client_hosts]
         print(f"Replicas: {replica_hosts}")
@@ -421,11 +423,12 @@ def run_experiment(
         procs = []
         for i, host in enumerate(replica_hosts, 1):
             log_file  = log_dir / f"server_{i}.log"
+            pid_file  = log_dir / f"server_{i}.pid"
             priv_key  = cert_dir / f"node_{i}.key.pri"
             cert_file = cert_dir / f"cert_{i}.cert"
             p = ssh_cmd(host,
                 f"{env_prefix}nohup {SERVER_BIN} {config_path} {priv_key} "
-                f"{cert_file} > {log_file} 2>&1 &")
+                f"{cert_file} > {log_file} 2>&1 & echo $! > {pid_file}")
             if p:
                 procs.append(p)
         for p in procs:
@@ -495,8 +498,11 @@ def run_experiment(
                   f"{list(range(live_replicas+1, num_replicas+1))} "
                   f"on {silent_hosts}")
             kill_silent = []
-            for host in silent_hosts:
-                p = ssh_cmd(host, "killall -9 kv_server_performance 2>/dev/null || true")
+            # Kill the replica process only: the node's co-located client
+            # keeps running.
+            for i, host in enumerate(silent_hosts, live_replicas + 1):
+                pid_file = log_dir / f"server_{i}.pid"
+                p = ssh_cmd(host, f"kill -9 $(cat {pid_file}) 2>/dev/null || true")
                 if p:
                     kill_silent.append(p)
             for p in kill_silent:
@@ -516,10 +522,9 @@ def run_experiment(
         print(f"Running for {runtime}s...")
         time.sleep(runtime)
 
-        # Kill all (skip silent replicas — they were never started)
         print("Killing nodes...")
         kill_procs = []
-        for host in replica_hosts[:live_replicas] + client_hosts:
+        for host in dict.fromkeys(replica_hosts + client_hosts):
             p = ssh_cmd(host, "killall -9 kv_server_performance 2>/dev/null || true")
             if p:
                 kill_procs.append(p)
