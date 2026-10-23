@@ -33,6 +33,7 @@
 
 #include "common/crypto/signature_verifier.h"
 #include "common/utils/utils.h"
+#include "platform/proto/resdb.pb.h"
 #include "proto/kv/kv.pb.h"
 
 namespace resdb {
@@ -172,6 +173,12 @@ int Consensus::ProcessCustomConsensus(std::unique_ptr<Request> request) {
     case MessageType::Body_Reply:
       if (auto m = Parse<BodyReply>(*request)) autobahn_->ReceiveBodyReply(std::move(m));
       break;
+    case MessageType::Block_Query:
+      if (auto m = Parse<BlockQuery>(*request)) autobahn_->ReceiveBlockQuery(std::move(m));
+      break;
+    case MessageType::Block_Reply:
+      if (auto m = Parse<BlockReply>(*request)) autobahn_->ReceiveBlockReply(std::move(m));
+      break;
     case MessageType::SyncHS_Propose:
       if (auto m = Parse<Proposal>(*request)) autobahn_->ReceiveProposal(std::move(m));
       break;
@@ -202,12 +209,18 @@ int Consensus::CommitMsg(const google::protobuf::Message& msg) {
   return CommitMsgInternal(dynamic_cast<const Transaction&>(msg));
 }
 
+// Executes a transaction on the application (the KV store) when Pearl's
+// execution layer releases it, in Pearl's order.  Throughput and latency are
+// measured by the replicas (`executed_batch`); the benchmark client sends
+// open-loop at its target rate, so no reply is sent back.
 int Consensus::CommitMsgInternal(const Transaction& txn) {
-  // Execution throughput and latency are measured by the replicas (Execute()
-  // logs `executed_batch`).  The benchmark client sends open-loop at its
-  // target rate (das.py sets max_process_txn above any run's volume), so no
-  // reply is sent back.
-  (void)txn;
+  BatchUserRequest batch;
+  if (!batch.ParseFromString(txn.data())) {
+    LOG(ERROR) << "Pearl: cannot parse the client request of transaction " << txn.id();
+    return -1;
+  }
+  TransactionManager* app = transaction_executor_->GetTransactionManager();
+  if (app != nullptr) app->ExecuteBatch(batch);
   return 0;
 }
 

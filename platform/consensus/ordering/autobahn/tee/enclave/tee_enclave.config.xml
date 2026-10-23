@@ -4,8 +4,9 @@
   <StackMaxSize>0x80000</StackMaxSize>
   <HeapMaxSize>0x20000000</HeapMaxSize>
   <!-- TCSNum: max concurrent threads entering the enclave.
-       One per replica worker thread is sufficient. -->
-  <TCSNum>16</TCSNum>
+       One per thread that may enter the enclave at once (network workers verify
+       tags concurrently). -->
+  <TCSNum>64</TCSNum>
   <TCSPolicy>1</TCSPolicy>
   <!-- DisableDebug=0 allows debugger attachment in sim/debug mode. -->
   <DisableDebug>0</DisableDebug>

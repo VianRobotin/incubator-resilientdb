@@ -72,6 +72,10 @@ class TransactionExecutor {
 
   void Prepare(std::unique_ptr<Request> request);
 
+  // The application (e.g. the KV executor), for protocols that execute
+  // requests themselves in their own order.
+  TransactionManager* GetTransactionManager() { return transaction_manager_.get(); }
+
  private:
   void Execute(std::unique_ptr<Request> request, bool need_execute = true);
   void OnlyExecute(std::unique_ptr<Request> request);

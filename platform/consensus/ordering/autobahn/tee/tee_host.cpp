@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <thread>
 
 static_assert(PEARL_SIGNED_TS_REC == PEARL_SIGNED_PLACE_REC, "one record layout");
 
@@ -43,6 +44,15 @@ std::string Id32(const std::string& id) {
   std::string out(PEARL_ID_LEN, '\0');
   std::memcpy(&out[0], id.data(), std::min(id.size(), out.size()));
   return out;
+}
+
+/* An enclave admits at most TCSNum threads at a time; a call that finds
+ * every slot busy is retried instead of failing. */
+template <typename Call>
+sgx_status_t RetryBusy(Call call) {
+  sgx_status_t ret;
+  while ((ret = call()) == SGX_ERROR_OUT_OF_TCS) std::this_thread::yield();
+  return ret;
 }
 
 bool Check(const char* what, sgx_status_t ret, sgx_status_t ecall_ret) {
@@ -129,9 +139,9 @@ bool TeeHost::Initialize(const std::string& enclave_path, int self_id, int n,
 
   sgx_status_t ecall_ret;
   std::string seed = Id32(group_seed);
-  ret = ecall_init(eid, &ecall_ret, static_cast<uint32_t>(self_id),
+  ret = RetryBusy([&] { return ecall_init(eid, &ecall_ret, static_cast<uint32_t>(self_id),
                    static_cast<uint32_t>(n), static_cast<uint32_t>(f),
-                   bof ? 1u : 0u, U8(seed));
+                   bof ? 1u : 0u, U8(seed)); });
   if (ret != SGX_SUCCESS || ecall_ret != SGX_SUCCESS) {
     fprintf(stderr, "[TEE] ecall_init failed: 0x%x / 0x%x\n", ret, ecall_ret);
     sgx_destroy_enclave(eid);
@@ -162,14 +172,14 @@ bool TeeHost::AttestBatch(const uint8_t* ids, uint32_t count,
      * enclave, which accepts only strictly increasing values. */
     int64_t ts = std::max(WallClockUs(), last_ts_ + 1);
     for (uint32_t i = 0; i < count; i++) pearl_put_i64(o + 8 * i, ts + i);
-    ret = ecall_ol_attest_batch(static_cast<sgx_enclave_id_t>(eid_), &ecall_ret,
+    ret = RetryBusy([&] { return ecall_ol_attest_batch(static_cast<sgx_enclave_id_t>(eid_), &ecall_ret,
                                 ids, count * PEARL_ID_LEN, o, count * 8, t,
-                                count * PEARL_TAG_LEN, ok->data(), count);
+                                count * PEARL_TAG_LEN, ok->data(), count); });
     if (ret == SGX_SUCCESS && ecall_ret == SGX_SUCCESS) last_ts_ = ts + count - 1;
   } else {
-    ret = ecall_bof_place_batch(static_cast<sgx_enclave_id_t>(eid_), &ecall_ret,
+    ret = RetryBusy([&] { return ecall_bof_place_batch(static_cast<sgx_enclave_id_t>(eid_), &ecall_ret,
                                 ids, count * PEARL_ID_LEN, o, count * 8, t,
-                                count * PEARL_TAG_LEN, ok->data(), count);
+                                count * PEARL_TAG_LEN, ok->data(), count); });
   }
   lk.unlock();
   if (!Check(bof_ ? "ecall_bof_place_batch" : "ecall_ol_attest_batch", ret,
@@ -208,14 +218,14 @@ bool TeeHost::CloseWindowsBatch(const std::string& collected, uint32_t count,
   std::string out(static_cast<size_t>(count) * 8, '\0');
   std::unique_lock<std::mutex> lk(mu_);
   if (!bof_) {
-    ret = ecall_ol_local_key_batch(
+    ret = RetryBusy([&] { return ecall_ol_local_key_batch(
         static_cast<sgx_enclave_id_t>(eid_), &ecall_ret, U8(collected),
         static_cast<uint32_t>(collected.size()),
-        reinterpret_cast<uint8_t*>(&out[0]), count * 8, ok->data(), count);
+        reinterpret_cast<uint8_t*>(&out[0]), count * 8, ok->data(), count); });
   } else {
-    ret = ecall_bof_record_announcements_batch(
+    ret = RetryBusy([&] { return ecall_bof_record_announcements_batch(
         static_cast<sgx_enclave_id_t>(eid_), &ecall_ret, U8(collected),
-        static_cast<uint32_t>(collected.size()), ok->data(), count);
+        static_cast<uint32_t>(collected.size()), ok->data(), count); });
   }
   lk.unlock();
   if (!Check(bof_ ? "ecall_bof_record_announcements_batch"
@@ -277,10 +287,10 @@ bool TeeHost::OlSealCar(const std::vector<OlItem>& items, SealedCar* out) {
   uint8_t hash[PEARL_ID_LEN], tag[PEARL_TAG_LEN];
   sgx_status_t ecall_ret;
   std::unique_lock<std::mutex> lk(mu_);
-  sgx_status_t ret = ecall_ol_seal_car(
+  sgx_status_t ret = RetryBusy([&] { return ecall_ol_seal_car(
       static_cast<sgx_enclave_id_t>(eid_), &ecall_ret, U8(bytes),
       static_cast<uint32_t>(bytes.size()), &out->index, &out->frontier, hash,
-      tag);
+      tag); });
   lk.unlock();
   if (!Check("ecall_ol_seal_car", ret, ecall_ret)) return false;
   out->hash.assign(reinterpret_cast<char*>(hash), PEARL_ID_LEN);
@@ -320,11 +330,11 @@ bool TeeHost::BofSealCar(SealedCar* out) {
   uint8_t hash[PEARL_ID_LEN], tag[PEARL_TAG_LEN];
   sgx_status_t ecall_ret;
   std::unique_lock<std::mutex> lk(mu_);
-  sgx_status_t ret = ecall_bof_seal_car(
+  sgx_status_t ret = RetryBusy([&] { return ecall_bof_seal_car(
       static_cast<sgx_enclave_id_t>(eid_), &ecall_ret,
       items.get(), items_cap, &num_items,
       &out->index, &out->frontier, reinterpret_cast<uint8_t*>(&m[0]),
-      static_cast<uint32_t>(m.size()), hash, tag);
+      static_cast<uint32_t>(m.size()), hash, tag); });
   lk.unlock();
   if (!Check("ecall_bof_seal_car", ret, ecall_ret)) return false;
 
@@ -360,8 +370,8 @@ bool TeeHost::Heartbeat(std::string* id, int64_t* value) {
   sgx_status_t ecall_ret;
   std::unique_lock<std::mutex> lk(mu_);
   int64_t ts = std::max(WallClockUs(), last_ts_ + 1);
-  sgx_status_t ret = ecall_heartbeat(static_cast<sgx_enclave_id_t>(eid_),
-                                     &ecall_ret, ts, out_id, value);
+  sgx_status_t ret = RetryBusy([&] { return ecall_heartbeat(static_cast<sgx_enclave_id_t>(eid_),
+                                     &ecall_ret, ts, out_id, value); });
   if (ret == SGX_SUCCESS && ecall_ret == SGX_SUCCESS && !bof_) last_ts_ = ts;
   lk.unlock();
   if (!Check("ecall_heartbeat", ret, ecall_ret)) return false;
@@ -377,8 +387,8 @@ bool TeeHost::Forget(const std::vector<std::string>& ids) {
   for (const std::string& id : ids) buf += Id32(id);
   sgx_status_t ecall_ret;
   std::unique_lock<std::mutex> lk(mu_);
-  sgx_status_t ret = ecall_forget(static_cast<sgx_enclave_id_t>(eid_), &ecall_ret,
-                                  U8(buf), static_cast<uint32_t>(buf.size()));
+  sgx_status_t ret = RetryBusy([&] { return ecall_forget(static_cast<sgx_enclave_id_t>(eid_), &ecall_ret,
+                                  U8(buf), static_cast<uint32_t>(buf.size())); });
   lk.unlock();
   return Check("ecall_forget", ret, ecall_ret);
 }
@@ -390,8 +400,8 @@ bool TeeHost::SignBlock(int64_t view, int64_t height, const std::string& digest,
   uint8_t out_tag[PEARL_TAG_LEN];
   sgx_status_t ecall_ret;
   std::unique_lock<std::mutex> lk(mu_);
-  sgx_status_t ret = ecall_sign_block(static_cast<sgx_enclave_id_t>(eid_),
-                                      &ecall_ret, view, height, U8(d32), out_tag);
+  sgx_status_t ret = RetryBusy([&] { return ecall_sign_block(static_cast<sgx_enclave_id_t>(eid_),
+                                      &ecall_ret, view, height, U8(d32), out_tag); });
   lk.unlock();
   if (!Check("ecall_sign_block", ret, ecall_ret)) return false;
   tag->assign(reinterpret_cast<char*>(out_tag), PEARL_TAG_LEN);
@@ -415,10 +425,10 @@ std::vector<bool> TeeHost::VerifyBatch(const std::vector<VerifyItem>& items) {
   sgx_status_t ecall_ret;
   /* Verification only reads the enclave's key: no host lock, so network
    * threads verify concurrently. */
-  sgx_status_t ret = ecall_verify_batch(
+  sgx_status_t ret = RetryBusy([&] { return ecall_verify_batch(
       static_cast<sgx_enclave_id_t>(eid_), &ecall_ret, U8(recs),
       static_cast<uint32_t>(recs.size()), ok.data(),
-      static_cast<uint32_t>(ok.size()));
+      static_cast<uint32_t>(ok.size())); });
   if (!Check("ecall_verify_batch", ret, ecall_ret)) return result;
   for (size_t i = 0; i < items.size(); i++) result[i] = ok[i] != 0;
   return result;

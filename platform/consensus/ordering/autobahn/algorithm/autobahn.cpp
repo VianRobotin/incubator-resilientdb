@@ -182,7 +182,7 @@ void AutoBahn::SendLoop() {
       send_queue_.pop_front();
       int64_t wait = Now() - out.queued;
       static int64_t last_report = 0;
-      if (wait > params_.delta_us / 5 && Now() - last_report > 1000000) {
+      if (wait > params_.delta_us / 2 && Now() - last_report > 1000000) {
         last_report = Now();
         LOG(ERROR) << "send queue: " << send_queue_.size() << " waiting, oldest "
                    << wait << "us";
@@ -254,7 +254,7 @@ void AutoBahn::ProtocolLoop() {
     int64_t start = Now();
     for (auto& fn : batch) fn();
     int64_t events = Now() - start;
-    if (events > 20000) {
+    if (events > params_.delta_us / 2) {
       LOG(ERROR) << "protocol thread: " << batch.size() << " events took " << events << "us";
     }
     Tick();
@@ -266,7 +266,7 @@ void AutoBahn::Tick() {
   int64_t mark = now;
   auto step = [&](const char* name) {
     int64_t t = Now();
-    if (t - mark > 20000) LOG(ERROR) << "protocol thread: " << name << " took " << (t - mark) << "us";
+    if (t - mark > params_.delta_us / 2) LOG(ERROR) << "protocol thread: " << name << " took " << (t - mark) << "us";
     mark = t;
   };
   if (now - last_admission_ >= kAdmissionPeriodUs) {
@@ -768,7 +768,7 @@ void AutoBahn::AdjustAdmission() {
                   : static_cast<int>(kAdmitAll * effective / arrival_rate_);
   admit_ = std::max(1, admit);
   static int64_t last_report = 0;
-  if (now - last_report > 1000000) {
+  if (now - last_report > 5000000) {
     last_report = now;
     LOG(ERROR) << "admission: " << admit_ / (kAdmitAll / 100) << "% of "
                << static_cast<int64_t>(arrival_rate_) << " tx/s (rate "
@@ -835,7 +835,13 @@ void AutoBahn::SealCar() {
       }
     }
     if (!tee_->OlSealCar(items, &sealed)) {
+      // Keep the keys for the next seal: dropping them would leave them
+      // unsealed in the enclave, so G_r could never advance past them.
       LOG(ERROR) << "OL: enclave refused to seal a Car";
+      std::lock_guard<std::mutex> lk(ol_mu_);
+      for (auto it = items.rbegin(); it != items.rend(); ++it) {
+        ol_open_.push_front(std::move(*it));
+      }
       return;
     }
     for (const auto& it : items) {
@@ -914,11 +920,10 @@ bool AutoBahn::VerifyPoa(int lane, const Poa& poa) {
   if (CheckVerified(key)) return true;
   std::set<int> signers;
   for (const SignInfo& ack : poa.acks()) {
-    if (ack.hash() != poa.car_hash() || ack.local_id() != poa.index()) continue;
-    if (ack.sender_id() < 1 || ack.sender_id() > n_) continue;
-    if (ack.sign().node_id() != ack.sender_id()) continue;
+    const int signer = static_cast<int>(ack.sign().node_id());
+    if (signer < 1 || signer > n_ || signers.count(signer)) continue;
     if (!verifier_->VerifyMessage(poa.car_hash(), ack.sign())) continue;
-    signers.insert(ack.sender_id());
+    signers.insert(signer);
   }
   if (static_cast<int>(signers.size()) < f_ + 1) return false;
   MarkVerified(key);
@@ -1115,7 +1120,9 @@ void AutoBahn::HandleCarAck(const CarAck& ack) {
   Poa poa;
   poa.set_index(ack.index());
   poa.set_car_hash(ack.car_hash());
-  for (const auto& a : acks) *poa.add_acks() = a.second;
+  // Each ack signs the Car hash; the PoA keeps only the signatures (the
+  // hash, index and signer are implied by the PoA and the signature).
+  for (const auto& a : acks) *poa.add_acks()->mutable_sign() = a.second.sign();
   own_poa_ = poa;
   own_acks_.erase(own_acks_.begin(), own_acks_.upper_bound(ack.index()));
   // Usable at once (proposals, timers), but other replicas only learn it
@@ -1304,7 +1311,7 @@ void AutoBahn::ReceiveProposal(std::unique_ptr<Proposal> proposal) {
   {
     int64_t delay = Now() - proposal->block().propose_time();
     static std::atomic<int64_t> last_report{0};
-    if (delay > params_.delta_us / 5 && Now() - last_report > 1000000) {
+    if (delay > params_.delta_us / 2 && Now() - last_report > 1000000) {
       last_report = Now();
       LOG(ERROR) << "proposal " << proposal->block().height() << " from "
                  << proposal->forwarder() << " reached the network thread "
@@ -1320,7 +1327,7 @@ void AutoBahn::ReceiveProposal(std::unique_ptr<Proposal> proposal) {
   Post([this, p, with_parent, posted] {
     int64_t wait = Now() - posted;
     static int64_t last_report = 0;
-    if (wait > params_.delta_us / 5 && Now() - last_report > 1000000) {
+    if (wait > params_.delta_us / 2 && Now() - last_report > 1000000) {
       last_report = Now();
       LOG(ERROR) << "protocol queue: proposal waited " << wait << "us";
     }
@@ -1329,8 +1336,42 @@ void AutoBahn::ReceiveProposal(std::unique_ptr<Proposal> proposal) {
   });
 }
 
+// A block this replica missed (lost or dropped proposal): fetched by hash
+// from every replica, at most once per 2 Delta.
+void AutoBahn::RequestBlock(const std::string& hash) {
+  int64_t now = Now();
+  int64_t& last = block_requests_[hash];
+  if (now - last < 2 * params_.delta_us) return;
+  last = now;
+  BlockQuery q;
+  q.set_requester(id_);
+  q.set_hash(hash);
+  Broadcast(MessageType::Block_Query, q);
+}
+
+void AutoBahn::ReceiveBlockQuery(std::unique_ptr<BlockQuery> query) {
+  auto q = std::make_shared<BlockQuery>(std::move(*query));
+  Post([this, q] {
+    if (q->requester() < 1 || q->requester() > n_ || q->requester() == id_) return;
+    auto it = blocks_.find(q->hash());
+    if (it == blocks_.end()) return;
+    BlockReply reply;
+    *reply.mutable_block() = it->second.block;
+    SendMessage(MessageType::Block_Reply, reply, q->requester());
+  });
+}
+
+void AutoBahn::ReceiveBlockReply(std::unique_ptr<BlockReply> reply) {
+  if (!VerifyBlock(reply->block())) return;
+  auto r = std::make_shared<BlockReply>(std::move(*reply));
+  Post([this, r] {
+    block_requests_.erase(r->block().hash());
+    StoreKnownBlock(r->block());
+  });
+}
+
 // A certified block learned outside the voting path (parent of a view's
-// first proposal, or a Status): known, never voted on.
+// first proposal, a Status, or a fetch): known, never voted on.
 void AutoBahn::StoreKnownBlock(const ConsensusBlock& b) {
   if (blocks_.count(b.hash())) return;
   BlockState& st = blocks_[b.hash()];
@@ -1464,6 +1505,7 @@ void AutoBahn::ProcessPendingVotes() {
                          ? !RankAbove(highest_qc_, b.parent_qc())
                          : b.parent_hash() == voted_tip_;
     bool parent_known = b.parent_hash().empty() || blocks_.count(b.parent_hash());
+    if (!parent_known) RequestBlock(b.parent_hash());
     if (!parent_ok || !parent_known) break;
     if (!st.tipcut_checked) {
       st.tipcut_checked = true;
@@ -1544,7 +1586,12 @@ void AutoBahn::EnqueueCommitChain(const std::string& hash) {
   while (h != committed_hash_) {
     if (h.empty()) break;
     auto it = blocks_.find(h);
-    if (it == blocks_.end()) break;
+    if (it == blocks_.end()) {
+      // A missed ancestor: fetch it; the chain commits once it is known
+      // (a later commit timer walks it again).
+      RequestBlock(h);
+      return;
+    }
     // Under synchrony Sync HotStuff never commits two blocks at one height;
     // reaching a committed block other than the committed tip means the
     // Delta bound was violated.  Stop rather than diverge.
@@ -1732,6 +1779,10 @@ void AutoBahn::MaybePropose() {
     parent = last_proposed_;
     parent_qc = qc->second;
   }
+  // At most one block per Delta/5: under load the tip cut advances
+  // continuously, and every block (with one PoA per lane) is forwarded by
+  // every replica.
+  if (now - last_propose_time_ < params_.delta_us / 5) return;
 
   ConsensusBlock b;
   b.set_view(view_);
@@ -2068,25 +2119,12 @@ void AutoBahn::Execute(const CommittedBlock& block) {
     }
     order = ol_->Commit(cars);
     pending = ol_->PendingSize();
-    static int64_t last_report = 0;
-    if (Now() - last_report > 1000000) {
-      last_report = Now();
-      std::string g;
-      for (int j = 1; j <= n_; ++j) {
-        g += " " + std::to_string(ol_->Frontier(j) % 100000000) + "@" +
-             std::to_string(ol_->CommittedIndex(j));
-      }
-      LOG(ERROR) << "ol: tau=" << ol_->Threshold() % 100000000
-                 << " smallest fixed key=" << ol_->SmallestFixedKey() % 100000000
-                 << " unfixed=" << ol_->UnfixedSize() << " fixed=" << ol_->FixedSize()
-                 << " G@index:" << g;
-    }
   } else if (!block.bof_eligible.empty()) {
     int64_t start = Now();
     auto batches = BofOrderer::Order(block.bof_eligible, n_, bof_theta_);
     int64_t took = Now() - start;
     static int64_t last_report = 0;
-    if (took > 10000 && Now() - last_report > 1000000) {
+    if (took > params_.delta_us && Now() - last_report > 1000000) {
       last_report = Now();
       LOG(ERROR) << "bof: ordering " << block.bof_eligible.size() << " transactions took "
                  << took << "us (" << batches.size() << " batches)";

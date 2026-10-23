@@ -121,6 +121,8 @@ class AutoBahn : public common::ProtocolBase {
   void ReceiveCarQuery(std::unique_ptr<CarQuery> query);
   void ReceiveBodyQuery(std::unique_ptr<BodyQuery> query);
   void ReceiveBodyReply(std::unique_ptr<BodyReply> reply);
+  void ReceiveBlockQuery(std::unique_ptr<BlockQuery> query);
+  void ReceiveBlockReply(std::unique_ptr<BlockReply> reply);
   void ReceiveProposal(std::unique_ptr<Proposal> proposal);
   void ReceiveVote(std::unique_ptr<Vote> vote);
   void ReceiveBlame(std::unique_ptr<Blame> blame);
@@ -294,6 +296,7 @@ class AutoBahn : public common::ProtocolBase {
   const Tip* TipOf(const ConsensusBlock& b, int lane) const;
   int64_t TipIndex(const std::string& block_hash, int lane) const;
   void StoreKnownBlock(const ConsensusBlock& b);
+  void RequestBlock(const std::string& hash);
   void HandleProposal(const ConsensusBlock& b);
   bool ValidTipCut(const BlockState& st);
   bool VoteWaitsOver(const BlockState& st);
@@ -415,6 +418,8 @@ class AutoBahn : public common::ProtocolBase {
   std::map<std::pair<int, int64_t>, int64_t> delinquency_armed_;
   std::set<std::pair<int, int64_t>> delinquency_expired_;
   std::map<int, int64_t> claim_targets_;
+  // Block fetches for missed blocks: hash -> last request time.
+  std::map<std::string, int64_t> block_requests_;
   // Body fetches for Cars learned outside the lane (lane, index) -> time.
   std::map<std::pair<int, int64_t>, int64_t> body_requests_;
   std::set<int> claimed_lanes_;    // claimed in this view, not yet committed

@@ -158,6 +158,16 @@ message Proposal {
   ConsensusBlock parent = 3;
 }
 
+// Request for a consensus block this replica missed (by hash).
+message BlockQuery {
+  int32 requester = 1;
+  bytes hash = 2;
+}
+
+message BlockReply {
+  ConsensusBlock block = 1;
+}
+
 message Blame {
   int64 view = 1;
   int32 sender_id = 2;
@@ -204,4 +214,6 @@ enum MessageType {
   SyncHS_Status = 9;
   Body_Query = 10;
   Body_Reply = 11;
+  Block_Query = 12;
+  Block_Reply = 13;
 }
