@@ -774,7 +774,16 @@ if __name__ == "__main__":
                         help="Only sweep these N values (e.g. --nodes 10 16)")
     parser.add_argument("--mode", choices=["ol", "bof"], nargs="+",
                         help="Only sweep these modes (e.g. --mode bof)")
+    parser.add_argument("--results-dir",
+                        help="Write tput_latency.csv here instead of das_results/ "
+                             "(relative to the repo root); resuming reads only this file")
+    parser.add_argument("--reps", type=int,
+                        help=f"Repetitions per (N, mode, rate) point (default {REPETITIONS})")
     args = parser.parse_args()
+    if args.results_dir:
+        RESULTS_DIR = (PROJ_ROOT / args.results_dir).resolve()
+    if args.reps:
+        REPETITIONS = args.reps
 
     if not args.dry_run:
         if not args.skip_build:
