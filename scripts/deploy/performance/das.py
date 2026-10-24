@@ -703,13 +703,14 @@ def run_rate_sweep(dry_run: bool, nodes_filter: Optional[List[int]] = None,
                         num_clients=n,   # one client per replica
                         target_tps=rate,
                     )
+                    if dry_run:
+                        continue  # a dry run measures nothing: record nothing
                     append_csv(csv_path,
                         f"{n},{mode},{rate},{rep},"
                         f"{con_tps},{round(con_lat_s * 1000, 2)},"
                         f"{exec_tps},{round(exec_lat_s * 1000, 2)},"
                         f"{slots}")
-                    if not dry_run:
-                        time.sleep(10)
+                    time.sleep(10)
 
 
 # ---------------------------------------------------------------------------
