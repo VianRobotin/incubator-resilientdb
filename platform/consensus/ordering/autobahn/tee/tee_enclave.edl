@@ -105,12 +105,11 @@ enclave {
             [out]          int64_t* value_out
         );
 
-        /* Enclave garbage collection (Sec. 5.1): remove executed
-         * transactions (count PEARL_ID_LEN identifiers) from H.  In OL, an
-         * identifier whose local key is not sealed yet leaves H when it is. */
-        public sgx_status_t ecall_forget(
-            [in, size=ids_len] const uint8_t* ids,
-            uint32_t                          ids_len
+        /* Admission control: a key derived from the committee key, given to
+         * the host to rank client transactions (unpredictable to clients,
+         * identical at every replica). */
+        public sgx_status_t ecall_admission_key(
+            [out, size=16] uint8_t* key_out
         );
 
         /* TEE.SignBlock (Alg. 2): sign a consensus block digest.  Refuses a

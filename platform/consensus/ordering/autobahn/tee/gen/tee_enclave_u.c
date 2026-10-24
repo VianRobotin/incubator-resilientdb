@@ -82,11 +82,10 @@ typedef struct ms_ecall_heartbeat_t {
 	int64_t* ms_value_out;
 } ms_ecall_heartbeat_t;
 
-typedef struct ms_ecall_forget_t {
+typedef struct ms_ecall_admission_key_t {
 	sgx_status_t ms_retval;
-	const uint8_t* ms_ids;
-	uint32_t ms_ids_len;
-} ms_ecall_forget_t;
+	uint8_t* ms_key_out;
+} ms_ecall_admission_key_t;
 
 typedef struct ms_ecall_sign_block_t {
 	sgx_status_t ms_retval;
@@ -306,12 +305,11 @@ sgx_status_t ecall_heartbeat(sgx_enclave_id_t eid, sgx_status_t* retval, int64_t
 	return status;
 }
 
-sgx_status_t ecall_forget(sgx_enclave_id_t eid, sgx_status_t* retval, const uint8_t* ids, uint32_t ids_len)
+sgx_status_t ecall_admission_key(sgx_enclave_id_t eid, sgx_status_t* retval, uint8_t* key_out)
 {
 	sgx_status_t status;
-	ms_ecall_forget_t ms;
-	ms.ms_ids = ids;
-	ms.ms_ids_len = ids_len;
+	ms_ecall_admission_key_t ms;
+	ms.ms_key_out = key_out;
 	status = sgx_ecall(eid, 8, &ocall_table_tee_enclave, &ms);
 	if (status == SGX_SUCCESS && retval) *retval = ms.ms_retval;
 	return status;

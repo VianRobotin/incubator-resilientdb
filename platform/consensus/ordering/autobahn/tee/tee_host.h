@@ -103,8 +103,8 @@ class TeeHost {
    * item's identifier in *id and its Car index in *value. */
   bool Heartbeat(std::string* id, int64_t* value);
 
-  /* Enclave garbage collection: drop executed transactions from H. */
-  bool Forget(const std::vector<std::string>& ids);
+  /* 16-byte admission key (derived from the committee key). */
+  std::string AdmissionKey();
 
   /* TEE.SignBlock; refuses a second block at the same (view, height). */
   bool SignBlock(int64_t view, int64_t height, const std::string& digest,

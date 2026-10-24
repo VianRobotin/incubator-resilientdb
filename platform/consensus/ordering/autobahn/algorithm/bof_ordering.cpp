@@ -15,9 +15,11 @@ BofOrderer::BofOrderer(int n, int f, double gamma)
       committed_(n + 1, 0),
       discarded_(n + 1, false),
       uncovered_(n + 1),
-      unsettled_(n + 1) {
+      unsettled_(n + 1),
+      hold_(n, 0) {
   // theta = ceil(gamma (n - f)); the epsilon absorbs float error on gamma.
   theta_ = static_cast<int>(std::ceil(gamma * (n - f) - 1e-9));
+  hold_ = BofHoldBack(n, theta_);
 }
 
 bool BofOrderer::Settled(const TxnState& t, int j) const {
@@ -29,10 +31,104 @@ BofCommitResult BofOrderer::Commit(const std::vector<BofCommittedCar>& cars,
   BofSettleResult settled = Settle(cars, claimed_lanes);
   BofCommitResult result;
   result.armed = std::move(settled.armed);
-  if (!settled.eligible.empty()) {
-    result.batches = Order(std::move(settled.eligible), n_, theta_);
-  }
+  hold_.OnCommitted(cars, claimed_lanes);
+  std::vector<BofEligibleTxn> released = hold_.Release(std::move(settled.eligible));
+  if (!released.empty()) result.batches = Order(std::move(released), n_, theta_);
   return result;
+}
+
+BofHoldBack::BofHoldBack(int n, int theta)
+    : n_(n), theta_(theta), discarded_(n + 1, false), lane_(n + 1) {}
+
+uint32_t BofHoldBack::Intern(const std::string& id) {
+  auto it = index_.emplace(id, static_cast<uint32_t>(state_.size()));
+  if (it.second) state_.push_back(kPending);
+  return it.first->second;
+}
+
+void BofHoldBack::OnCommitted(const std::vector<BofCommittedCar>& cars,
+                              const std::vector<int>& claimed_lanes) {
+  for (int j : claimed_lanes) {
+    discarded_[j] = true;
+    lane_[j].clear();
+  }
+  for (const BofCommittedCar& car : cars) {
+    const int r = car.lane;
+    if (discarded_[r]) continue;
+    for (size_t p = 0; p < car.items.size(); ++p) {
+      if (car.heartbeat[p]) continue;
+      uint32_t t = Intern(car.items[p]);
+      if (state_[t] == kExecuted) continue;
+      // Lanes commit in order, so positions arrive increasing.
+      lane_[r].push_back(Entry{Pos{car.index, static_cast<int32_t>(p)}, t});
+    }
+  }
+}
+
+const BofHoldBack::Entry* BofHoldBack::FirstPending(int lane) {
+  auto& q = lane_[lane];
+  while (!q.empty() && state_[q.front().txn] == kExecuted) q.pop_front();
+  for (const Entry& e : q) {
+    if (state_[e.txn] == kPending) return &e;
+  }
+  return nullptr;
+}
+
+std::vector<BofEligibleTxn> BofHoldBack::Release(std::vector<BofEligibleTxn> eligible) {
+  std::vector<BofEligibleTxn> candidates = std::move(held_);
+  held_.clear();
+  for (auto& e : eligible) candidates.push_back(std::move(e));
+  std::vector<uint32_t> txn(candidates.size());
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    txn[i] = Intern(candidates[i].id);
+    state_[txn[i]] = kCandidate;
+  }
+  // A candidate is held back if some pending, non-candidate transaction
+  // precedes it in at least theta of the non-discarded lanes that committed
+  // it (its attestations).  Held candidates become pending again and may in
+  // turn hold back others: iterate to a fixpoint.
+  std::vector<bool> held(candidates.size(), false);
+  std::vector<const Entry*> first(n_ + 1);
+  std::unordered_map<uint32_t, int> before;
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (int r = 1; r <= n_; ++r) first[r] = discarded_[r] ? nullptr : FirstPending(r);
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      if (held[i]) continue;
+      const auto& attest = candidates[i].attest;
+      int lanes = 0;
+      for (int r = 1; r <= n_; ++r) {
+        if (first[r] != nullptr && attest[r].first >= 0 && first[r]->pos < attest[r]) ++lanes;
+      }
+      if (lanes < theta_) continue;  // the common case
+      before.clear();
+      bool blocked = false;
+      for (int r = 1; r <= n_ && !blocked; ++r) {
+        if (first[r] == nullptr || attest[r].first < 0) continue;
+        for (const Entry& e : lane_[r]) {
+          if (!(e.pos < attest[r])) break;
+          if (state_[e.txn] == kPending && ++before[e.txn] >= theta_) {
+            blocked = true;
+            break;
+          }
+        }
+      }
+      if (!blocked) continue;
+      held[i] = true;
+      state_[txn[i]] = kPending;
+      changed = true;
+    }
+  }
+  std::vector<BofEligibleTxn> released;
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    if (held[i]) {
+      held_.push_back(std::move(candidates[i]));
+    } else {
+      state_[txn[i]] = kExecuted;
+      released.push_back(std::move(candidates[i]));
+    }
+  }
+  return released;
 }
 
 BofSettleResult BofOrderer::Settle(const std::vector<BofCommittedCar>& cars,

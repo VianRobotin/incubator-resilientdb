@@ -2,10 +2,11 @@
  *
  * The enclave keeps, in memory its host can neither read nor modify:
  *   - H: identifiers of the transactions it has attested (one attestation
- *     per transaction, so a host cannot equivocate on indicators), pruned
- *     once a transaction is executed;
- *   - OL: the last timestamp it attested (host timestamps must exceed it), the transactions whose local ordering key is
- *     not yet sealed into a Car, and the keys it certified; from these it
+ *     per transaction, so a host cannot equivocate on indicators).  It is
+ *     never pruned: safe deletion would require verifying an execution proof;
+ *   - OL: the last timestamp it attested (host timestamps must exceed it),
+ *     the transactions whose local ordering key is not yet sealed into a
+ *     Car, and the keys it certified; from these it
  *     derives the completion frontier G_r;
  *   - BOF: its sequence counter, the open Car, and the placement
  *     announcements collected for transactions whose window closed; from
@@ -56,7 +57,25 @@ Mode g_mode = kModeOL;
 pearl::AesCmac g_cmac;  /* keyed with the committee group key */
 
 /* H: identifiers already attested. */
-std::unordered_set<std::string>* g_history = nullptr;
+/* H holds every attested identifier for the whole run, as fixed-size keys
+ * in a set reserved up front: no per-key allocation and no rehash (which
+ * would stall every ECALL for its duration) below kHistoryReserve ids. */
+struct Id32 {
+  uint64_t w[4];
+  bool operator==(const Id32& o) const {
+    return w[0] == o.w[0] && w[1] == o.w[1] && w[2] == o.w[2] && w[3] == o.w[3];
+  }
+};
+struct Id32Hash {
+  size_t operator()(const Id32& id) const { return static_cast<size_t>(id.w[0]); }
+};
+const size_t kHistoryReserve = 1 << 22;
+Id32 ToId32(const uint8_t* id) {
+  Id32 out;
+  memcpy(out.w, id, sizeof(out.w));
+  return out;
+}
+std::unordered_set<Id32, Id32Hash>* g_history = nullptr;
 
 /* Lane state shared by both variants. */
 int64_t g_next_car = 1;
@@ -71,9 +90,6 @@ int64_t g_clock = 0;                                   /* last attested T   */
 std::map<int64_t, std::string>* g_ol_unsealed = nullptr;     /* T -> id      */
 std::unordered_map<std::string, int64_t>* g_ol_own_ts = nullptr;  /* id -> T */
 std::unordered_map<std::string, int64_t>* g_ol_keys = nullptr;    /* id -> K */
-/* Executed transactions whose own key is not sealed yet: they leave H at
- * the seal, so the frontier still cannot pass them. */
-std::unordered_set<std::string>* g_forget_on_seal = nullptr;
 
 /* ---- BOF ---- */
 int64_t g_seq = 0;                                     /* s                 */
@@ -170,11 +186,11 @@ sgx_status_t ecall_init(uint32_t self_id, uint32_t n, uint32_t f,
   g_mode = static_cast<Mode>(mode);
   memset(g_last_car_hash, 0, sizeof(g_last_car_hash));
 
-  g_history = new std::unordered_set<std::string>();
+  g_history = new std::unordered_set<Id32, Id32Hash>();
+  g_history->reserve(kHistoryReserve);
   g_ol_unsealed = new std::map<int64_t, std::string>();
   g_ol_own_ts = new std::unordered_map<std::string, int64_t>();
   g_ol_keys = new std::unordered_map<std::string, int64_t>();
-  g_forget_on_seal = new std::unordered_set<std::string>();
   g_open_items = new std::vector<std::pair<std::string, bool>>();
   g_window_open = new std::unordered_map<std::string, int64_t>();
   g_open_count = new std::map<int64_t, int>();
@@ -190,10 +206,10 @@ namespace {
 
 sgx_status_t OlAttest(const uint8_t* id, int64_t ts, uint8_t* tag_out) {
   std::string key = Key(id);
-  if (g_history->count(key) || !FreshTimestamp(ts)) {
+  if (g_history->count(ToId32(id)) || !FreshTimestamp(ts)) {
     return SGX_ERROR_INVALID_PARAMETER;
   }
-  g_history->insert(key);
+  g_history->insert(ToId32(id));
   (*g_ol_unsealed)[ts] = key;
   (*g_ol_own_ts)[key] = ts;
 
@@ -237,7 +253,7 @@ sgx_status_t OlLocalKey(const uint8_t* id, const uint8_t* records,
 
 sgx_status_t BofPlace(const uint8_t* id, int64_t* car_out, uint8_t* tag_out) {
   std::string key = Key(id);
-  if (!g_history->insert(key).second) return SGX_ERROR_INVALID_PARAMETER;
+  if (!g_history->insert(ToId32(id)).second) return SGX_ERROR_INVALID_PARAMETER;
 
   ++g_seq;
   int64_t c = g_open_car;
@@ -327,7 +343,6 @@ sgx_status_t ecall_ol_seal_car(const uint8_t* items, uint32_t items_len,
     g_ol_unsealed->erase(ts->second);
     g_ol_own_ts->erase(ts);
     g_ol_keys->erase(key);
-    if (g_forget_on_seal->erase(key)) g_history->erase(key);
   }
 
   uint8_t items_digest[PEARL_ID_LEN];
@@ -498,21 +513,10 @@ sgx_status_t ecall_sign_block(int64_t view, int64_t height,
   return Tag(msg, sizeof(msg), tag_out);
 }
 
-/* Enclave garbage collection (Sec. 5.1): once a transaction has been
- * executed, its digest leaves H, so the enclave state stays proportional to
- * the pending transactions.  A resubmission would get a fresh, larger
- * indicator and is discarded against the committed history. */
-sgx_status_t ecall_forget(const uint8_t* ids, uint32_t ids_len) {
+sgx_status_t ecall_admission_key(uint8_t* key_out) {
   if (!g_initialized) return SGX_ERROR_INVALID_STATE;
-  if (ids_len % PEARL_ID_LEN != 0) return SGX_ERROR_INVALID_PARAMETER;
-  for (uint32_t i = 0; i < ids_len / PEARL_ID_LEN; i++) {
-    std::string key = Key(ids + i * PEARL_ID_LEN);
-    if (g_mode == kModeOL && g_ol_own_ts->count(key)) {
-      g_forget_on_seal->insert(key);
-    } else {
-      g_history->erase(key);
-    }
-  }
+  static const char kDomain[] = "pearl-admission-rank";
+  g_cmac.Mac(reinterpret_cast<const uint8_t*>(kDomain), sizeof(kDomain) - 1, key_out);
   return SGX_SUCCESS;
 }
 

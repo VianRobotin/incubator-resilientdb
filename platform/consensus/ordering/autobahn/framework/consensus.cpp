@@ -117,10 +117,11 @@ Consensus::Consensus(const ResDBConfig& config,
         cfg.has_tcp_batch_timeout_us() ? cfg.tcp_batch_timeout_us() : 0;
     if (batch_timeout_us > 0) GetBroadCastClient()->SetBatchTimeoutUs(batch_timeout_us);
     LOG(ERROR) << "Pearl: send batch timeout " << batch_timeout_us << "us";
+    // Echo batches are large: batch only a few per write.
     bulk_communicator_ = std::make_unique<ReplicaCommunicator>(
         config_.GetReplicaInfos(), GetSignatureVerifier(),
         /*is_use_long_conn=*/true, config_.GetOutputWorkerNum(),
-        config_.GetTcpBatchNum());
+        /*tcp_batch=*/4);
     if (batch_timeout_us > 0) bulk_communicator_->SetBatchTimeoutUs(batch_timeout_us);
     autobahn_->SetBulkChannel(
         [this](int type, const google::protobuf::Message& msg) {

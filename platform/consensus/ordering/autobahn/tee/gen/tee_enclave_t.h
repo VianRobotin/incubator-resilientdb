@@ -23,7 +23,7 @@ sgx_status_t ecall_bof_place_batch(const uint8_t* ids, uint32_t ids_len, uint8_t
 sgx_status_t ecall_bof_record_announcements_batch(const uint8_t* buf, uint32_t len, uint8_t* ok_out, uint32_t count);
 sgx_status_t ecall_bof_seal_car(uint8_t* items_out, uint32_t items_cap, uint32_t* num_items_out, int64_t* index_out, int64_t* w_out, uint8_t* m_out, uint32_t m_cap, uint8_t* car_hash_out, uint8_t* tag_out);
 sgx_status_t ecall_heartbeat(int64_t ts, uint8_t* id_out, int64_t* value_out);
-sgx_status_t ecall_forget(const uint8_t* ids, uint32_t ids_len);
+sgx_status_t ecall_admission_key(uint8_t* key_out);
 sgx_status_t ecall_sign_block(int64_t view, int64_t height, const uint8_t* digest, uint8_t* tag_out);
 sgx_status_t ecall_verify_batch(const uint8_t* records, uint32_t rec_len, uint8_t* ok_out, uint32_t count);
 

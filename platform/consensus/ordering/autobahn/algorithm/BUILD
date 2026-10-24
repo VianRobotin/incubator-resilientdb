@@ -37,6 +37,7 @@ cc_library(
     name = "autobahn",
     srcs = ["autobahn.cpp"],
     hdrs = ["autobahn.h"],
+    copts = ["-maes"],  # AES-CMAC admission rank
     linkopts = [
         "-L/var/scratch/vrobotin/sgxsdk/lib64",
         "-lsgx_urts_sim",
@@ -53,6 +54,7 @@ cc_library(
         "//platform/consensus/ordering/common/algorithm:protocol_base",
         "//platform/consensus/ordering/autobahn/proto:proposal_cc_proto",
         "//platform/common/queue:lock_free_queue",
+        "//platform/consensus/ordering/autobahn/tee:aes_cmac",
         "//platform/consensus/ordering/autobahn/tee:tee_host",
         "//platform/networkstrate:traffic",
         "@com_google_absl//absl/container:flat_hash_map",

@@ -62,6 +62,7 @@ struct BofCommitResult {
 // Lane j is settled for t once its committed prefix reaches c_hat_j(t) or a
 // committed delinquency claim names j.  t is eligible once every lane is
 // settled.
+
 //
 // Ordering (Sec. 7.2-7.3, Alg. 3): over the eligible transactions T, for each
 // pair, R = non-discarded lanes whose committed attestations contain both;
@@ -69,6 +70,49 @@ struct BofCommitResult {
 // else t_b -> t_a iff the complementary count reaches theta.  SCCs become
 // batches, emitted in a topological order of the condensation with ties
 // broken by the smallest digest of each SCC.
+// Hold-back rule across execution steps (Sec. 7.1): an eligible t executes
+// only once every transaction that precedes t in at least theta of the
+// non-discarded lanes that committed t is eligible too (or executed).  Every
+// transaction with a mandated edge to t satisfies this (each correct lane
+// that committed t holds it earlier), so it is ordered in the same step as
+// t or before it; theta > f guarantees that such predecessors are held by a
+// correct lane and eventually become eligible.
+//
+// It only affects execution order, so it runs on the execution thread,
+// apart from settlement (which arms the delinquency timers).  Feed it every
+// committed block in commit order: OnCommitted, then Release.
+class BofHoldBack {
+ public:
+  BofHoldBack(int n, int theta);
+  void OnCommitted(const std::vector<BofCommittedCar>& cars,
+                   const std::vector<int>& claimed_lanes);
+  // The transactions the block made eligible; returns those that may
+  // execute now (the others are kept and reconsidered with later blocks).
+  std::vector<BofEligibleTxn> Release(std::vector<BofEligibleTxn> eligible);
+  size_t HeldSize() const { return held_.size(); }
+
+ private:
+  using Pos = std::pair<int64_t, int32_t>;
+  enum State : uint8_t { kPending, kCandidate, kExecuted };
+  struct Entry {
+    Pos pos;
+    uint32_t txn;
+  };
+  uint32_t Intern(const std::string& id);
+  // First pending, non-candidate entry of a lane (dropping executed ones
+  // from the front); nullptr if none.
+  const Entry* FirstPending(int lane);
+
+  int n_, theta_;
+  std::vector<bool> discarded_;
+  // Per non-discarded lane: its committed transactions in lane order;
+  // executed ones are skipped lazily.
+  std::vector<std::deque<Entry>> lane_;
+  std::unordered_map<std::string, uint32_t> index_;
+  std::vector<State> state_;
+  std::vector<BofEligibleTxn> held_;
+};
+
 class BofOrderer {
  public:
   BofOrderer(int n, int f, double gamma);
@@ -84,7 +128,7 @@ class BofOrderer {
   static std::vector<std::vector<std::string>> Order(
       std::vector<BofEligibleTxn> txns, int n, int theta);
 
-  // Settle() followed by Order().
+  // Settle(), the hold-back rule and Order() (tests).
   BofCommitResult Commit(const std::vector<BofCommittedCar>& cars,
                          const std::vector<int>& claimed_lanes);
 
@@ -122,6 +166,7 @@ class BofOrderer {
   // settled yet.  Settlement only visits the lanes that advance.
   std::vector<std::multimap<int64_t, std::string>> unsettled_;
   std::unordered_set<std::string> executed_;
+  BofHoldBack hold_;  // for Commit()
 };
 
 }  // namespace autobahn

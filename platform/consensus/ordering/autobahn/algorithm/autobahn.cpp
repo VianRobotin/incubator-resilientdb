@@ -11,6 +11,7 @@
 
 #include "common/crypto/signature_verifier.h"
 #include "common/utils/utils.h"
+#include "platform/consensus/ordering/autobahn/tee/aes_cmac.h"
 #include "platform/networkstrate/traffic.h"
 
 namespace resdb {
@@ -42,8 +43,10 @@ constexpr int64_t kBacklogHigh = 1 << 20;
 constexpr int64_t kBacklogLow = 256 << 10;
 constexpr size_t kVerifiedCache = 1 << 16;
 constexpr size_t kRecentCars = 256;  // committed Cars kept to answer queries
-// Blame timers start at the first proposal, or after this many Delta if none
-// arrives (replicas of a deployment start within this window).
+// Startup: the first block is proposed only once every replica's lane has
+// delivered a Car (all replicas are running, so none misses the first
+// blocks and is left behind); blame timers start at the first proposal, or
+// this many Delta after that point if none arrives.
 constexpr int64_t kStartupGraceDeltas = 40;
 
 int64_t Now() { return static_cast<int64_t>(GetCurrentTime()); }
@@ -78,7 +81,8 @@ AutoBahn::AutoBahn(int id, int f, int total_num, int block_size,
       params_(params),
       bof_(params.batch_order_fairness),
       verifier_(verifier),
-      lanes_(total_num + 1) {
+      lanes_(total_num + 1),
+      heard_(total_num + 1, false) {
   global_stats_ = Stats::GetGlobalStats(5);
   tee_ = std::make_unique<TeeHost>();
   CHECK(tee_->Initialize(params_.enclave_path, id_, n_, f_, bof_,
@@ -87,13 +91,24 @@ AutoBahn::AutoBahn(int id, int f, int total_num, int block_size,
   if (bof_) {
     bof_orderer_ = std::make_unique<BofOrderer>(n_, f_, params_.bof_gamma);
     bof_theta_ = bof_orderer_->Theta();
+    bof_hold_ = std::make_unique<BofHoldBack>(n_, bof_theta_);
   } else {
     ol_ = std::make_unique<OlOrderer>(n_, f_);
   }
   for (int k = 0; k < std::max(1, params_.dissemination_threads); ++k) {
     shards_.push_back(std::make_unique<Shard>());
   }
+  std::string admission_key = tee_->AdmissionKey();
+  CHECK_EQ(admission_key.size(), 16u) << "enclave gave no admission key";
+  admission_mac_ = std::make_unique<pearl::AesCmac>();
+  admission_mac_->SetKey(reinterpret_cast<const uint8_t*>(admission_key.data()));
   own_rate_ = kInitialAdmitRate;
+  reported_rate_.reset(new std::atomic<int64_t>[n_ + 1]);
+  reported_at_.reset(new std::atomic<int64_t>[n_ + 1]);
+  for (int j = 0; j <= n_; ++j) {
+    reported_rate_[j] = 0;
+    reported_at_[j] = 0;
+  }
   capacity_ = 1e9;
   last_car_hash_ = ZeroHash();
   int64_t now = Now();
@@ -118,6 +133,7 @@ AutoBahn::~AutoBahn() {
   if (execution_thread_.joinable()) execution_thread_.join();
   settle_cv_.notify_all();
   if (settle_thread_.joinable()) settle_thread_.join();
+  if (admission_thread_.joinable()) admission_thread_.join();
   for (auto& s : shards_) {
     if (s->thread.joinable()) s->thread.join();
   }
@@ -132,6 +148,8 @@ void AutoBahn::Start() {
     settle_thread_ = std::thread(&AutoBahn::SettleLoop, this);
     pthread_setname_np(settle_thread_.native_handle(), "pearl-settle");
   }
+  admission_thread_ = std::thread(&AutoBahn::AdmissionLoop, this);
+  pthread_setname_np(admission_thread_.native_handle(), "pearl-admit");
   for (int k = 0; k < kSenderThreads; ++k) {
     send_threads_.emplace_back(&AutoBahn::SendLoop, this);
     pthread_setname_np(send_threads_.back().native_handle(), "pearl-send");
@@ -269,10 +287,6 @@ void AutoBahn::Tick() {
     if (t - mark > params_.delta_us / 2) LOG(ERROR) << "protocol thread: " << name << " took " << (t - mark) << "us";
     mark = t;
   };
-  if (now - last_admission_ >= kAdmissionPeriodUs) {
-    last_admission_ = now;
-    AdjustAdmission();
-  }
   step("admission");
   MaybeHeartbeat();
   MaybeSealCar();
@@ -336,19 +350,21 @@ void AutoBahn::Route(std::vector<Incoming> items) {
 //
 // Admission control: beyond capacity, queues (outgoing connections, shard
 // inputs) would grow until messages miss the synchrony bound Delta.  A
-// replica therefore admits a client transaction only if a value derived
-// from id(t) lies below its admission threshold, which AdjustAdmission
-// lowers under backlog and raises otherwise.  The rule is the same at every
-// replica, so replicas with similar load admit nearly the same transactions
-// (the sets are nested), and a transaction that one replica sheds is not
-// still disseminated by all others.  Echoes and fetched bodies are never
-// shed.
+// replica therefore admits a client transaction only if its rank lies below
+// the admission threshold (see AdjustAdmission).  The rank is a MAC of id(t)
+// under a key derived from the enclaves' committee key: identical at every
+// replica, so correct replicas admit the same transactions and a transaction
+// one sheds is not still disseminated by the others, and unpredictable to
+// clients, who cannot craft transactions that are never shed.  Echoes and
+// fetched bodies are never shed.
 bool AutoBahn::ReceiveTransaction(std::string data) {
   Incoming in;
   in.id = TxnId::From(SignatureVerifier::CalculateHash(data));
   client_arrivals_.fetch_add(1, std::memory_order_relaxed);
+  uint8_t mac[pearl::AesCmac::kTagLen];
+  admission_mac_->Mac(in.id.b.data(), static_cast<uint32_t>(in.id.b.size()), mac);
   uint32_t rank;
-  std::memcpy(&rank, in.id.b.data() + 16, sizeof(rank));
+  std::memcpy(&rank, mac, sizeof(rank));
   if (static_cast<int>(rank % kAdmitAll) >= admit_.load(std::memory_order_relaxed) ||
       ShardOf(in.id).inbox_size.load(std::memory_order_relaxed) > kMaxInbox) {
     int64_t d = ++dropped_;
@@ -684,6 +700,15 @@ void AutoBahn::ReceiveBodyReply(std::unique_ptr<BodyReply> reply) {
 }
 
 
+// Runs on its own thread: reading the outgoing backlog takes the network
+// layer's locks, which must never stall the protocol thread.
+void AutoBahn::AdmissionLoop() {
+  while (!IsStop()) {
+    std::this_thread::sleep_for(std::chrono::microseconds(kAdmissionPeriodUs));
+    if (network_ready_) AdjustAdmission();
+  }
+}
+
 // Keeps the link below saturation: a saturated 1 Gbps port drops packets,
 // and TCP's retransmission timeout (>= 200 ms) then delays every message,
 // consensus included, far beyond Delta.
@@ -715,7 +740,7 @@ void AutoBahn::AdjustAdmission() {
   size_t inbox = 0;
   for (const auto& s : shards_) inbox = std::max(inbox, s->inbox_size.load());
   if (backlog > kBacklogHigh || inbox > kMaxInbox / 4) {
-    own_rate_ = std::max(kMinAdmitRate, own_rate_ * 0.5);
+    own_rate_ = std::max(kMinAdmitRate, own_rate_.load() * 0.5);
   }
 
   if (++admission_ticks_ >= kModelPeriods) {
@@ -744,21 +769,22 @@ void AutoBahn::AdjustAdmission() {
       estimate = std::min(prior, budget / per_txn);
     }
     capacity_ = std::min(prior, 0.5 * capacity_ + 0.5 * estimate);
-    if (own_rate_ > capacity_) {
-      own_rate_ = capacity_;
-    } else if (demand > own_rate_) {
-      own_rate_ = std::min(capacity_, own_rate_ * 1.05 + 100);
+    double rate = own_rate_.load();
+    if (rate > capacity_) {
+      rate = capacity_;
+    } else if (demand > rate) {
+      rate = std::min(capacity_, rate * 1.05 + 100);
     }
-    own_rate_ = std::max(kMinAdmitRate, own_rate_);
+    own_rate_ = std::max(kMinAdmitRate, rate);
     link_used_ = used;
   }
 
   const int64_t now = Now();
-  std::vector<double> rates = {own_rate_};
+  std::vector<double> rates = {own_rate_.load()};
   for (int j = 1; j <= n_; ++j) {
-    if (j != id_ && lanes_[j].admit_at > 0 &&
-        now - lanes_[j].admit_at <= 2 * params_.delta_us) {
-      rates.push_back(lanes_[j].admit_rate);
+    int64_t at = reported_at_[j].load(std::memory_order_relaxed);
+    if (j != id_ && at > 0 && now - at <= 2 * params_.delta_us) {
+      rates.push_back(static_cast<double>(reported_rate_[j].load(std::memory_order_relaxed)));
     }
   }
   std::sort(rates.begin(), rates.end());
@@ -773,7 +799,7 @@ void AutoBahn::AdjustAdmission() {
     LOG(ERROR) << "admission: " << admit_ / (kAdmitAll / 100) << "% of "
                << static_cast<int64_t>(arrival_rate_) << " tx/s (rate "
                << static_cast<int64_t>(effective) << ", own "
-               << static_cast<int64_t>(own_rate_) << ", capacity "
+               << static_cast<int64_t>(own_rate_.load()) << ", capacity "
                << static_cast<int64_t>(capacity_) << ", link "
                << static_cast<int64_t>(link_used_ / 1000000) << " MB/s, backlog "
                << backlog << " B)";
@@ -878,7 +904,7 @@ void AutoBahn::SealCar() {
   car.set_tee_tag(sealed.tag);
   car.set_frontier(sealed.frontier);
   car.set_seal_time(Now());
-  car.set_admit(static_cast<int32_t>(own_rate_));
+  car.set_admit(static_cast<int32_t>(own_rate_.load()));
   if (own_poa_.index() > 0) {
     *car.mutable_poa() = own_poa_;
     Lane& own = lanes_[id_];
@@ -892,6 +918,7 @@ void AutoBahn::SealCar() {
   Broadcast(MessageType::Car_Prop, car);
 
   Lane& lane = lanes_[id_];
+  NoteHeard(id_);
   lane.hashes[car.index()] = car.hash();
   lane.bodies_held.insert(car.index());
   lane.acked = car.index();
@@ -985,10 +1012,11 @@ void AutoBahn::ReceiveCar(std::unique_ptr<Car> car) {
 // the Car at position i-1 of the lane was received and acknowledged.
 void AutoBahn::HandleCar(const Car& car) {
   Lane& lane = lanes_[car.lane()];
+  NoteHeard(car.lane());
   if (car.poa().index() > 0) LearnCertified(car.lane(), car.poa());
   if (car.admit() > 0) {
-    lane.admit_rate = car.admit();
-    lane.admit_at = Now();
+    reported_rate_[car.lane()] = car.admit();
+    reported_at_[car.lane()] = Now();
   }
   const int64_t idx = car.index();
   if (idx <= lane.acked || lane.buffered.count(idx)) return;
@@ -1082,6 +1110,16 @@ void AutoBahn::AcceptCar(Lane& lane, Car car) {
   lane.acked = car.index();
   lane.hashes[car.index()] = car.hash();
   lane.cars.emplace(car.index(), std::move(car));
+}
+
+void AutoBahn::NoteHeard(int lane) {
+  if (all_heard_at_ > 0 || heard_[lane]) return;
+  heard_[lane] = true;
+  for (int j = 1; j <= n_; ++j) {
+    if (!heard_[j]) return;
+  }
+  all_heard_at_ = Now();
+  LOG(ERROR) << "Pearl replica " << id_ << ": every lane has delivered a Car";
 }
 
 void AutoBahn::LearnCertified(int lane_id, const Poa& poa) {
@@ -1259,34 +1297,43 @@ bool AutoBahn::VerifyQc(const QuorumCert& qc) {
 // Stateless checks of a proposed block: digest, TEE.SignBlock tag, parent
 // certificate, and the PoA of every tip.
 bool AutoBahn::VerifyBlock(const ConsensusBlock& b) {
-  if (b.proposer() < 1 || b.proposer() > n_ || b.height() < 1) return false;
+  auto reject = [&](const char* why) {
+    static std::atomic<int64_t> last_report{0};
+    if (Now() - last_report > 1000000) {
+      last_report = Now();
+      LOG(ERROR) << "rejecting block " << b.height() << " of view " << b.view()
+                 << " from " << b.proposer() << ": " << why;
+    }
+    return false;
+  };
+  if (b.proposer() < 1 || b.proposer() > n_ || b.height() < 1) return reject("header");
   // The digest binds the content, so a copy of a block already verified
   // needs no further signature checks.
-  if (BlockDigest(b) != b.hash()) return false;
+  if (BlockDigest(b) != b.hash()) return reject("digest");
   const std::string key = "block" + b.hash();
   if (CheckVerified(key)) return true;
   const QuorumCert& qc = b.parent_qc();
   if (qc.height() != b.height() - 1 || qc.block_hash() != b.parent_hash() ||
       !VerifyQc(qc)) {
-    return false;
+    return reject("parent certificate");
   }
   std::set<int> lanes;
   for (const Tip& t : b.tips()) {
     if (t.lane() < 1 || t.lane() > n_ || !lanes.insert(t.lane()).second) {
-      return false;
+      return reject("tip lanes");
     }
     if (t.poa().index() != t.index() || t.poa().car_hash() != t.car_hash() ||
         !VerifyPoa(t.lane(), t.poa())) {
-      return false;
+      return reject("tip PoA");
     }
   }
   for (const Claim& c : b.claims()) {
-    if (!bof_ || c.lane() < 1 || c.lane() > n_) return false;
+    if (!bof_ || c.lane() < 1 || c.lane() > n_) return reject("claim");
   }
   if (!tee_->VerifyBatch({{TeeHost::BlockMsg(b.proposer(), b.view(), b.height(),
                                              b.hash()),
                            b.tee_tag()}})[0]) {
-    return false;
+    return reject("TEE tag");
   }
   MarkVerified(key);
   return true;
@@ -1488,9 +1535,12 @@ bool AutoBahn::VoteWaitsOver(const BlockState& st) {
   return true;
 }
 
-// Votes are cast in height order: the first vote of a view requires the
-// parent certificate to rank at least as high as the lock; later votes must
-// extend the block voted last.
+// Votes are cast in height order.  A replica votes for a block only if its
+// parent certificate ranks at least as high as the replica's lock and its
+// height exceeds the last height it voted for in this view; a block that
+// fails either is stale (superseded by a certificate the replica already
+// holds, or below a block it voted for) and is dropped, never voted for.
+// Equivocation within a view is detected through forwarding.
 void AutoBahn::ProcessPendingVotes() {
   if (!in_view_) return;
   for (auto it = pending_votes_.begin(); it != pending_votes_.end();) {
@@ -1501,12 +1551,14 @@ void AutoBahn::ProcessPendingVotes() {
     }
     BlockState& st = bit->second;
     const ConsensusBlock& b = st.block;
-    bool parent_ok = voted_tip_.empty()
-                         ? !RankAbove(highest_qc_, b.parent_qc())
-                         : b.parent_hash() == voted_tip_;
-    bool parent_known = b.parent_hash().empty() || blocks_.count(b.parent_hash());
-    if (!parent_known) RequestBlock(b.parent_hash());
-    if (!parent_ok || !parent_known) break;
+    if (RankAbove(highest_qc_, b.parent_qc()) || b.height() <= voted_height_) {
+      it = pending_votes_.erase(it);
+      continue;
+    }
+    if (!b.parent_hash().empty() && !blocks_.count(b.parent_hash())) {
+      RequestBlock(b.parent_hash());
+      break;
+    }
     if (!st.tipcut_checked) {
       st.tipcut_checked = true;
       st.rejected = !ValidTipCut(st);
@@ -1528,7 +1580,7 @@ void AutoBahn::ProcessPendingVotes() {
 void AutoBahn::CastVote(BlockState& st) {
   const ConsensusBlock& b = st.block;
   st.voted = true;
-  voted_tip_ = b.hash();
+  voted_height_ = b.height();
   if (b.proposer() != id_) {
     // Forwarding the proposal is what makes the 2 Delta commit rule safe.
     Proposal fwd;
@@ -1648,6 +1700,7 @@ void AutoBahn::ProcessPendingCommits() {
 
     CommittedBlock out;
     out.height = b.height();
+    out.commit_time = Now();
     for (int j = 1; j <= n_; ++j) {
       const Tip* t = TipOf(b, j);
       if (t == nullptr) continue;
@@ -1743,6 +1796,7 @@ void AutoBahn::SettleLoop() {
 // as soon as the tip cut advanced or a claim is due, and at least every Delta.
 void AutoBahn::MaybePropose() {
   if (!in_view_ || LeaderOf(view_) != id_) return;
+  if (all_heard_at_ == 0 && committed_height_ == 0 && last_proposed_.empty()) return;
   int64_t now = Now();
   if (!leader_ready_) {
     if (view_ > 1 && now - view_start_ < 2 * params_.delta_us) return;
@@ -1842,8 +1896,8 @@ void AutoBahn::MaybePropose() {
 // leader if fewer than p proposals triggered its vote within the budget.
 void AutoBahn::CheckBlame() {
   int64_t now = Now();
-  if (!consensus_started_ &&
-      now - start_time_ >= kStartupGraceDeltas * params_.delta_us) {
+  if (!consensus_started_ && all_heard_at_ > 0 &&
+      now - all_heard_at_ >= kStartupGraceDeltas * params_.delta_us) {
     consensus_started_ = true;
     view_start_ = now;
   }
@@ -1947,7 +2001,7 @@ void AutoBahn::EnterNextView() {
   blamed_ = false;
   leader_ready_ = false;
   vote_times_.clear();
-  voted_tip_.clear();
+  voted_height_ = 0;
   last_proposed_.clear();
   claimed_lanes_.clear();
   commit_timers_.clear();
@@ -2011,18 +2065,28 @@ void AutoBahn::SettleBof(const std::vector<int>& claims, CommittedBlock* out) {
   BofSettleResult res = bof_orderer_->Settle(cars, claims);
   auto armed = std::make_shared<std::vector<std::pair<int, int64_t>>>(std::move(res.armed));
   auto targets = std::make_shared<std::map<int, int64_t>>(bof_orderer_->ClaimTargets());
-  Post([this, armed, targets] {
-    ArmDelinquencyTimers(*armed);
+  const int64_t committed_at = out->commit_time;
+  Post([this, armed, targets, committed_at] {
+    ArmDelinquencyTimers(*armed, committed_at);
     claim_targets_ = *targets;
   });
+  int64_t lag = Now() - committed_at;
+  static int64_t last_report = 0;
+  if (lag > params_.delta_us / 2 && Now() - last_report > 1000000) {
+    last_report = Now();
+    LOG(ERROR) << "bof: settled block " << out->height << " " << lag << "us after commit";
+  }
   out->bof_eligible = std::move(res.eligible);
   out->bof_pending = bof_orderer_->PendingSize();
+  out->bof_cars = std::move(cars);
 }
 
+// The timer starts when the block commits (the paper's rule, so the timers
+// of correct replicas expire within Delta of one another), however late
+// settlement learns of it.
 void AutoBahn::ArmDelinquencyTimers(
-    const std::vector<std::pair<int, int64_t>>& armed) {
-  int64_t now = Now();
-  for (const auto& a : armed) delinquency_armed_.emplace(a, now);
+    const std::vector<std::pair<int, int64_t>>& armed, int64_t committed_at) {
+  for (const auto& a : armed) delinquency_armed_.emplace(a, committed_at);
 }
 
 void AutoBahn::CheckDelinquencyTimers() {
@@ -2082,7 +2146,7 @@ std::vector<AutoBahn::Body> AutoBahn::GetBodies(const std::vector<TxnId>& ids) {
   return out;
 }
 
-void AutoBahn::Execute(const CommittedBlock& block) {
+void AutoBahn::Execute(CommittedBlock& block) {
   int64_t now = Now();
 
   // Newly committed transactions, and consensus latency over those this
@@ -2119,21 +2183,24 @@ void AutoBahn::Execute(const CommittedBlock& block) {
     }
     order = ol_->Commit(cars);
     pending = ol_->PendingSize();
-  } else if (!block.bof_eligible.empty()) {
+  } else {
+    // Hold-back rule (Sec. 7.1), then Alg. 3 on what it releases.
+    bof_hold_->OnCommitted(block.bof_cars, block.claims);
+    std::vector<BofEligibleTxn> released = bof_hold_->Release(std::move(block.bof_eligible));
+    const size_t releasing = released.size();
     int64_t start = Now();
-    auto batches = BofOrderer::Order(block.bof_eligible, n_, bof_theta_);
+    auto batches = BofOrderer::Order(std::move(released), n_, bof_theta_);
     int64_t took = Now() - start;
     static int64_t last_report = 0;
     if (took > params_.delta_us && Now() - last_report > 1000000) {
       last_report = Now();
-      LOG(ERROR) << "bof: ordering " << block.bof_eligible.size() << " transactions took "
-                 << took << "us (" << batches.size() << " batches)";
+      LOG(ERROR) << "bof: ordering " << releasing << " transactions took " << took
+                 << "us (" << batches.size() << " batches, " << bof_hold_->HeldSize()
+                 << " held back)";
     }
     for (auto& batch : batches) {
       for (auto& id : batch) order.push_back(std::move(id));
     }
-    pending = block.bof_pending;
-  } else {
     pending = block.bof_pending;
   }
 
@@ -2160,8 +2227,9 @@ void AutoBahn::Execute(const CommittedBlock& block) {
     }
   }
   if (!ids.empty()) {
-    // Enclave garbage collection (Sec. 5.1): executed transactions leave H.
-    tee_->Forget(order);
+    // The host drops its copies of executed bodies after a retention period.
+    // The enclave keeps H: deleting an id safely would require the enclave
+    // to verify an execution proof (not implemented; see the paper).
     std::vector<std::vector<TxnId>> parts(shards_.size());
     for (const TxnId& id : ids) {
       uint64_t v;

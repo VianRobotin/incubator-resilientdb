@@ -2,6 +2,9 @@
   <ProdID>0</ProdID>
   <ISVSVN>0</ISVSVN>
   <StackMaxSize>0x80000</StackMaxSize>
+  <!-- Simulation mode commits the whole heap at enclave creation (about
+       1 s and 0.5 GB per 512 MB), so keep it modest: H holds every attested
+       identifier for the run as compact keys (see kHistoryReserve). -->
   <HeapMaxSize>0x20000000</HeapMaxSize>
   <!-- TCSNum: max concurrent threads entering the enclave.
        One per thread that may enter the enclave at once (network workers verify

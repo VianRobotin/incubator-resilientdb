@@ -25,6 +25,10 @@
 #include "platform/consensus/ordering/common/algorithm/protocol_base.h"
 #include "platform/statistic/stats.h"
 
+namespace pearl {
+class AesCmac;
+}  // namespace pearl
+
 namespace resdb {
 namespace autobahn {
 
@@ -199,9 +203,6 @@ class AutoBahn : public common::ProtocolBase {
     // (for the freshness check).
     Poa certified;
     std::deque<std::pair<int64_t, int64_t>> certified_at;  // (index, time)
-    // Latest admitted rate reported by the lane's owner, and when.
-    double admit_rate = 0;
-    int64_t admit_at = 0;
   };
 
   struct BlockState {
@@ -230,6 +231,8 @@ class AutoBahn : public common::ProtocolBase {
     std::vector<BofEligibleTxn> bof_eligible;
     size_t bof_pending = 0;
     std::vector<int> claims;  // BOF: lanes named by newly committed claims
+    std::vector<BofCommittedCar> bof_cars;  // BOF: the Cars, as settled
+    int64_t commit_time = 0;
   };
 
   // Outgoing messages are copied and queued; a pool of sender threads
@@ -241,6 +244,7 @@ class AutoBahn : public common::ProtocolBase {
 
   // Admission control under overload (see ReceiveTransaction).
   void AdjustAdmission();
+  void AdmissionLoop();
 
   // Signature checks run once per distinct PoA and block: proposals are
   // forwarded by every voter and tips recur across blocks.
@@ -277,6 +281,7 @@ class AutoBahn : public common::ProtocolBase {
   void AdvanceLanes();
   void AcceptCar(Lane& lane, Car car);
   void LearnCertified(int lane, const Poa& poa);
+  void NoteHeard(int lane);
   void HandleCarAck(const CarAck& ack);
   void RequestCar(int lane, int64_t index);
   void RequestMissingCars();
@@ -315,12 +320,13 @@ class AutoBahn : public common::ProtocolBase {
   // BOF settlement at commit and delinquency timers (Sec. 7.1).
   void SettleBof(const std::vector<int>& claims, CommittedBlock* out);
   void SettleLoop();
-  void ArmDelinquencyTimers(const std::vector<std::pair<int, int64_t>>& armed);
+  void ArmDelinquencyTimers(const std::vector<std::pair<int, int64_t>>& armed,
+                            int64_t committed_at);
   void CheckDelinquencyTimers();
 
   // Execution layer.
   void ExecutionLoop();
-  void Execute(const CommittedBlock& block);
+  void Execute(CommittedBlock& block);
   std::vector<Body> GetBodies(const std::vector<TxnId>& ids);
 
   // ---- Configuration ----
@@ -361,12 +367,17 @@ class AutoBahn : public common::ProtocolBase {
   std::vector<std::unique_ptr<Shard>> shards_;
   std::atomic<int64_t> dropped_{0};       // client txns shed under overload
   std::atomic<int> admit_{kAdmitAll};     // admission threshold, of kAdmitAll
-  double own_rate_ = 0;                   // admitted rate this replica proposes
+  std::unique_ptr<pearl::AesCmac> admission_mac_;  // keyed rank of client txns
+  // Admission thread: own_rate_ is the admitted rate this replica proposes
+  // (read by SealCar); reported_rate_/reported_at_ hold the rates other
+  // replicas reported in their Cars (written by the protocol thread).
+  std::atomic<double> own_rate_{0};
+  std::unique_ptr<std::atomic<int64_t>[]> reported_rate_, reported_at_;
+  std::thread admission_thread_;
   double capacity_ = 0;                   // estimated, tx/s
   double arrival_rate_ = 0;               // client arrivals, tx/s
   int64_t window_arrivals_ = 0;
   double link_used_ = 0;
-  int64_t last_admission_ = 0;
   int64_t nic_rx_ = -1, nic_tx_ = -1;    // traffic counters at last check
   std::atomic<int64_t> client_arrivals_{0};  // since the last adjustment
   std::atomic<int64_t> echo_bytes_{0};       // sent, fan-out included
@@ -395,6 +406,8 @@ class AutoBahn : public common::ProtocolBase {
   int64_t quit_time_ = 0;
   bool blamed_ = false;
   bool consensus_started_ = false;
+  std::vector<bool> heard_;    // startup: lanes that delivered a Car
+  int64_t all_heard_at_ = 0;
   std::map<std::string, BlockState> blocks_;
   std::map<std::pair<int64_t, int64_t>, std::string> seen_heights_;
   std::set<std::pair<int64_t, std::string>> pending_votes_;  // (height, hash)
@@ -407,7 +420,7 @@ class AutoBahn : public common::ProtocolBase {
   std::map<int64_t, std::map<int, Status>> statuses_;
   std::deque<int64_t> vote_times_;
   std::vector<CommitTimer> commit_timers_;
-  std::string voted_tip_;  // last block voted in this view
+  int64_t voted_height_ = 0;  // last height voted for in this view
   std::deque<std::string> commit_queue_;
   int64_t committed_height_ = 0;
   std::string committed_hash_;
@@ -434,6 +447,7 @@ class AutoBahn : public common::ProtocolBase {
 
   // ---- Execution state (execution thread) ----
   std::unique_ptr<OlOrderer> ol_;
+  std::unique_ptr<BofHoldBack> bof_hold_;
   absl::flat_hash_set<TxnId> exec_committed_;
   int64_t execute_id_ = 1;
   std::string order_digest_;

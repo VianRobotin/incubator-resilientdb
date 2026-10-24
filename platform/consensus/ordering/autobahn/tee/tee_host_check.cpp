@@ -113,15 +113,9 @@ void CheckOl() {
   // Timestamps the host feeds the enclave strictly increase.
   CHECK(hb_ts > ts[2][0].value);
 
-  // Garbage collection: an executed, sealed transaction leaves H, and a
-  // resubmission gets a fresh, larger timestamp.
-  CHECK(tees[1]->Forget({Id(1)}));
+  // H is never pruned: a transaction is attested at most once.
   int64_t again = 0;
   std::string again_tag;
-  CHECK(tees[1]->OlAttest(Id(1), &again, &again_tag));
-  CHECK(again > hb_ts);
-  // One whose own key is not sealed yet stays in H until it is.
-  CHECK(tees[1]->Forget({Id(1)}));
   CHECK(!tees[1]->OlAttest(Id(1), &again, &again_tag));
 }
 
@@ -181,12 +175,10 @@ void CheckBof() {
        {TeeHost::CarSigMsg(1, c3.hash), c3.tag}});
   CHECK(ok[0] && ok[1]);
 
-  // Garbage collection: an executed transaction leaves H.
+  // H is never pruned: a transaction is placed at most once.
   int64_t c = 0;
   std::string ptag;
   CHECK(!tees[1]->BofPlace(Id(1), &c, &ptag));
-  CHECK(tees[1]->Forget({Id(1)}));
-  CHECK(tees[1]->BofPlace(Id(1), &c, &ptag));
 
   // Block signing refuses equivocation at the same height.
   std::string tag;

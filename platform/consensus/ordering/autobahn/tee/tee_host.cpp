@@ -379,18 +379,15 @@ bool TeeHost::Heartbeat(std::string* id, int64_t* value) {
   return true;
 }
 
-bool TeeHost::Forget(const std::vector<std::string>& ids) {
-  if (!ok_) return false;
-  if (ids.empty()) return true;
-  std::string buf;
-  buf.reserve(ids.size() * PEARL_ID_LEN);
-  for (const std::string& id : ids) buf += Id32(id);
+std::string TeeHost::AdmissionKey() {
+  if (!ok_) return "";
+  uint8_t key[16];
   sgx_status_t ecall_ret;
-  std::unique_lock<std::mutex> lk(mu_);
-  sgx_status_t ret = RetryBusy([&] { return ecall_forget(static_cast<sgx_enclave_id_t>(eid_), &ecall_ret,
-                                  U8(buf), static_cast<uint32_t>(buf.size())); });
-  lk.unlock();
-  return Check("ecall_forget", ret, ecall_ret);
+  sgx_status_t ret = RetryBusy([&] {
+    return ecall_admission_key(static_cast<sgx_enclave_id_t>(eid_), &ecall_ret, key);
+  });
+  if (!Check("ecall_admission_key", ret, ecall_ret)) return "";
+  return std::string(reinterpret_cast<char*>(key), sizeof(key));
 }
 
 bool TeeHost::SignBlock(int64_t view, int64_t height, const std::string& digest,

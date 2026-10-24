@@ -24,3 +24,10 @@ cc_library(
         "-lpthread",
     ],
 )
+
+# AES-128-CMAC (AES-NI); shared by the enclave and the host (admission rank).
+cc_library(
+    name = "aes_cmac",
+    hdrs = ["aes_cmac.h"],
+    copts = ["-maes"],
+)

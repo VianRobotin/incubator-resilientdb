@@ -177,6 +177,36 @@ TEST(BofOrdererTest, CoverageNeedsFPlusOneLanes) {
 }
 
 
+// RV4 (Sec. 7.1, hold-back rule).  n = 3, f = 1, gamma = 1, theta = 2.
+// Lanes 1 and 2 are correct and received a before b; lane 3 is faulty and
+// placed only b.  b is covered first (lanes 1 and 3) and becomes eligible
+// while a is not (lane 2 has not covered it yet).  b must not execute
+// before a: a precedes b in two (= theta) of the lanes that committed b.
+TEST(BofOrdererTest, EligibleTransactionWaitsForMandatedPredecessor) {
+  const int n = 3;
+  BofOrderer bof(n, 1, 1.0);
+  auto res = bof.Commit({BofCar(n, 1, 1, {"a", "b"}, 1, {1, 1, 1}),
+                         BofCar(n, 2, 1, {"a", "b"}, 0, {0, 0, 0}),
+                         BofCar(n, 3, 1, {"b"}, 1, {1, 1, 1})},
+                        {});
+  EXPECT_TRUE(res.batches.empty());  // b is eligible but held back
+  // Lane 2 covers a: both execute, a first.
+  res = bof.Commit({BofCar(n, 2, 2, {}, 1, {1, 1, 1})}, {});
+  ASSERT_EQ(res.batches, (Batches{{"a"}, {"b"}}));
+}
+
+// A transaction placed before b by a single (faulty) lane, fewer than theta,
+// does not hold b back.
+TEST(BofOrdererTest, PredecessorInFewerThanThetaLanesDoesNotHold) {
+  const int n = 3;
+  BofOrderer bof(n, 1, 1.0);
+  auto res = bof.Commit({BofCar(n, 1, 1, {"b"}, 1, {1, 1, 1}),
+                         BofCar(n, 2, 1, {"b"}, 1, {1, 1, 1}),
+                         BofCar(n, 3, 1, {"x", "b"}, 0, {0, 0, 0})},
+                        {});
+  ASSERT_EQ(res.batches, (Batches{{"b"}}));
+}
+
 // The straightforward Alg. 3 (adjacency lists, recursive-free Tarjan), kept
 // as the reference the optimized BofOrderer::Order must match exactly.
 Batches ReferenceOrder(
