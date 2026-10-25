@@ -315,6 +315,7 @@ def run_one(system: str, batch_size: int, dry_run: bool, pearl_mode: str = "ol")
 
 
 def main():
+    global RESULTS_DIR
     p = argparse.ArgumentParser(description="Batch-size sweep across systems")
     p.add_argument("--systems", nargs="+", choices=list(SYSTEMS.keys()),
                    default=list(SYSTEMS.keys()),
@@ -328,8 +329,14 @@ def main():
                    help="Pearl modes to run (default: ol bof). Ignored for non-pearl systems.")
     p.add_argument("--dry-run", action="store_true",
                    help="print plan, don't reserve or run")
+    p.add_argument("--results-dir",
+                   help=f"write the per-system CSVs here instead of "
+                        f"{RESULTS_DIR.relative_to(PEARL_ROOT)} (relative to the repo "
+                        f"root); resuming reads only this directory")
     args = p.parse_args()
 
+    if args.results_dir:
+        RESULTS_DIR = (PEARL_ROOT / args.results_dir).resolve()
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     RUNTIME_BASE.mkdir(parents=True, exist_ok=True)
 

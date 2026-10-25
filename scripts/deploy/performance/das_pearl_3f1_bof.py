@@ -50,14 +50,10 @@ RUNTIME     = 60
 WARMUP      = 15
 REPETITIONS = 5
 
-# Cap load-generator clients so the reservation stays grantable on a busy DAS5.
-# Replicas (n) are fixed; clients are just injectors and need not be 1-per-replica.
-# Demand = n + min(n, MAX_CLIENTS): 17/23/29 for n=10/16/22 (vs 2n = 20/32/44 —
-# 44 is never available while long-term reservations hold ~16 nodes). At 7 clients
-# the peak per-client rate is 50000/7 ≈ 7.1k tx/s, the top of the range the 2f+1
-# runs (num_clients=n, peak ~3.3k–7.1k) already validated, so clients stay below
-# the bottleneck and throughput remains comparable.
-MAX_CLIENTS = 7
+# Each node hosts one replica and one co-located client (paper Sec. 8.1), as in
+# the 2f+1 rate sweep, so a run reserves n machines.  --max-clients can lower
+# the number of clients; 0 means one per replica.
+MAX_CLIENTS = 0
 
 HEADER = ("n,mode,input_rate,rep,"
           "consensus_tps,consensus_latency_ms,"
@@ -100,6 +96,7 @@ def append_row(path: Path, row: str):
 
 
 def main():
+    global OUT_CSV
     ap = argparse.ArgumentParser(
         description="Pearl BOF rate sweep at 3f+1 (n ∈ {10, 16, 22})")
     ap.add_argument("--dry-run", action="store_true",
@@ -111,10 +108,16 @@ def main():
     ap.add_argument("--reps", type=int, default=REPETITIONS,
                     help=f"Repetitions per (n, rate) point (default: {REPETITIONS})")
     ap.add_argument("--max-clients", type=int, default=MAX_CLIENTS,
-                    help=f"Cap on load-generator clients; num_clients=min(n, cap) "
-                         f"(default: {MAX_CLIENTS}). Lower => fewer machines but "
-                         f"higher per-client injection rate.")
+                    help="Cap on load-generator clients; num_clients=min(n, cap), "
+                         "0 = one per replica (default)")
+    ap.add_argument("--results-dir",
+                    help=f"Write {OUT_CSV.name} here instead of das_results/ "
+                         f"(relative to the repo root); resuming reads only this file")
     args = ap.parse_args()
+
+    if args.results_dir:
+        OUT_CSV = (PEARL_ROOT / args.results_dir).resolve() / OUT_CSV.name
+        OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
 
     # Import das.py from the same directory.
     sys.path.insert(0, str(THIS_DIR))
@@ -144,7 +147,7 @@ def main():
         # Pin f to the 3f+1 fault tolerance (f=3/5/7 for n=10/16/22) so this is a
         # real 3f+1 committee, not Pearl's default f=(n-1)/2 near-unanimous regime.
         f_pin = (n - 1) // 3
-        n_clients = min(n, args.max_clients)
+        n_clients = min(n, args.max_clients) if args.max_clients > 0 else n
         for rate in rates:
             for rep in range(1, args.reps + 1):
                 if (n, MODE, rate, rep) in done:
@@ -152,7 +155,7 @@ def main():
                     continue
                 print(f"\n--- n={n} (f={f_pin}, 3f+1)  mode={MODE}  "
                       f"rate={rate}  rep={rep}/{args.reps}  "
-                      f"clients={n_clients} (machines={n + n_clients}) ---")
+                      f"clients={n_clients} ---")
                 # One slow/short DAS5 reservation (e.g. 2n=44 machines at n=22 not
                 # granted within the wait) raises from run_experiment. Catch it so a
                 # single bad point is logged and skipped instead of unwinding the
@@ -165,7 +168,7 @@ def main():
                         runtime=RUNTIME,
                         warmup=WARMUP,
                         dry_run=args.dry_run,
-                        num_clients=n_clients,   # capped (see MAX_CLIENTS)
+                        num_clients=n_clients,
                         target_tps=rate,
                         silent_faults=0,
                         fault_num=f_pin,
