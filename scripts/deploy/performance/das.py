@@ -40,6 +40,7 @@ CERT_TOOL  = PROJ_ROOT / "bazel-bin/tools/certificate_tools"
 
 BASE_PORT      = 10001
 READY_TIMEOUT  = 120   # seconds to wait for all replicas to connect
+RUN_ATTEMPTS   = 3     # tries per point when a replica that should be live dies
 
 RESULTS_DIR  = PROJ_ROOT / "das_results"
 RUNTIME_BASE = PROJ_ROOT / "das_runtime"
@@ -326,7 +327,53 @@ def _compute_tps_latency(entries: list, fallback_duration: float):
 # Core experiment runner
 # ---------------------------------------------------------------------------
 
-def run_experiment(
+class ReplicaDied(RuntimeError):
+    """A replica that should have been live for the whole run was not."""
+
+
+def kill_nodes(hosts: List[str]):
+    procs = []
+    for host in dict.fromkeys(hosts):
+        p = ssh_cmd(host, "killall -9 kv_server_performance 2>/dev/null || true")
+        if p:
+            procs.append(p)
+    for p in procs:
+        p.wait()
+    time.sleep(2)
+
+
+def dead_replicas(replicas: List[Tuple[int, str]], log_dir: Path) -> List[int]:
+    """Ids of the (id, host) replicas whose process is no longer running."""
+    procs = [(i, subprocess.Popen(
+                ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+                 host, f"kill -0 $(cat {log_dir}/server_{i}.pid)"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+             for i, host in replicas]
+    dead = [i for i, p in procs if p.wait() != 0]
+    for i in dead:
+        tail = (log_dir / f"server_{i}.log").read_text(errors="replace")[-300:]
+        print(f"  Replica {i} is not running; log ends with:\n{tail}")
+    return dead
+
+
+def run_experiment(*args, **kwargs) -> Tuple[float, float, float, float, int]:
+    """
+    Run one experiment (see _run_once), repeating it when a replica that
+    should have been live died or executed nothing: such a run measures a
+    crash, not the configured setting.  After RUN_ATTEMPTS failures it
+    returns zeros, which the sweeps treat as not done and rerun on resume.
+    """
+    for attempt in range(1, RUN_ATTEMPTS + 1):
+        try:
+            return _run_once(*args, **kwargs)
+        except ReplicaDied as e:
+            print(f"INVALID RUN (attempt {attempt}/{RUN_ATTEMPTS}): {e}")
+            time.sleep(10)
+    print(f"ERROR: giving up after {RUN_ATTEMPTS} attempts; recording zeros")
+    return 0.0, 0.0, 0.0, 0.0, 0
+
+
+def _run_once(
     num_replicas: int,
     mode: str,
     block_size: int,
@@ -342,9 +389,9 @@ def run_experiment(
     Reserve machines, run one experiment, return:
       (consensus_tps, consensus_latency_s, execution_tps, execution_latency_s, slots)
 
-    silent_faults: number of replicas to leave unstarted (silent-crash model).
-    Certs/config are still generated for all N (committee size), but only the
-    first (N - silent_faults) replicas are ssh-launched.  The honest replicas
+    silent_faults: number of replicas crashed silently (silent-crash model).
+    All N replicas start; the last silent_faults are killed once the cluster
+    has formed, before the clients are triggered.  The honest replicas
     must still form quorum (f+1 of 2f+1) — caller is responsible for choosing
     a tolerable silent_faults value.
     """
@@ -435,9 +482,13 @@ def run_experiment(
             pid_file  = log_dir / f"server_{i}.pid"
             priv_key  = cert_dir / f"node_{i}.key.pri"
             cert_file = cert_dir / f"cert_{i}.cert"
+            # The wrapper shell records how the replica ended (137 = SIGKILL),
+            # so that a replica dying mid-run can be told apart from a crash.
             p = ssh_cmd(host,
-                f"{env_prefix}nohup {SERVER_BIN} {config_path} {priv_key} "
-                f"{cert_file} > {log_file} 2>&1 & echo $! > {pid_file}")
+                f"{env_prefix}nohup sh -c '{SERVER_BIN} {config_path} "
+                f"{priv_key} {cert_file} & echo $! > {pid_file}; wait $!; "
+                f"echo \"das: replica exited with status $? at $(date +%T.%N)\"' "
+                f"> {log_file} 2>&1 &")
             if p:
                 procs.append(p)
         for p in procs:
@@ -518,6 +569,12 @@ def run_experiment(
                 p.wait()
             time.sleep(1)
 
+        live = list(enumerate(replica_hosts[:live_replicas], 1))
+        dead = dead_replicas(live, log_dir)
+        if dead:
+            kill_nodes(replica_hosts + client_hosts)
+            raise ReplicaDied(f"replicas {dead} died before the clients started")
+
         print("Triggering clients...")
         experiment_start = datetime.datetime.now()
         trigger_procs = []
@@ -531,15 +588,13 @@ def run_experiment(
         print(f"Running for {runtime}s...")
         time.sleep(runtime)
 
+        dead = dead_replicas(live, log_dir)
+        if dead:
+            kill_nodes(replica_hosts + client_hosts)
+            raise ReplicaDied(f"replicas {dead} died during the run")
+
         print("Killing nodes...")
-        kill_procs = []
-        for host in dict.fromkeys(replica_hosts + client_hosts):
-            p = ssh_cmd(host, "killall -9 kv_server_performance 2>/dev/null || true")
-            if p:
-                kill_procs.append(p)
-        for p in kill_procs:
-            p.wait()
-        time.sleep(2)
+        kill_nodes(replica_hosts + client_hosts)
 
         print("Parsing logs...")
         fallback_dur = max(1.0, runtime - warmup)
@@ -550,6 +605,7 @@ def run_experiment(
         slots_committed = 0
         any_commit_fallback = False
         any_exec_fallback = False
+        stalled: list = []
 
         for i in range(1, live_replicas + 1):
             lf = log_dir / f"server_{i}.log"
@@ -566,12 +622,17 @@ def run_experiment(
             print(f"  Replica {i}: con={con_tps_i:.0f}tps/{con_lat_i*1000:.0f}ms"
                   f"  exec={exec_tps_i:.0f}tps/{exec_lat_i*1000:.0f}ms"
                   f"  slots={commit_total}  exec_slots={exec_total}{flag}")
+            if exec_total == 0:
+                stalled.append(i)
             if con_tps_i > 0:
                 per_replica_con_tps.append(con_tps_i)
                 per_replica_con_lat.append(con_lat_i)
             if exec_tps_i > 0:
                 per_replica_exec_tps.append(exec_tps_i)
                 per_replica_exec_lat.append(exec_lat_i)
+
+        if stalled:
+            raise ReplicaDied(f"replicas {stalled} executed nothing")
 
         if any_commit_fallback or any_exec_fallback:
             which = []
