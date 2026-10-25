@@ -657,6 +657,12 @@ def _run_once(
               f"  slots={slots_committed}")
         return consensus_tps, consensus_lat_s, execution_tps, execution_lat_s, slots_committed
 
+    except BaseException:
+        # Don't leave replicas running into the next point.
+        if hostnames:
+            kill_nodes(hostnames)
+        raise
+
     finally:
         try:
             pm.kill_reservation(reservation_id)
@@ -744,6 +750,7 @@ def run_rate_sweep(dry_run: bool, nodes_filter: Optional[List[int]] = None,
     modes = modes_filter if modes_filter else ["ol", "bof"]
 
     print(f"\n=== Throughput-Latency rate sweep  (N={n_values}, modes={modes}) ===")
+    failures = []
 
     for n in n_values:
         rates = RATE_SWEEP[n]
@@ -754,16 +761,24 @@ def run_rate_sweep(dry_run: bool, nodes_filter: Optional[List[int]] = None,
                         print(f"  skip n={n} mode={mode} rate={rate} rep={rep} (done)")
                         continue
                     print(f"\n--- n={n}  mode={mode}  rate={rate}  rep={rep}/{REPETITIONS} ---")
-                    con_tps, con_lat_s, exec_tps, exec_lat_s, slots = run_experiment(
-                        num_replicas=n,
-                        mode=mode,
-                        block_size=BLOCK_SIZE,
-                        runtime=RUNTIME,
-                        warmup=WARMUP,
-                        dry_run=dry_run,
-                        num_clients=n,   # one client per replica
-                        target_tps=rate,
-                    )
+                    # A failed point (e.g. machines not granted in time) is
+                    # skipped without a row, so that rerunning the sweep fills it.
+                    try:
+                        con_tps, con_lat_s, exec_tps, exec_lat_s, slots = run_experiment(
+                            num_replicas=n,
+                            mode=mode,
+                            block_size=BLOCK_SIZE,
+                            runtime=RUNTIME,
+                            warmup=WARMUP,
+                            dry_run=dry_run,
+                            num_clients=n,   # one client per replica
+                            target_tps=rate,
+                        )
+                    except Exception as e:  # keep the sweep alive
+                        failures.append((n, mode, rate, rep))
+                        print(f"  !! FAILED n={n} mode={mode} rate={rate} rep={rep}: {e}")
+                        time.sleep(30)
+                        continue
                     if dry_run:
                         continue  # a dry run measures nothing: record nothing
                     append_csv(csv_path,
@@ -772,6 +787,10 @@ def run_rate_sweep(dry_run: bool, nodes_filter: Optional[List[int]] = None,
                         f"{exec_tps},{round(exec_lat_s * 1000, 2)},"
                         f"{slots}")
                     time.sleep(10)
+
+    if failures:
+        print(f"\n{len(failures)} point(s) failed and have no row; "
+              f"rerun the same command to fill them: {failures}")
 
 
 # ---------------------------------------------------------------------------
