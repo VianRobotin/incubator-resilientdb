@@ -94,12 +94,15 @@ int64_t ReplicaCommunicator::PendingBytes() {
   return pending[pending.size() / 2] * static_cast<int64_t>(pending.size());
 }
 
+// Updated by the heartbeat threads while the sender threads read it.
 void ReplicaCommunicator::UpdateClientReplicas(
     const std::vector<ReplicaInfo>& replicas) {
+  std::lock_guard<std::mutex> lk(clients_mu_);
   clients_ = replicas;
 }
 
 std::vector<ReplicaInfo> ReplicaCommunicator::GetClientReplicas() {
+  std::lock_guard<std::mutex> lk(clients_mu_);
   return clients_;
 }
 

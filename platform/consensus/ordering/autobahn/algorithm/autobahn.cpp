@@ -188,6 +188,7 @@ int AutoBahn::SendMessage(int msg_type, const google::protobuf::Message& msg,
 void AutoBahn::SendLoop() {
   while (true) {
     Outgoing out;
+    size_t waiting;
     {
       std::unique_lock<std::mutex> lk(send_mu_);
       send_cv_.wait_for(lk, std::chrono::milliseconds(10),
@@ -198,13 +199,14 @@ void AutoBahn::SendLoop() {
       }
       out = std::move(send_queue_.front());
       send_queue_.pop_front();
-      int64_t wait = Now() - out.queued;
-      static int64_t last_report = 0;
-      if (wait > params_.delta_us / 2 && Now() - last_report > 1000000) {
-        last_report = Now();
-        LOG(ERROR) << "send queue: " << send_queue_.size() << " waiting, oldest "
-                   << wait << "us";
-      }
+      waiting = send_queue_.size();
+    }
+    // Logged outside send_mu_: a slow log write must not block senders.
+    int64_t wait = Now() - out.queued;
+    static std::atomic<int64_t> last_report{0};
+    if (wait > params_.delta_us / 2 && Now() - last_report > 1000000) {
+      last_report = Now();
+      LOG(ERROR) << "send queue: " << waiting << " waiting, oldest " << wait << "us";
     }
     if (out.prepare) out.prepare(out.msg.get());
     if (out.target == 0) {

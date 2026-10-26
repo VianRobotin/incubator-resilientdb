@@ -112,7 +112,7 @@ void ServiceNetwork::AcceptorHandler(const char* buffer, size_t data_len) {
     }
     std::unique_ptr<DataInfo> sub_request_info = std::make_unique<DataInfo>();
     sub_request_info->data_len = sub_data.size();
-    sub_request_info->buff = new char[sub_request_info->data_len];
+    sub_request_info->buff = malloc(sub_request_info->data_len);  // freed by ~DataInfo
     memcpy(sub_request_info->buff, sub_data.data(), sub_request_info->data_len);
     std::unique_ptr<QueueItem> item = std::make_unique<QueueItem>();
     item->socket = nullptr;

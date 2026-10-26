@@ -74,9 +74,18 @@ int AsyncReplicaClient::SendMessage(const std::string& data) {
 
 void AsyncReplicaClient::OnSendNewMessage() {
   std::unique_ptr<std::string> data = queue_.Pop(0);
-  if (data == nullptr || data->empty()) {
+  while (data == nullptr || data->empty()) {
     in_process_ = false;
-    return;
+    // A message pushed after the Pop above, by a sender that still saw
+    // in_process_ set, would otherwise wait for the next SendMessage.
+    if (queue_.Empty()) return;
+    bool old_value = false;
+    if (!in_process_.compare_exchange_strong(old_value, true,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acq_rel)) {
+      return;  // that sender started the send itself
+    }
+    data = queue_.Pop(0);
   }
   pending_data_ = std::move(data);
   status_ = 0;

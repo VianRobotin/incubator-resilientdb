@@ -45,7 +45,7 @@ void AsyncAcceptor::Session::Close() {
     client_socket_.cancel();
   }
   if (recv_buffer_ && status_ != 0) {
-    delete recv_buffer_;
+    delete[] recv_buffer_;
     recv_buffer_ = nullptr;
   }
 }
@@ -63,7 +63,7 @@ void AsyncAcceptor::Session::StartRead() {
     need_size_ = data_size_;
     current_idx_ = 0;
     if (recv_buffer_) {
-      delete recv_buffer_;
+      delete[] recv_buffer_;
     }
     recv_buffer_ = new char[need_size_];
     memset(recv_buffer_, 0, need_size_);
@@ -74,7 +74,7 @@ void AsyncAcceptor::Session::StartRead() {
 void AsyncAcceptor::Session::ReadDone() {
   if (status_ == 1) {
     call_back_func_(recv_buffer_, data_size_);
-    delete recv_buffer_;
+    delete[] recv_buffer_;
   } else {
     data_size_ = *reinterpret_cast<size_t*>(recv_buffer_);
     /*
@@ -155,9 +155,12 @@ void AsyncAcceptor::OnAccept(boost::shared_ptr<Session> client_session,
     return;
   }
 
+  // Record the session before arming the next accept: OnAccept runs on any
+  // of the io_service threads, and only one accept is outstanding at a time,
+  // so this keeps sessions_ to one thread at a time.
+  sessions_.push_back(client_session);
   StartAccept();  // Add the next accept event.
 
-  sessions_.push_back(client_session);
   client_session->StartRead();
 }
 

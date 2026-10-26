@@ -251,9 +251,7 @@ int ConsensusManager::ProcessHeartBeat(std::unique_ptr<Context> context,
          //AddNewReplica(info);
       }
     } else {
-      if (!ReplicaExisted(info, clients_)) {
-        AddNewClient(info);
-      }
+      AddNewClient(info);
     }
   }
   if (!is_ready_ && replica_num >= config_.GetMinDataReceiveNum()) {
@@ -271,6 +269,7 @@ int ConsensusManager::ConsensusCommit(std::unique_ptr<Context> context,
 }
 
 std::vector<ReplicaInfo> ConsensusManager::GetClientReplicas() {
+  std::unique_lock<std::mutex> lk(mutex_);
   return clients_;
 }
 
@@ -325,8 +324,11 @@ std::unique_ptr<ReplicaCommunicator> ConsensusManager::GetReplicaClient(
 
 void ConsensusManager::AddNewReplica(const ReplicaInfo& info) {}
 
+// Heartbeats are processed on several threads: the existence check and the
+// insertion happen under one lock.
 void ConsensusManager::AddNewClient(const ReplicaInfo& info) {
   std::unique_lock<std::mutex> lk(mutex_);
+  if (ReplicaExisted(info, clients_)) return;
   clients_.push_back(info);
   bc_client_->UpdateClientReplicas(clients_);
 }

@@ -72,7 +72,7 @@ class LockFreeQueue {
   boost::lockfree::queue<T*> queue_;
   std::condition_variable cv_;
   std::mutex mutex_;
-  std::atomic<bool> need_notify_;
+  std::atomic<bool> need_notify_{false};
 };
 
 }  // namespace resdb

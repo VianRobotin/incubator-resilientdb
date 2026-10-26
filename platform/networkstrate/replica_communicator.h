@@ -106,7 +106,8 @@ class ReplicaCommunicator {
   boost::asio::io_service io_service_;
   std::unique_ptr<boost::asio::io_service::work> worker_;
   std::vector<std::thread> worker_threads_;
-  std::vector<ReplicaInfo> clients_;
+  std::vector<ReplicaInfo> clients_;  // guarded by clients_mu_
+  std::mutex clients_mu_;
   std::mutex mutex_;
   
 

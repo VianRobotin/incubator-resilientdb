@@ -104,7 +104,7 @@ class ConsensusManager : public ServiceInterface {
   std::thread heartbeat_thread_;
   std::atomic<bool> is_ready_ = false;
   std::unique_ptr<ReplicaCommunicator> bc_client_;
-  std::vector<ReplicaInfo> clients_;
+  std::vector<ReplicaInfo> clients_;  // guarded by mutex_
   Stats* global_stats_;
 };
 
