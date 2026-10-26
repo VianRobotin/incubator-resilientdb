@@ -37,6 +37,9 @@ SERVER_BIN = PROJ_ROOT / "bazel-bin/benchmark/protocols/autobahn/kv_server_perfo
 CLIENT_BIN = PROJ_ROOT / "bazel-bin/benchmark/protocols/autobahn/kv_service_tools"
 KEY_GEN    = PROJ_ROOT / "bazel-bin/tools/key_generator_tools"
 CERT_TOOL  = PROJ_ROOT / "bazel-bin/tools/certificate_tools"
+# Replicas may run a different build of the server (e.g. a sanitizer build);
+# clients always use SERVER_BIN.
+REPLICA_BIN = Path(os.environ.get("PEARL_REPLICA_BIN", SERVER_BIN))
 
 BASE_PORT      = 10001
 READY_TIMEOUT  = 120   # seconds to wait for all replicas to connect
@@ -44,6 +47,11 @@ RUN_ATTEMPTS   = 3     # tries per point when a replica that should be live dies
 
 RESULTS_DIR  = PROJ_ROOT / "das_results"
 RUNTIME_BASE = PROJ_ROOT / "das_runtime"
+# Replicas and clients log to node-local disk; the logs are copied into the
+# run directory once the nodes are killed.  /var/scratch is a hard-mounted
+# NFS share on the compute nodes: a stalled NFS write blocks every thread
+# that logs, which stalled replicas for seconds and broke the Delta bound.
+LOCAL_LOG_BASE = f"/local/{USERNAME}/pearl"
 
 TEE_ENCLAVE_PATH = PROJ_ROOT / "platform/consensus/ordering/autobahn/tee/tee_enclave.signed.so"
 LD_LIBRARY_PATH  = "/var/scratch/vrobotin/sgxsdk/lib64"
@@ -331,7 +339,10 @@ class ReplicaDied(RuntimeError):
     """A replica that should have been live for the whole run was not."""
 
 
-def kill_nodes(hosts: List[str]):
+def kill_nodes(hosts: List[str], local_dir: Optional[str] = None,
+               log_dir: Optional[Path] = None):
+    """Kill the Pearl processes on hosts; with local_dir, then move each
+    host's node-local logs into log_dir."""
     procs = []
     for host in dict.fromkeys(hosts):
         p = ssh_cmd(host, "killall -9 kv_server_performance 2>/dev/null || true")
@@ -340,18 +351,40 @@ def kill_nodes(hosts: List[str]):
     for p in procs:
         p.wait()
     time.sleep(2)
+    if local_dir is None:
+        return
+    procs = []
+    for host in dict.fromkeys(hosts):
+        p = ssh_cmd(host, f"cp {local_dir}/* {log_dir}/ 2>/dev/null; rm -rf {local_dir}")
+        if p:
+            procs.append(p)
+    for p in procs:
+        p.wait()
 
 
-def dead_replicas(replicas: List[Tuple[int, str]], log_dir: Path) -> List[int]:
-    """Ids of the (id, host) replicas whose process is no longer running."""
-    procs = [(i, subprocess.Popen(
+def remote_check(checks: List[Tuple[int, str, str]]) -> List[int]:
+    """Run each (key, host, command) over ssh in parallel; keys of the
+    commands that succeeded."""
+    procs = [(k, subprocess.Popen(
                 ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                 host, f"kill -0 $(cat {log_dir}/server_{i}.pid)"],
+                 host, cmd],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-             for i, host in replicas]
-    dead = [i for i, p in procs if p.wait() != 0]
+             for k, host, cmd in checks]
+    return [k for k, p in procs if p.wait() == 0]
+
+
+def dead_replicas(replicas: List[Tuple[int, str]], local_dir: str) -> List[int]:
+    """Ids of the (id, host) replicas whose process is no longer running."""
+    alive = set(remote_check([(i, host, f"kill -0 $(cat {local_dir}/server_{i}.pid)")
+                              for i, host in replicas]))
+    dead = [i for i, _ in replicas if i not in alive]
+    hosts = dict(replicas)
     for i in dead:
-        tail = (log_dir / f"server_{i}.log").read_text(errors="replace")[-300:]
+        tail = subprocess.run(
+            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+             hosts[i], f"tail -c 300 {local_dir}/server_{i}.log"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout.decode(
+                errors="replace")
         print(f"  Replica {i} is not running; log ends with:\n{tail}")
     return dead
 
@@ -423,6 +456,8 @@ def _run_once(
     print(f"Reservation: {reservation_id}")
     time.sleep(5)
 
+    local_dir = None
+    log_dir = None
     try:
         # Wait for machines
         hostnames = []
@@ -449,6 +484,7 @@ def _run_once(
         cert_dir    = runtime_dir / "cert"
         log_dir     = runtime_dir / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
+        local_dir   = f"{LOCAL_LOG_BASE}/{run_id}"
 
         print("Generating certificates...")
         generate_certs(cert_dir, replica_ips, client_ips)
@@ -467,6 +503,9 @@ def _run_once(
             f"export TEE_ENCLAVE_PATH={TEE_ENCLAVE_PATH}; "
             f"export LD_LIBRARY_PATH={LD_LIBRARY_PATH}:$LD_LIBRARY_PATH; "
         )
+        for var in ("ASAN_OPTIONS", "TSAN_OPTIONS"):
+            if var in os.environ:
+                env_prefix += f"export {var}='{os.environ[var]}'; "
 
         # Start ALL N replicas — silent faults are induced AFTER the cluster
         # forms, by killing the last `silent_faults` replicas just before
@@ -478,14 +517,14 @@ def _run_once(
               f"(silent_faults={silent_faults} will be killed post-ready)...")
         procs = []
         for i, host in enumerate(replica_hosts, 1):
-            log_file  = log_dir / f"server_{i}.log"
-            pid_file  = log_dir / f"server_{i}.pid"
+            log_file  = f"{local_dir}/server_{i}.log"
+            pid_file  = f"{local_dir}/server_{i}.pid"
             priv_key  = cert_dir / f"node_{i}.key.pri"
             cert_file = cert_dir / f"cert_{i}.cert"
             # The wrapper shell records how the replica ended (137 = SIGKILL),
             # so that a replica dying mid-run can be told apart from a crash.
             p = ssh_cmd(host,
-                f"{env_prefix}nohup sh -c '{SERVER_BIN} {config_path} "
+                f"mkdir -p {local_dir}; {env_prefix}nohup sh -c '{REPLICA_BIN} {config_path} "
                 f"{priv_key} {cert_file} & echo $! > {pid_file}; wait $!; "
                 f"echo \"das: replica exited with status $? at $(date +%T.%N)\"' "
                 f"> {log_file} 2>&1 &")
@@ -500,13 +539,12 @@ def _run_once(
         deadline = time.time() + READY_TIMEOUT
         ready = [False] * num_replicas
         while not all(ready) and time.time() < deadline:
-            for i in range(num_replicas):
-                if ready[i]:
-                    continue
-                lf = log_dir / f"server_{i+1}.log"
-                if lf.exists() and ready_pattern in lf.read_text(errors="replace"):
-                    ready[i] = True
-                    print(f"  Replica {i+1} ready")
+            for i in remote_check([
+                    (i, replica_hosts[i],
+                     f"grep -qF '{ready_pattern}' {local_dir}/server_{i+1}.log")
+                    for i in range(num_replicas) if not ready[i]]):
+                ready[i] = True
+                print(f"  Replica {i+1} ready")
             if not all(ready):
                 time.sleep(2)
         if not all(ready):
@@ -518,11 +556,11 @@ def _run_once(
         client_procs = []
         for j, host in enumerate(client_hosts, 1):
             node_id   = num_replicas + j
-            log_file  = log_dir / f"client_{node_id}.log"
+            log_file  = f"{local_dir}/client_{node_id}.log"
             priv_key  = cert_dir / f"node_{node_id}.key.pri"
             cert_file = cert_dir / f"cert_{node_id}.cert"
             p = ssh_cmd(host,
-                f"{env_prefix}nohup {SERVER_BIN} {config_path} {priv_key} "
+                f"mkdir -p {local_dir}; {env_prefix}nohup {SERVER_BIN} {config_path} {priv_key} "
                 f"{cert_file} > {log_file} 2>&1 &")
             if p:
                 client_procs.append(p)
@@ -561,7 +599,7 @@ def _run_once(
             # Kill the replica process only: the node's co-located client
             # keeps running.
             for i, host in enumerate(silent_hosts, live_replicas + 1):
-                pid_file = log_dir / f"server_{i}.pid"
+                pid_file = f"{local_dir}/server_{i}.pid"
                 p = ssh_cmd(host, f"kill -9 $(cat {pid_file}) 2>/dev/null || true")
                 if p:
                     kill_silent.append(p)
@@ -570,9 +608,9 @@ def _run_once(
             time.sleep(1)
 
         live = list(enumerate(replica_hosts[:live_replicas], 1))
-        dead = dead_replicas(live, log_dir)
+        dead = dead_replicas(live, local_dir)
         if dead:
-            kill_nodes(replica_hosts + client_hosts)
+            kill_nodes(replica_hosts + client_hosts, local_dir, log_dir)
             raise ReplicaDied(f"replicas {dead} died before the clients started")
 
         print("Triggering clients...")
@@ -588,13 +626,13 @@ def _run_once(
         print(f"Running for {runtime}s...")
         time.sleep(runtime)
 
-        dead = dead_replicas(live, log_dir)
+        dead = dead_replicas(live, local_dir)
         if dead:
-            kill_nodes(replica_hosts + client_hosts)
+            kill_nodes(replica_hosts + client_hosts, local_dir, log_dir)
             raise ReplicaDied(f"replicas {dead} died during the run")
 
         print("Killing nodes...")
-        kill_nodes(replica_hosts + client_hosts)
+        kill_nodes(replica_hosts + client_hosts, local_dir, log_dir)
 
         print("Parsing logs...")
         fallback_dur = max(1.0, runtime - warmup)
@@ -660,7 +698,10 @@ def _run_once(
     except BaseException:
         # Don't leave replicas running into the next point.
         if hostnames:
-            kill_nodes(hostnames)
+            if local_dir is not None:
+                kill_nodes(hostnames, local_dir, log_dir)
+            else:
+                kill_nodes(hostnames)
         raise
 
     finally:
