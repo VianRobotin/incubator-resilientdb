@@ -222,14 +222,18 @@ bool AutoBahn::CheckVerified(const std::string& key) {
   return verified_.contains(key);
 }
 
-void AutoBahn::MarkVerified(const std::string& key) {
+void AutoBahn::MarkVerified(const std::string& key) { FirstSeen(key); }
+
+// Records key in the bounded cache; false if it was already there.
+bool AutoBahn::FirstSeen(const std::string& key) {
   std::lock_guard<std::mutex> lk(verified_mu_);
-  if (!verified_.insert(key).second) return;
+  if (!verified_.insert(key).second) return false;
   verified_order_.push_back(key);
   if (verified_order_.size() > kVerifiedCache) {
     verified_.erase(verified_order_.front());
     verified_order_.pop_front();
   }
+  return true;
 }
 
 // ============================================================
@@ -1007,12 +1011,12 @@ void AutoBahn::ReceiveCar(std::unique_ptr<Car> car) {
     return;
   }
   auto c = std::make_shared<Car>(std::move(*car));
-  Post([this, c] { HandleCar(*c); });
+  Post([this, c] { HandleCar(std::move(*c)); });
 }
 
 // OnReceiveProp (Alg. 1): store the Car and acknowledge it, but only once
 // the Car at position i-1 of the lane was received and acknowledged.
-void AutoBahn::HandleCar(const Car& car) {
+void AutoBahn::HandleCar(Car&& car) {
   Lane& lane = lanes_[car.lane()];
   NoteHeard(car.lane());
   if (car.poa().index() > 0) LearnCertified(car.lane(), car.poa());
@@ -1022,7 +1026,7 @@ void AutoBahn::HandleCar(const Car& car) {
   }
   const int64_t idx = car.index();
   if (idx <= lane.acked || lane.buffered.count(idx)) return;
-  lane.buffered.emplace(idx, car);
+  lane.buffered.emplace(idx, std::move(car));
   AdvanceLane(lane);
 }
 
@@ -1368,6 +1372,11 @@ void AutoBahn::ReceiveProposal(std::unique_ptr<Proposal> proposal) {
     }
   }
   if (!VerifyBlock(proposal->block())) return;
+  // Every replica forwards each proposal: only the first copy of a block
+  // reaches the protocol thread (an identical copy carries nothing new;
+  // equivocation is two different blocks at one height).  The copies are
+  // freed here, off the protocol thread.
+  if (!FirstSeen("prop" + proposal->block().hash())) return;
   bool with_parent = proposal->has_parent() &&
                      proposal->parent().hash() == proposal->block().parent_hash() &&
                      VerifyBlock(proposal->parent());

@@ -250,6 +250,7 @@ class AutoBahn : public common::ProtocolBase {
   // forwarded by every voter and tips recur across blocks.
   bool CheckVerified(const std::string& key);
   void MarkVerified(const std::string& key);
+  bool FirstSeen(const std::string& key);
 
   // Protocol-thread plumbing.
   bool NetworkReady();
@@ -276,7 +277,7 @@ class AutoBahn : public common::ProtocolBase {
   SignInfo SignAck(const Car& car);
   bool VerifyPoa(int lane, const Poa& poa);
   bool VerifyCar(const Car& car);
-  void HandleCar(const Car& car);
+  void HandleCar(Car&& car);
   void AdvanceLane(Lane& lane);
   void AdvanceLanes();
   void AcceptCar(Lane& lane, Car car);
