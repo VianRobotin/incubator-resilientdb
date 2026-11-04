@@ -42,7 +42,8 @@ incubator-resilientdb/
 │   ├── preserve.py         # DAS5 reservation manager wrapper
 │   ├── METRICS.md          # Metric definitions and interpretation
 │   └── plot.py             # Result plotting
-├── das_results/            # CSV outputs from das.py experiments
+├── das_results/            # CSV outputs: pearl/<run>/{rate,faulty,batch,committee}/,
+│                           #   baselines/{rate,faulty,batch}/, paper_plots/
 └── das_runtime/            # Per-run certs, configs, logs (NFS-shared)
 ```
 
@@ -95,19 +96,23 @@ SGX SDK libs: `/var/scratch/vrobotin/sgxsdk/lib64`
 
 ## Reproducing the Final Paper Results
 
-Each system has a CSV in `das_results/` (or `das_results/baselines/`). The paper plots
-are generated from these CSVs by `scripts/deploy/performance/plot_paper.py`.
+Pearl's CSVs are in `das_results/pearl/2026-10-26/`, the baselines' in
+`das_results/baselines/2026-10-29/` (one dated folder per full run; older runs are in git
+history). That folder's `driver.log` records every launch, rerun and moved row; superseded
+rows are archived in its `*_rows/` subfolders. The paper figures are generated from copies of
+these CSVs by the paper's own `scripts/plot_paper_all_results_new.py` (paper folder, not in
+this repo; needs matplotlib >= 3.8).
 
 ### Rate-sweep CSVs (n × input_rate × rep)
 
 | System              | Mode | Result CSV                                |
 | ------------------- | ---- | ----------------------------------------- |
-| **Pearl** (ours)    | —    | `das_results/tput_latency.csv`            |
-| **FairDAG**         | OL   | `das_results/baselines/fairdag-ol.csv`    |
-| **FairDAG**         | BOF  | `das_results/baselines/fairdag-bof.csv`   |
-| **Tusk**            | —    | `das_results/baselines/tusk.csv`          |
-| **Pompe**           | —    | `das_results/baselines/pompe.csv`         |
-| **Themis**          | —    | `das_results/baselines/themis.csv`        |
+| **Pearl** (ours)    | —    | `das_results/pearl/<run>/rate/tput_latency.csv` |
+| **FairDAG**         | OL   | `das_results/baselines/<run>/rate/fairdag-ol.csv`    |
+| **FairDAG**         | BOF  | `das_results/baselines/<run>/rate/fairdag-bof.csv`   |
+| **Tusk**            | —    | `das_results/baselines/<run>/rate/tusk.csv`          |
+| **Pompe**           | —    | `das_results/baselines/<run>/rate/pompe.csv`         |
+| **Themis**          | —    | `das_results/baselines/<run>/rate/themis.csv`        |
 
 **Baseline location**: the FairDAG and narwhal baselines now live *inside* this repo at
 `baselines/fairdag` and `baselines/narwhal` (so their changes commit alongside Pearl). The
@@ -117,7 +122,10 @@ out-of-repo copies at `/var/scratch/vrobotin/{baselines-fairdag,narwhal}` are re
 **Tusk** is the plain DAG-BFT substrate that FairDAG is layered on (FairDAG = fair ordering
 on Tusk), drawn from the **fairdag** baseline's `platform/consensus/ordering/tusk` +
 `benchmark/protocols/tusk:kv_server_performance`. It is its own system (peer to FairDAG, not a
-FairDAG mode) and serves as the no-fair-ordering throughput/latency baseline.
+FairDAG mode) and serves as the no-fair-ordering throughput/latency baseline. As upstream,
+its client sends each transaction to one replica in round robin (every other system's client
+broadcasts). Its commit loop skips a round whose leader vertex is missing, as FairDAG's own
+Tusk does; it used to wait forever, so any silent replica stalled it (2026-11-04).
 
 **Pearl** is reproducible from source via `scripts/deploy/performance/das.py`.
 
@@ -140,10 +148,14 @@ codepath as the reps 2..5 entry points, so rep=1 and reps 2..5 are comparable.
 Pompe/Themis runs require the conda `workenv` environment, which the orchestrator
 activates in its narwhal subshell.
 
-**Pompe TPS caveat**: throughput reported by `narwhal/benchmark` for the `pompe` flavor is
-inflated 100× and must be divided by 100. The CSV at `das_results/baselines/pompe.csv` should
-contain the corrected (divided) values; `pompe-rate/run_pompe.py` output does not need this
-correction. (`das_baselines_reps.py`'s narwhal runner divides automatically.)
+**Pompe TPS caveat (June CSVs only)**: until 2026-10-29 the Pompe client sent every command
+`block-size` (100) times, replicas processed it on the 100th copy, and the client counted it
+as 100 transactions, so narwhal's Pompe TPS was divided by 100: the June `pompe.csv` rows count
+*commands* (each 100 transactions' worth of messages). Now a command is sent once and
+carries `client-batch` transactions (`pompe_client.cpp`, default 1): Pompe fair-orders a
+command as one unit, so 1 gives per-transaction ordering, as Pearl does. `block-size` only
+sets the replicas' block size. Serialization buffers in `crypto.h` are per call (a shared
+static buffer corrupted block hashes across threads).
 
 ### Faulty-node sweep (silent_faults × system)
 
@@ -155,8 +167,8 @@ into the underlying single-run mechanism:
 - Tusk: same shim with `--system tusk` (n=16, same 3f+1 as FairDAG)
 - Pompe/Themis: `fab of-faulty --flavor=<pompe|themis>` (note hyphen — fabric converts the underscore in `def of_faulty` to a hyphen on the command line)
 
-Per-system rows are appended to `das_results/faulty/{system}.csv`. Rows with `tps>0` are
-auto-skipped on re-run. Plots: `scripts/deploy/performance/plot_paper_faulty_curated.py`.
+Per-system rows are appended to `das_results/baselines/<run>/faulty/{system}.csv` (Pearl: `das_results/pearl/<run>/faulty/pearl.csv`). Rows with `tps>0` are
+auto-skipped on re-run, but rows with `tps<=0` are rerun and *appended*: move the old zero row out afterwards.
 Pearl can be run in either OL or BOF via `--pearl-mode {ol,bof}`; both modes share the
 same `pearl.csv` and the dedup key includes `mode` so they don't shadow each other.
 
@@ -179,19 +191,33 @@ sweeps batch_size in {25, 50, 100, 200, 400}.
 - Pompe/Themis: narwhal's worker accumulates batches by bytes; converted via
   `node_params['batch_size'] = batch * tx_size` (tx_size=128). New fab task `of-batch`.
 
-Per-system rows are appended to `das_results/batch/{system}.csv` with a `batch_size`
-column in place of `silent_faults`. Plots: `plot_paper_batch_curated.py`.
+Per-system rows are appended to `das_results/baselines/<run>/batch/{system}.csv` (Pearl: `das_results/pearl/<run>/batch/pearl.csv`) with a `batch_size`
+column in place of `silent_faults`.
 
-Final paper plots are produced by:
-```bash
-python /var/scratch/vrobotin/incubator-resilientdb/scripts/deploy/performance/plot_paper.py
-python /var/scratch/vrobotin/incubator-resilientdb/scripts/deploy/performance/plot_paper_faulty_curated.py
-python /var/scratch/vrobotin/incubator-resilientdb/scripts/deploy/performance/plot_paper_batch_curated.py
-```
+The `plot_paper*.py` scripts in `scripts/deploy/performance/` predate the 2026-10 runs and
+read the old CSV layout; the paper figures come from the paper folder's script (above).
 
 ---
 
-## Throughput-metric consistency across systems (IMPORTANT — partially unresolved)
+## Throughput/latency metrics: one definition for every system (since 2026-10-29)
+
+Every baseline replica now logs Pearl's `executed_batch` line every 100 ms
+(`exec_metrics.h`, copied into `baselines/fairdag/.../common/framework/`,
+`Pompe-HS/include/hotstuff/` and `Themis_tx/include/hotstuff/`): transactions executed and
+their mean latency from first arrival at that replica (from a client) to execution, where
+execution = commit in the final order (FairDAG/Tusk `CommitMsgInternal`, Themis's execute
+callback, Pompe's leader consensus callback; Pompe executes only at server#1).
+FairDAG-BOF clients send batched requests (up to 100 tx, fair-ordered as one unit, as upstream
+FairDAG; Tusk blocks sized in requests, ~100 tx) because its pairwise weights are O(n·pending²);
+OL/Tusk send one tx per request.  Pompe's `commit_set` is only touched on the HotStuff thread
+(a cross-thread race used to deadlock it).
+`scripts/deploy/performance/baseline_metrics.py` computes throughput and latency from those
+lines exactly as `das.py` does for Pearl (window [start+15 s, start+60 s], start = first
+client transaction; trimmed mean; median across replicas), and both baseline runners use
+it. The consensus columns of baseline rows mirror the execution columns. The rest of this
+section describes the old pipelines, which produced the June CSVs.
+
+## Throughput-metric consistency across systems (historical, June CSVs)
 
 Each system computes throughput in its own pipeline, and they were NOT all measuring
 the same thing. Reference (correct) definition is **sustained goodput = total executed
