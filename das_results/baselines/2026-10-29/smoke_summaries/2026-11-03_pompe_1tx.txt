@@ -1,0 +1,5 @@
+n=10 rate=1000: tps=997.9 lat=122.87ms mismatch=0 client_too_slow=0
+n=10 rate=4000: tps=1697.0 lat=21587.84ms mismatch=0 client_too_slow=0
+n=10 rate=15000: tps=1691.8 lat=33262.32ms mismatch=0 client_too_slow=0
+n=22 rate=4000: tps=939.2 lat=28517.16ms mismatch=0 client_too_slow=0
+done

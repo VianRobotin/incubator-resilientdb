@@ -1,0 +1,5 @@
+baseline,n,f,mode,input_rate,rep,consensus_tps,consensus_latency_ms,execution_tps,execution_latency_ms,slots_committed
+fairdag-ol,10,3,ol,500,1,488.9000,896.2500,488.9000,896.2500,
+fairdag-ol,10,3,ol,1000,1,1460.3000,5763.0500,1460.3000,5763.0500,
+fairdag-ol,10,3,ol,2000,1,2157.6000,32318.8800,2157.6000,32318.8800,
+fairdag-ol,10,3,ol,4000,1,2050.0000,38568.0200,2050.0000,38568.0200,

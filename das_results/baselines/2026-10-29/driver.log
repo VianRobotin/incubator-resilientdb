@@ -1,0 +1,55 @@
+=== fairdag-ol+tusk started Sat Oct 31 13:04:03 CET 2026 ===
+=== themis started Sat Oct 31 13:11:28 CET 2026 ===
+--- OL/Tusk sweep stopped 13:2x: FairDAG client start-up backlog; client fixed, rows moved to old_client_rows/ ---
+=== fairdag-ol+tusk started Sat Oct 31 13:23:29 CET 2026 ===
+--- themis stopped 13:53:48: collapses above 1000 tx/s; rows in themis_collapse_rows/; investigating ---
+=== pompe started Sat Oct 31 13:53:54 CET 2026 ===
+--- pompe stopped 15:00:29: second deadlock (random), rows in pompe_deadlock_rows/; debugging ---
+=== themis started Sat Oct 31 15:00:36 CET 2026 ===
+--- 13:38 run_reruns.sh queued: after OL/Tusk and BOF finish, reruns tusk n=22 r=1000 reps 1,3 (344.7, 1.7 -> rerun_rows/) and all tps<=0 OL/Tusk rate rows ---
+--- 14:23 narwhal runners (benchmark/ and benchmark_smoke/): reservation wait 60 s -> 30 min (13 Themis zero rows never ran: no nodes) ---
+=== pompe started Sun Nov  1 14:23:15 CET 2026 (from benchmark_smoke) ===
+--- 14:25 run_themis_reruns.sh queued: after run_themis.sh, reruns Themis rate points that never ran (no nodes) ---
+rate done Mon Nov  2 02:50:31 CET 2026
+themis rate done Mon Nov  2 03:36:08 CET 2026
+themis faulty done Mon Nov  2 05:28:46 CET 2026
+faulty done Mon Nov  2 06:35:01 CET 2026
+themis batch done Mon Nov  2 08:02:36 CET 2026
+batch done Mon Nov  2 08:55:40 CET 2026
+=== fairdag-bof started Mon Nov  2 08:56:33 CET 2026 ===
+pompe rate done Mon Nov  2 15:35:10 CET 2026
+pompe faulty done Mon Nov  2 17:02:17 CET 2026
+pompe batch done Mon Nov  2 18:24:00 CET 2026
+fairdag-bof rate done Mon Nov  2 20:31:19 CET 2026
+fairdag-bof faulty done Mon Nov  2 21:09:26 CET 2026
+fairdag-bof batch done Mon Nov  2 21:46:51 CET 2026
+=== reruns started Mon Nov  2 21:47:31 CET 2026 ===
+reruns done Mon Nov  2 22:17:39 CET 2026
+=== themis reruns started Tue Nov  3 14:12:59 CET 2026 ===
+themis never-ran points: 21:500:4
+21:4000:1
+21:4000:3
+21:6000:4
+21:8000:2
+21:10000:3
+21:25000:1
+21:25000:2
+21:25000:3
+21:25000:4
+21:40000:4
+29:500:4
+29:1000:4
+--- 14:49 pompe batched rows -> pompe_batch100_rows/; rerun with 1 tx per command ---
+=== pompe started Tue Nov  3 14:49:39 CET 2026 (from benchmark_smoke) ===
+themis reruns done Tue Nov  3 16:33:57 CET 2026
+pompe rate done Wed Nov  4 10:34:10 CET 2026
+pompe faulty done Wed Nov  4 11:55:31 CET 2026
+--- 11:57 moved 13 superseded themis false-zero rows -> rerun_rows/themis_rate.csv ---
+--- 12:09 tusk faulty smoke (n=16 f_silent=1, 500 tx/s) -> smoke_2026-11-04/tusk_faulty ---
+--- 12:11 moved superseded zero rows (tusk 8, fairdag-ol 1) -> rerun_rows/ ---
+--- 12:13 tusk: skip missing leader (as FairDAG's tusk.cpp); faulty smoke again ---
+--- 12:18 tusk faulty: 15 zero rows (commit stalled on a silent leader) -> tusk_stall_rows/; rerun with the fixed binary ---
+=== tusk faulty rerun started Wed Nov  4 12:18:42 CET 2026 ===
+tusk faulty rerun done Wed Nov  4 12:56:43 CET 2026
+pompe batch done Wed Nov  4 13:16:16 CET 2026
+--- 13:18 tusk batch=100 rep2 (1 tx/s, failed run) -> rerun_rows/tusk_batch.csv ---

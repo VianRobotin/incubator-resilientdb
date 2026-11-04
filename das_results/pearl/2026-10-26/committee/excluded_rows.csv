@@ -1,0 +1,3 @@
+n,mode,input_rate,rep,consensus_tps,consensus_latency_ms,execution_tps,execution_latency_ms,slots_committed
+# run 20261029_123118_n10_bof_r500: Delta violation (leader proposal 117 ms late), replica 1 aborted; excluded and rerun
+10,bof,500,1,500.2,136.95,499.8,279.3,5813

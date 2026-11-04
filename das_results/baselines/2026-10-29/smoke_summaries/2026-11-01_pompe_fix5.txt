@@ -1,0 +1,7 @@
+run1 rate 500: tps=497.7 mismatch=0 dbg=0
+run2 rate 1000: tps=999.1 mismatch=0 dbg=0
+run3 rate 2000: tps=1996.5 mismatch=0 dbg=0
+run4 rate 4000: tps=3987.9 mismatch=0 dbg=0
+run5 rate 1000: tps=996.3 mismatch=0 dbg=0
+run6 rate 2000: tps=1995.3 mismatch=0 dbg=0
+done

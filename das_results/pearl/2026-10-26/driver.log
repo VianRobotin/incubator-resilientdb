@@ -1,0 +1,10 @@
+=== started Wed Oct 28 20:24:28 CET 2026 ===
+faulty done Wed Oct 28 21:12:50 CET 2026
+batch done Wed Oct 28 22:00:18 CET 2026
+committee done Wed Oct 28 23:58:51 CET 2026
+=== committee n=10,16 started Thu Oct 29 12:31:17 CET 2026 ===
+committee n=10,16 done Thu Oct 29 16:18:57 CET 2026
+=== rerun n10 bof 500 rep1 Thu Oct 29 18:54:35 CET 2026 ===
+rerun done Thu Oct 29 18:54:35 CET 2026 rc=0
+=== rerun (abs path) n10 bof 500 rep1 Thu Oct 29 18:54:44 CET 2026 ===
+rerun done Thu Oct 29 18:56:19 CET 2026 rc=0

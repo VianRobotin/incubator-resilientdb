@@ -1,0 +1,2 @@
+baseline,n,f,mode,input_rate,rep,consensus_tps,consensus_latency_ms,execution_tps,execution_latency_ms,slots_committed
+fairdag-ol,16,5,ol,1000,1,0.0000,0.0000,0.0000,0.0000,
