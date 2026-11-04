@@ -2,7 +2,8 @@
 """
 plot_paper_batch_curated.py — Batch-size sweep figures for the paper.
 
-Reads das_results/batch/{pearl,fairdag-ol,fairdag-bof,pompe,themis}.csv and
+Reads das_results/pearl/<run>/batch/pearl.csv and
+das_results/baselines/batch/{fairdag-ol,fairdag-bof,pompe,themis}.csv and
 emits two figures into das_results/paper_plots/curated/:
 
 X-axis is the configured batch size on a linear scale (ticks at 25/50/100/
@@ -42,8 +43,15 @@ LINEAR = os.environ.get("PLOT_LINEAR") == "1"
 _OUT_SUBDIR = "curated_linear" if LINEAR else "curated"
 
 PROJ_ROOT = Path(__file__).resolve().parents[3]
-BATCH_DIR = PROJ_ROOT / "das_results" / "batch"
+# Current Pearl run (das_results/pearl/<date>/{rate,faulty,batch,committee});
+# baselines live in das_results/baselines/{rate,faulty,batch}.
+PEARL_BATCH_DIR    = PROJ_ROOT / "das_results" / "pearl" / "2026-10-26" / "batch"
+BASELINE_BATCH_DIR = PROJ_ROOT / "das_results" / "baselines" / "batch"
 OUT_DIR   = PROJ_ROOT / "das_results" / "paper_plots" / _OUT_SUBDIR
+
+
+def _batch_dir(system):
+    return PEARL_BATCH_DIR if system.startswith("pearl") else BASELINE_BATCH_DIR
 
 
 def _log_label(text):
@@ -156,7 +164,7 @@ def plot_metric(metric: str, ylabel: str, out_stem: str):
     any_data = False
     for system in SERIES_ORDER:
         fname, mode = SERIES_SOURCE[system]
-        agg = aggregate(load_csv(BATCH_DIR / fname, mode_filter=mode))
+        agg = aggregate(load_csv(_batch_dir(system) / fname, mode_filter=mode))
         if not agg:
             continue
         xs = [t[0] for t in agg]
@@ -196,7 +204,7 @@ def plot_combined(out_stem: str):
                                (ax_l, "lat", "Latency (ms, log)")):
         for system in SERIES_ORDER:
             fname, mode = SERIES_SOURCE[system]
-            agg = aggregate(load_csv(BATCH_DIR / fname, mode_filter=mode))
+            agg = aggregate(load_csv(_batch_dir(system) / fname, mode_filter=mode))
             if not agg:
                 continue
             xs = [t[0] for t in agg]

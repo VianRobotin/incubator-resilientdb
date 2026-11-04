@@ -6,8 +6,8 @@ single latency-vs-throughput panel (no title).
 
 Series (Pearl only — the Themis / FairDAG-RL baselines are discussed in the
 paper text but deliberately left off this control figure):
-    pearl-bof            das_results/tput_latency.csv           mode=bof  (2f+1)
-    pearl-bof (3f+1)     das_results/tput_latency_pearl_3f1.csv mode=bof  (3f+1)
+    pearl-bof            das_results/pearl/<run>/rate/tput_latency.csv                mode=bof  (2f+1)
+    pearl-bof (3f+1)     das_results/pearl/<run>/committee/tput_latency_pearl_3f1.csv mode=bof  (3f+1)
 
 Two files are written per run, identical content on different axis scales:
     <out>_f{f}_log.pdf       log axes (rate log; tput-vs-lat log-log)
@@ -36,9 +36,12 @@ import numpy as np
 # Paths (resolved relative to this script, like plot_paper.py).
 # ---------------------------------------------------------------------------
 PROJ_ROOT     = Path(__file__).resolve().parents[3]
-PEARL_CSV     = PROJ_ROOT / "das_results" / "tput_latency.csv"
-PEARL_3F1_CSV = PROJ_ROOT / "das_results" / "tput_latency_pearl_3f1.csv"
-BASELINES_DIR = PROJ_ROOT / "das_results" / "baselines"
+# Current Pearl run (das_results/pearl/<date>/{rate,faulty,batch,committee});
+# baselines live in das_results/baselines/{rate,faulty,batch}.
+PEARL_RUN_DIR = PROJ_ROOT / "das_results" / "pearl" / "2026-10-26"
+PEARL_CSV     = PEARL_RUN_DIR / "rate" / "tput_latency.csv"
+PEARL_3F1_CSV = PEARL_RUN_DIR / "committee" / "tput_latency_pearl_3f1.csv"
+BASELINES_DIR = PROJ_ROOT / "das_results" / "baselines" / "rate"
 OUT_DIR       = PROJ_ROOT / "das_results" / "paper_plots"
 
 # Pearl (3f+1) n per f -- this CSV uses a 3f+1 committee (n = 3f+1).

@@ -13,6 +13,8 @@
 
 import argparse
 import datetime
+import errno
+import gzip
 import json
 import os
 import re
@@ -45,13 +47,17 @@ BASE_PORT      = 10001
 READY_TIMEOUT  = 120   # seconds to wait for all replicas to connect
 RUN_ATTEMPTS   = 3     # tries per point when a replica that should be live dies
 
-RESULTS_DIR  = PROJ_ROOT / "das_results"
+RESULTS_DIR  = PROJ_ROOT / "das_results" / "pearl" / "2026-10-26" / "rate"  # current Pearl run
 RUNTIME_BASE = PROJ_ROOT / "das_runtime"
 # Replicas and clients log to node-local disk; the logs are copied into the
 # run directory once the nodes are killed.  /var/scratch is a hard-mounted
 # NFS share on the compute nodes: a stalled NFS write blocks every thread
 # that logs, which stalled replicas for seconds and broke the Delta bound.
 LOCAL_LOG_BASE = f"/local/{USERNAME}/pearl"
+# A run is not started with less than this much room left under the soft
+# disk quota of RUNTIME_BASE.  Past the hard limit, run directories and log
+# copies fail; every remaining point of the 2026-10-26 sweep failed so.
+MIN_QUOTA_HEADROOM_GB = 5
 
 TEE_ENCLAVE_PATH = PROJ_ROOT / "platform/consensus/ordering/autobahn/tee/tee_enclave.signed.so"
 LD_LIBRARY_PATH  = "/var/scratch/vrobotin/sgxsdk/lib64"
@@ -297,6 +303,18 @@ def _apply_warmup(entries: list, experiment_start: datetime.datetime,
     return fallback, bool(fallback)
 
 
+def read_log(log_file: Path) -> Optional[str]:
+    """Text of a run log, whether still plain or already gzipped
+    (<name>.gz, see compress_logs); None if neither exists."""
+    if log_file.exists():
+        return log_file.read_text(errors="replace")
+    gz = Path(str(log_file) + ".gz")
+    if gz.exists():
+        with gzip.open(str(gz), "rt", errors="replace") as f:
+            return f.read()
+    return None
+
+
 def parse_log_file(log_file: Path, experiment_start: datetime.datetime,
                    warmup_secs: int, runtime: int):
     """
@@ -306,9 +324,9 @@ def parse_log_file(log_file: Path, experiment_start: datetime.datetime,
     commit_meas entries: (dt, txns_in_slot, consensus_latency_us)
     exec_meas   entries: (dt, executed_count, avg_latency_us)
     """
-    if not log_file.exists():
+    text = read_log(log_file)
+    if text is None:
         return [], [], 0, 0, False, False
-    text = log_file.read_text(errors="replace")
     commit_all = _extract_entries(text, _COMMIT_RE)
     exec_all   = _extract_entries(text, _EXEC_RE)
     commit_meas, commit_fb = _apply_warmup(commit_all, experiment_start, warmup_secs, runtime)
@@ -337,6 +355,96 @@ def _compute_tps_latency(entries: list, fallback_duration: float):
 
 class ReplicaDied(RuntimeError):
     """A replica that should have been live for the whole run was not."""
+
+
+class DiskFull(BaseException):
+    """RUNTIME_BASE is (nearly) out of disk quota.  A BaseException so that
+    the sweeps' per-point `except Exception` stops instead of failing every
+    remaining point."""
+
+
+_DISK_FULL_ERRNOS = (errno.EDQUOT, errno.ENOSPC)
+
+
+def quota_headroom_gb() -> Optional[float]:
+    """GB left under the soft (else hard) disk quota of the filesystem
+    holding RUNTIME_BASE; None if no quota applies or it can't be read."""
+    try:
+        path = RUNTIME_BASE if RUNTIME_BASE.exists() else PROJ_ROOT
+        dev = subprocess.run(["df", "--output=source", str(path)],
+                             stdout=subprocess.PIPE, universal_newlines=True).stdout.split()[-1]
+        # quota exits non-zero when a quota is exceeded: don't check it.
+        out = subprocess.run(["quota", "-w"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, universal_newlines=True).stdout
+    except (OSError, IndexError):
+        return None
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) >= 4 and fields[0] == dev:
+            used, soft, hard = int(fields[1].rstrip("*")), int(fields[2]), int(fields[3])
+            limit = soft or hard
+            return (limit - used) / 1024 ** 2 if limit else None  # 1 KB blocks
+    return None
+
+
+def check_disk_headroom():
+    headroom = quota_headroom_gb()
+    if headroom is not None and headroom < MIN_QUOTA_HEADROOM_GB:
+        raise DiskFull(f"only {headroom:.1f} GB left under the disk quota of {RUNTIME_BASE} "
+                       f"(need {MIN_QUOTA_HEADROOM_GB} GB)")
+
+
+# Health scan of a finished run, over its live replicas' logs.
+_SCAN_HEADER = ("run_id,n,silent_faults,mode,input_rate,recorded,ok,missing_logs,"
+                "fatal_lines,crash_lines,bad_exits,view_entries,blames,rejects,"
+                "abstains,max_stall_ms,digest_disagree_slots")
+_FATAL_RE  = re.compile(r"^F\d{8} ", re.MULTILINE)
+_CRASH_RE  = re.compile(r"Segmentation|Aborted|double free|corrupt|core dumped|"
+                        r"terminate called|AddressSanitizer|ThreadSanitizer")
+_STATUS_RE = re.compile(r"das: replica exited with status (\d+)")
+_DIGEST_RE = re.compile(r"executed_batch slot:(\d+) .*order_digest:([0-9a-f]+)")
+_STALL_RE  = re.compile(r"protocol thread: .* took (\d+)us")
+_VIEW_EVENTS = (("view_entries", "entering view"), ("blames", "blaming leader"),
+                ("rejects", "rejecting block"), ("abstains", "abstaining on block"))
+
+
+def scan_run(log_dir: Path, live_replicas: int) -> dict:
+    """Count, over the live replicas' logs: missing logs, glog F lines,
+    crash messages, exits other than our SIGKILL (137, or no exit line),
+    view-change events, the worst protocol-thread stall, and the slots at
+    which replicas' order digests disagree.  ok iff nothing but the stall
+    is nonzero."""
+    s = {k: 0 for k in ("missing_logs", "fatal_lines", "crash_lines", "bad_exits",
+                        "max_stall_ms", "digest_disagree_slots")}
+    s.update({k: 0 for k, _ in _VIEW_EVENTS})
+    digests: dict = {}
+    for i in range(1, live_replicas + 1):
+        text = read_log(log_dir / f"server_{i}.log")
+        if text is None:
+            s["missing_logs"] += 1
+            continue
+        s["fatal_lines"] += len(_FATAL_RE.findall(text))
+        s["crash_lines"] += len(_CRASH_RE.findall(text))
+        statuses = _STATUS_RE.findall(text)
+        s["bad_exits"] += sum(1 for st in statuses if st != "137") + (0 if statuses else 1)
+        for key, needle in _VIEW_EVENTS:
+            s[key] += text.count(needle)
+        for us in _STALL_RE.findall(text):
+            s["max_stall_ms"] = max(s["max_stall_ms"], int(us) // 1000)
+        for slot, digest in _DIGEST_RE.findall(text):
+            digests.setdefault(slot, set()).add(digest)
+    s["digest_disagree_slots"] = sum(1 for d in digests.values() if len(d) > 1)
+    s["ok"] = int(all(v == 0 for k, v in s.items() if k != "max_stall_ms"))
+    return s
+
+
+def compress_logs(log_dir: Path):
+    """gzip every log of a run once it has been parsed and scanned (about
+    6x smaller); read_log reads them back transparently."""
+    for p in sorted(log_dir.glob("*.log")):
+        with open(str(p), "rb") as src, gzip.open(str(p) + ".gz", "wb", compresslevel=6) as dst:
+            shutil.copyfileobj(src, dst)
+        p.unlink()
 
 
 def kill_nodes(hosts: List[str], local_dir: Optional[str] = None,
@@ -450,14 +558,17 @@ def _run_once(
     if dry_run:
         print(f"[DRY-RUN] Reserve {total_machines} machines for {duration_str}")
         print(f"[DRY-RUN] target_tps={target_tps}  per_client_tps={per_client_tps}")
+        print(f"[DRY-RUN] disk quota headroom: {quota_headroom_gb()} GB")
         return 0.0, 0.0, 0.0, 0.0, 0
 
+    check_disk_headroom()
     reservation_id = pm.create_reservation(total_machines, duration_str)
     print(f"Reservation: {reservation_id}")
     time.sleep(5)
 
     local_dir = None
     log_dir = None
+    recorded = False
     try:
         # Wait for machines
         hostnames = []
@@ -693,15 +804,18 @@ def _run_once(
         print(f"=> con_TPS={consensus_tps}  con_lat={consensus_lat_s*1000:.0f}ms"
               f"  exec_TPS={execution_tps}  exec_lat={execution_lat_s*1000:.0f}ms"
               f"  slots={slots_committed}")
+        recorded = True
         return consensus_tps, consensus_lat_s, execution_tps, execution_lat_s, slots_committed
 
-    except BaseException:
+    except BaseException as e:
         # Don't leave replicas running into the next point.
         if hostnames:
             if local_dir is not None:
                 kill_nodes(hostnames, local_dir, log_dir)
             else:
                 kill_nodes(hostnames)
+        if isinstance(e, OSError) and e.errno in _DISK_FULL_ERRNOS:
+            raise DiskFull(str(e)) from e
         raise
 
     finally:
@@ -710,6 +824,24 @@ def _run_once(
             print(f"Reservation {reservation_id} released.")
         except Exception as e:
             print(f"Warning: could not release reservation: {e}")
+        # Scan every attempt, including the rejected ones (retries otherwise
+        # hide crashes), then compress its logs.
+        if log_dir is not None and log_dir.is_dir():
+            try:
+                s = scan_run(log_dir, live_replicas)
+                scan_csv = RESULTS_DIR / "scan.csv"
+                init_csv(scan_csv, _SCAN_HEADER)
+                append_csv(scan_csv, ",".join(
+                    [run_id, str(num_replicas), str(silent_faults), mode,
+                     str(target_tps), str(int(recorded))] +
+                    [str(s[k]) for k in _SCAN_HEADER.split(",")[6:]]))
+                issues = [f"{k}={v}" for k, v in s.items()
+                          if v and k not in ("ok", "max_stall_ms")]
+                print(f"Scan: {'OK' if s['ok'] else 'ISSUES ' + ' '.join(issues)}"
+                      f"  (max stall {s['max_stall_ms']} ms)")
+                compress_logs(log_dir)
+            except Exception as e:
+                print(f"Warning: could not scan/compress {log_dir}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -815,6 +947,10 @@ def run_rate_sweep(dry_run: bool, nodes_filter: Optional[List[int]] = None,
                             num_clients=n,   # one client per replica
                             target_tps=rate,
                         )
+                    except DiskFull as e:
+                        print(f"\n!! STOPPING the sweep: {e}.\n"
+                              f"Free space, then rerun the same command to resume.")
+                        return
                     except Exception as e:  # keep the sweep alive
                         failures.append((n, mode, rate, rep))
                         print(f"  !! FAILED n={n} mode={mode} rate={rate} rep={rep}: {e}")
@@ -897,7 +1033,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["ol", "bof"], nargs="+",
                         help="Only sweep these modes (e.g. --mode bof)")
     parser.add_argument("--results-dir",
-                        help="Write tput_latency.csv here instead of das_results/ "
+                        help=f"Write tput_latency.csv here instead of {RESULTS_DIR.relative_to(PROJ_ROOT)} "
                              "(relative to the repo root); resuming reads only this file")
     parser.add_argument("--reps", type=int,
                         help=f"Repetitions per (N, mode, rate) point (default {REPETITIONS})")

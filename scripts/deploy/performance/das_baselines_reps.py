@@ -20,6 +20,7 @@
 #   python3 performance/das_baselines_reps.py --dry-run
 
 import argparse
+import os
 import json
 import re
 import subprocess
@@ -27,6 +28,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
+
+import das  # disk-quota guard shared with the Pearl sweep
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -43,9 +46,13 @@ FAIRDAG_ROOT  = PEARL_ROOT / "baselines" / "fairdag"
 NARWHAL_ROOT  = PEARL_ROOT / "baselines" / "narwhal"
 
 FAIRDAG_DEPLOY = FAIRDAG_ROOT / "scripts" / "deploy"
-NARWHAL_BENCH  = NARWHAL_ROOT / "benchmark"
+# NARWHAL_BENCH_DIR: run Pompe/Themis from a copy of benchmark/ (own logs/ and
+# results/), e.g. benchmark_smoke, so two narwhal sweeps can run at once.
+NARWHAL_BENCH  = Path(os.environ.get("NARWHAL_BENCH_DIR") or NARWHAL_ROOT / "benchmark")
 
-RESULTS_DIR = PEARL_ROOT / "das_results" / "baselines"
+# Rerun of 2026-10-29 (co-located clients, node-local logs); the June rows
+# stay in das_results/baselines/rate.
+RESULTS_DIR = PEARL_ROOT / "das_results" / "baselines" / "2026-10-29" / "rate"
 
 CONDA_PROFILE         = SCRATCH / "miniconda3" / "etc" / "profile.d" / "conda.sh"
 NARWHAL_CONDA_PROFILE = NARWHAL_ROOT / "miniconda" / "etc" / "profile.d" / "conda.sh"
@@ -245,9 +252,7 @@ def run_narwhal(flavor: str, n: int, rate: int, dry_run: bool):
         print(f"[narwhal/{flavor}] no new result line in {result_file}")
         return 0.0, 0.0, 0.0, 0.0
     tps, lat_ms = data_line
-    # Pompe TPS is reported inflated 100x by narwhal.
-    if flavor == "pompe":
-        tps = tps / 100.0
+    # Pompe now counts transactions, not 100-transaction commands: no /100.
     # Single-stage protocols: execution and consensus columns mirror.
     return tps, lat_ms, tps, lat_ms
 
@@ -274,6 +279,7 @@ def run_one(system: str, n: int, rate: int, dry_run: bool):
 
 
 def main():
+    global RESULTS_DIR
     p = argparse.ArgumentParser(description="Add rate-sweep reps to baseline CSVs")
     p.add_argument("--systems", nargs="+", choices=list(N_GRID.keys()),
                    default=list(N_GRID.keys()),
@@ -282,12 +288,17 @@ def main():
                    help="subset of n values (default: per-system grid)")
     p.add_argument("--rates", type=int, nargs="+", default=RATE_GRID,
                    help=f"input rates to sweep (default: {RATE_GRID})")
-    p.add_argument("--reps", type=int, nargs="+", default=[2, 3, 4, 5],
-                   help="rep numbers to record (default: 2 3 4 5)")
+    p.add_argument("--reps", type=int, nargs="+", default=[1, 2, 3, 4, 5],
+                   help="rep numbers to record (default: 1 2 3 4 5)")
+    p.add_argument("--results-dir", default=None,
+                   help=f"directory for the CSVs (default: "
+                        f"{RESULTS_DIR.relative_to(PEARL_ROOT)}, relative to the repo root)")
     p.add_argument("--dry-run", action="store_true",
                    help="print plan, don't reserve or run")
     args = p.parse_args()
 
+    if args.results_dir:
+        RESULTS_DIR = (PEARL_ROOT / args.results_dir).resolve()
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Iterate rep > system > n > rate so an early abort still leaves whole
@@ -307,6 +318,13 @@ def main():
                     if (n, mode, rate, rep) in completed:
                         print(f"  skip {system} n={n} mode={mode} rate={rate} rep={rep} (done)")
                         continue
+                    if not args.dry_run:
+                        try:
+                            das.check_disk_headroom()
+                        except das.DiskFull as e:
+                            print(f"\n!! STOPPING the sweep: {e}. Free some space, then rerun "
+                                  f"the same command to resume.")
+                            return
                     t0 = time.time()
                     try:
                         exec_tps, exec_lat_ms, c_tps, c_lat_ms = run_one(

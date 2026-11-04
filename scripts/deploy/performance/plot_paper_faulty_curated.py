@@ -2,7 +2,8 @@
 """
 plot_paper_faulty_curated.py — Silent-fault sweep figures for the paper.
 
-Reads das_results/faulty/{pearl,fairdag-ol,fairdag-bof,pompe,themis}.csv and
+Reads das_results/pearl/<run>/faulty/pearl.csv and
+das_results/baselines/faulty/{fairdag-ol,fairdag-bof,pompe,themis}.csv and
 emits two figures into das_results/paper_plots/curated/:
 
   pearl_vs_baselines_lat_faults.png
@@ -36,14 +37,18 @@ LINEAR = os.environ.get("PLOT_LINEAR") == "1"
 _OUT_SUBDIR = "curated_linear" if LINEAR else "curated"
 
 PROJ_ROOT  = Path(__file__).resolve().parents[3]
-FAULTY_DIR = PROJ_ROOT / "das_results" / "faulty"
+# Current Pearl run (das_results/pearl/<date>/{rate,faulty,batch,committee});
+# baselines live in das_results/baselines/{rate,faulty,batch}.
+PEARL_RUN_DIR       = PROJ_ROOT / "das_results" / "pearl" / "2026-10-26"
+PEARL_FAULTY_DIR    = PEARL_RUN_DIR / "faulty"
+BASELINE_FAULTY_DIR = PROJ_ROOT / "das_results" / "baselines" / "faulty"
 OUT_DIR    = PROJ_ROOT / "das_results" / "paper_plots" / _OUT_SUBDIR
 
 # The x=0 (no-fault) reference comes from the rate sweep at the same
 # configuration the faulty sweep used: f=5 (Pearl n=11, baselines 3f+1=16/22),
 # rate=500 tx/s. Lets each line start at zero faults instead of one.
-PEARL_RATE_CSV     = PROJ_ROOT / "das_results" / "tput_latency.csv"
-BASELINE_RATE_DIR  = PROJ_ROOT / "das_results" / "baselines"
+PEARL_RATE_CSV     = PEARL_RUN_DIR / "rate" / "tput_latency.csv"
+BASELINE_RATE_DIR  = PROJ_ROOT / "das_results" / "baselines" / "rate"
 ZERO_FAULT_RATE       = 500
 ZERO_FAULT_PEARL_N    = 11
 ZERO_FAULT_BASELINE_F = 5
@@ -194,7 +199,8 @@ def load_zero_fault(system):
 def aggregated_series(system):
     """Per-fault aggregates for `system`, including the x=0 no-fault point."""
     fname, mode = SERIES_SOURCE[system]
-    points = load_csv(FAULTY_DIR / fname, mode_filter=mode)
+    faulty_dir = PEARL_FAULTY_DIR if system.startswith("pearl") else BASELINE_FAULTY_DIR
+    points = load_csv(faulty_dir / fname, mode_filter=mode)
     zf = load_zero_fault(system)
     if zf:
         points[0] = zf

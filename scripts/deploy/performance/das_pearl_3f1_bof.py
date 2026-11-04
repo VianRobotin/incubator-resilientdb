@@ -33,7 +33,7 @@ from pathlib import Path
 
 THIS_DIR    = Path(__file__).resolve().parent
 PEARL_ROOT  = THIS_DIR.parents[2]
-RESULTS_DIR = PEARL_ROOT / "das_results"
+RESULTS_DIR = PEARL_ROOT / "das_results" / "pearl" / "2026-10-26" / "committee"
 OUT_CSV     = RESULTS_DIR / "tput_latency_pearl_3f1.csv"
 
 # 3f+1 committee sizes matched to baselines (f ∈ {3, 5, 7}).
@@ -111,7 +111,7 @@ def main():
                     help="Cap on load-generator clients; num_clients=min(n, cap), "
                          "0 = one per replica (default)")
     ap.add_argument("--results-dir",
-                    help=f"Write {OUT_CSV.name} here instead of das_results/ "
+                    help=f"Write {OUT_CSV.name} here instead of {RESULTS_DIR.relative_to(PEARL_ROOT)} "
                          f"(relative to the repo root); resuming reads only this file")
     args = ap.parse_args()
 
@@ -121,7 +121,9 @@ def main():
 
     # Import das.py from the same directory.
     sys.path.insert(0, str(THIS_DIR))
+    import das  # type: ignore
     from das import run_experiment, check_binaries  # type: ignore
+    das.RESULTS_DIR = OUT_CSV.parent  # das.py writes scan.csv here
 
     if not args.dry_run:
         check_binaries()

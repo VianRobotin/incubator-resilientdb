@@ -2,8 +2,8 @@
 # Pearl BOF rate sweep at 3f+1 committee sizes (n ∈ {10, 16, 22}).
 #
 # Builds binaries (skip with --skip-build), then sweeps the same 14-point
-# rate ladder as das_results/tput_latency.csv with 5 reps per point and
-# writes to das_results/tput_latency_pearl_3f1.csv.
+# rate ladder as the 2f+1 rate sweep (tput_latency.csv) with 5 reps per point and
+# writes to das_results/pearl/<run>/committee/tput_latency_pearl_3f1.csv.
 #
 # Total points: 3 N × 14 rates × 5 reps = 210 runs.
 # Each run ≈ runtime (60s) + reservation/setup/teardown (~2–3 min) ≈ ~4 min,
@@ -43,7 +43,7 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
 fi
 
 echo "=== Launching Pearl BOF 3f+1 rate sweep ==="
-echo "    CSV: ${PROJ_ROOT}/das_results/tput_latency_pearl_3f1.csv"
+echo "    CSV: under ${PROJ_ROOT}/das_results/pearl/ (see das_pearl_3f1_bof.py)"
 
 cd "${PROJ_ROOT}/scripts/deploy"
 exec python3 performance/das_pearl_3f1_bof.py "${PASSTHROUGH[@]}"

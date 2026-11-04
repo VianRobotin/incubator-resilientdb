@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 
+import das  # disk-quota guard shared with the Pearl sweep
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -39,9 +41,14 @@ FAIRDAG_ROOT  = PEARL_ROOT / "baselines" / "fairdag"
 NARWHAL_ROOT  = PEARL_ROOT / "baselines" / "narwhal"
 
 FAIRDAG_DEPLOY = FAIRDAG_ROOT / "scripts" / "deploy"
-NARWHAL_BENCH  = NARWHAL_ROOT / "benchmark"
+# NARWHAL_BENCH_DIR: run Pompe/Themis from a copy of benchmark/ (own logs/ and
+# results/), e.g. benchmark_smoke, so two narwhal sweeps can run at once.
+NARWHAL_BENCH  = Path(os.environ.get("NARWHAL_BENCH_DIR") or NARWHAL_ROOT / "benchmark")
 
-RESULTS_DIR = PEARL_ROOT / "das_results" / "faulty"
+# Pearl rows go to the current Pearl run, the baselines' to das_results/baselines;
+# --results-dir puts every system's CSV in one directory instead.
+RESULTS_DIR = PEARL_ROOT / "das_results" / "baselines" / "2026-10-29" / "faulty"  # baselines' rerun
+PEARL_RESULTS_DIR = PEARL_ROOT / "das_results" / "pearl" / "2026-10-26" / "faulty"
 RUNTIME_BASE = PEARL_ROOT / "das_runtime" / "faulty"
 
 # Conda activation snippet for narwhal (workenv environment).
@@ -114,7 +121,7 @@ SYSTEM_MODE = {
 # ---------------------------------------------------------------------------
 
 def csv_path_for(system: str) -> Path:
-    return RESULTS_DIR / f"{system}.csv"
+    return (PEARL_RESULTS_DIR if system == "pearl" else RESULTS_DIR) / f"{system}.csv"
 
 
 def header_for(system: str) -> str:
@@ -198,7 +205,9 @@ def run_pearl(n: int, f: int, rate: int, dry_run: bool, mode: str = "ol"):
     Returns (exec_tps, exec_lat_ms, con_tps, con_lat_ms, slots).
     """
     sys.path.insert(0, str(THIS_DIR))
+    import das  # type: ignore
     from das import run_experiment, check_binaries  # type: ignore
+    das.RESULTS_DIR = PEARL_RESULTS_DIR  # das.py writes scan.csv here
 
     if not dry_run:
         check_binaries()
@@ -318,9 +327,7 @@ def run_narwhal(flavor: str, n: int, f: int, rate: int, dry_run: bool):
         print(f"[narwhal/{flavor}] no new result line in {result_file}")
         return 0.0, 0.0, 0.0, 0.0, 0
     tps, lat_ms = data_line
-    # Pompe TPS is reported inflated 100x by narwhal — divide.
-    if flavor == "pompe":
-        tps = tps / 100.0
+    # Pompe now counts transactions, not 100-transaction commands: no /100.
     # The existing baseline CSVs use the same value for execution and
     # consensus columns for pompe/themis (single-stage protocols), so
     # mirror that here.
@@ -354,7 +361,7 @@ def run_one(system: str, f: int, dry_run: bool, pearl_mode: str = "ol"):
 
 
 def main():
-    global RESULTS_DIR
+    global RESULTS_DIR, PEARL_RESULTS_DIR
     p = argparse.ArgumentParser(description="Faulty-node sweep across systems")
     p.add_argument("--systems", nargs="+", choices=list(SYSTEMS.keys()),
                    default=list(SYSTEMS.keys()),
@@ -373,8 +380,9 @@ def main():
     args = p.parse_args()
 
     if args.results_dir:
-        RESULTS_DIR = (PEARL_ROOT / args.results_dir).resolve()
+        RESULTS_DIR = PEARL_RESULTS_DIR = (PEARL_ROOT / args.results_dir).resolve()
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    PEARL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     RUNTIME_BASE.mkdir(parents=True, exist_ok=True)
 
     for system in args.systems:
@@ -389,6 +397,13 @@ def main():
                 if (n, mode, sf, rep) in completed:
                     print(f"  skip {system} n={n} mode={mode} silent_faults={sf} rep={rep} (done)")
                     continue
+                if not args.dry_run and system != "pearl":
+                    try:
+                        das.check_disk_headroom()
+                    except das.DiskFull as e:
+                        print(f"\n!! STOPPING the sweep: {e}. Free some space, then rerun "
+                              f"the same command to resume.")
+                        return
                 t0 = time.time()
                 try:
                     exec_tps, exec_lat_ms, c_tps, c_lat_ms, slots = run_one(

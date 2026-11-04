@@ -48,8 +48,10 @@ LINEAR = os.environ.get("PLOT_LINEAR") == "1"
 _OUT_SUBDIR = "curated_linear" if LINEAR else "curated"
 
 PROJ_ROOT      = Path(__file__).resolve().parents[3]
-PEARL_CSV      = PROJ_ROOT / "das_results" / "tput_latency.csv"
-BASELINES_DIR  = PROJ_ROOT / "das_results" / "baselines"
+# Current Pearl run (das_results/pearl/<date>/{rate,faulty,batch,committee});
+# baselines live in das_results/baselines/{rate,faulty,batch}.
+PEARL_CSV      = PROJ_ROOT / "das_results" / "pearl" / "2026-10-26" / "rate" / "tput_latency.csv"
+BASELINES_DIR  = PROJ_ROOT / "das_results" / "baselines" / "rate"
 OUT_DIR        = PROJ_ROOT / "das_results" / "paper_plots" / _OUT_SUBDIR
 
 
@@ -80,12 +82,12 @@ FULL_W  = 11.0  # inches; cross-column 1x3 figures
 PANEL_H = 4.0
 
 # Throughput axis cap for the saturation panels (figs 4 / 11). Pearl peaks
-# ~13k tx/s; 20k gives headroom while keeping the curves legible instead of
-# squashed against the bottom by the y=x line drawn out to the max rate.
-SATURATION_YMAX = 20000
+# ~40.6k tx/s (N=7, 2026-10-26 run); 45k keeps the peak on-panel with a
+# little headroom while still clipping the y=x line short of the 50k rate.
+SATURATION_YMAX = 45000
 
 # Log-scale throughput bounds for the main (non-linear) saturation panels
-# (fig 4). Frames Pearl's ~0.5k-13k tx/s range with a little headroom.
+# (fig 4). Frames Pearl's ~0.5k-41k tx/s range with a little headroom.
 SATURATION_LOG_YMIN = 300
 SATURATION_LOG_YMAX = 60000
 
@@ -94,9 +96,9 @@ SATURATION_LOG_YMAX = 60000
 OVERLAY_LINEAR_YMAX = 10000
 
 # Throughput-axis cap for the linear throughput-vs-rate overlay (fig 13).
-# Focuses on the fair-ordering region (Pearl ~13k, FairDAG-AB ~4.4k); Tusk is
-# kept but its no-fair-ordering ceiling (~30-40k at f>=5) runs off the top.
-TPUT_RATE_LINEAR_YMAX = 17000
+# Pearl now peaks at ~40.6k (f=3), so the cap must clear it; Tusk's
+# no-fair-ordering ceiling (~30-40k) fits as well.
+TPUT_RATE_LINEAR_YMAX = 45000
 
 plt.rcParams.update({
     "font.size":        11.0,
@@ -279,9 +281,8 @@ def _draw_saturation_panel(ax, pearl_data, n, show_legend=True):
                 linewidth=1.2, alpha=0.5, label="y = x")
         ax.set_xlim(xs)
     else:
-        # Linear appendix version: focus the throughput axis on the data
-        # (Pearl peaks ~13k tx/s) so the y=x line and post-knee rates don't
-        # blow the range out past 50k.
+        # Linear appendix version: cap the throughput axis just above Pearl's
+        # peak (~41k tx/s) so the y=x line doesn't stretch it out to 50k.
         if max_rate > 0:
             lim = min(max_rate * 1.05, SATURATION_YMAX)
             ax.plot([0, lim], [0, lim], color="black", linestyle=":",
