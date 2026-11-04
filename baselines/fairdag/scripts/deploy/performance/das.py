@@ -8,6 +8,17 @@ from preserve import *
 import os
 import json
 from typing import Optional
+import glob
+import importlib.util
+
+# Pearl-consistent metrics (scripts/deploy/performance/baseline_metrics.py in
+# the Pearl repo), loaded by path: this tree has its own `das` module.
+_spec = importlib.util.spec_from_file_location(
+    "baseline_metrics",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "../../../../../scripts/deploy/performance/baseline_metrics.py"))
+baseline_metrics = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(baseline_metrics)
 
 # preserve machines
 
@@ -29,19 +40,38 @@ CONF_FILENAME = "./config/kv_performance_server_genned.conf"
 TEMPLATE_CONFIG_PATH = "./config/fair.config" if not RUN_RL else "./config/fairrl.config"
 
 
-def set_input_rate_config(template_path: str, target_tps: int, client_num: int) -> int:
+# Nodes with a broken /local disk (processes cannot write their logs there):
+# node067 gave "Input/output error" on 2026-10-31.  Reserve extra, drop these.
+BANNED_NODES = ["node067"]
+
+BOF_CLIENT_BATCH = 100  # max transactions per FairDAG-BOF client request
+
+
+def set_input_rate_config(template_path: str, target_tps: int, client_num: int):
+    """Write the client rate into the config template; returns
+    (per-client tx/s, transactions per client request)."""
     if target_tps <= 0:
         raise ValueError("target_tps must be > 0")
     per_client_tps = max(1, int(round(target_tps / client_num)))
+    batch = 1
+    if os.path.basename(template_path) == "fairrl.config":
+        # FairDAG-BOF compares every pair of pending client requests each round
+        # (AddImplictWeight, O(n * pending^2)), so with one transaction per
+        # request it collapses even at 500 tx/s.  Upstream FairDAG batches 100
+        # transactions per request; do the same, choosing the batch so the
+        # client sends a whole number of batches per second
+        # (target_input_tps counts batches and is an integer).
+        batches_per_s = -(-per_client_tps // BOF_CLIENT_BATCH)  # ceil
+        batch = max(1, round(per_client_tps / batches_per_s))
     with open(template_path, "r") as f:
         config = json.load(f)
-    config["clientBatchNum"] = 1
+    config["clientBatchNum"] = batch
     config["client_batch_wait_time_us"] = 0
-    config["target_input_tps"] = per_client_tps
+    config["target_input_tps"] = max(1, round(per_client_tps / batch))
     with open(template_path, "w") as f:
         json.dump(config, f, indent=2)
         f.write("\n")
-    return per_client_tps
+    return per_client_tps, batch
 
 
 def run(
@@ -84,16 +114,32 @@ def run(
     else:
         results_file = f"fairdag-{amount_replicas}{fault_tag}.txt"
 
+    if client_num > amount_replicas:
+        raise ValueError(f"client_num={client_num} > n={amount_replicas}: clients "
+                         f"are co-located, one per replica machine")
     preserve_manager = PreserveManager(username)
-    try:
-        preserve_manager.kill_reservation("last")
-    except:
-        print("No last reservation")
-    num_machines = amount_replicas + client_num  # pompe runs 4 clients per machine
+    # One machine per replica; client j runs on replica j's machine (paper §8.1).
+    num_machines = amount_replicas + len(BANNED_NODES)
     time_string = str(
         datetime.timedelta(seconds=duration + 60)
     )  # extra time to set up things
     reservation_id = preserve_manager.create_reservation(num_machines, time_string)
+    try:
+        return _run_reserved(preserve_manager, reservation_id, amount_replicas,
+                             client_num, num_machines, target_tps, faults,
+                             block_size, template_config_path, benchmark_file,
+                             results_file)
+    finally:
+        # Release only our own reservation: "last" could be another sweep's.
+        try:
+            preserve_manager.kill_reservation(str(reservation_id))
+        except Exception as e:
+            print(f"WARN: could not release reservation {reservation_id}: {e}")
+
+
+def _run_reserved(preserve_manager, reservation_id, amount_replicas, client_num,
+                  num_machines, target_tps, faults, block_size,
+                  template_config_path, benchmark_file, results_file):
     time.sleep(5)
     deadline = time.time() + 900
     reservations = preserve_manager.get_own_reservations()
@@ -124,10 +170,12 @@ def run(
         hostnames = v.assigned_machines
         time.sleep(10)
 
-    replica_hosts = hostnames[
-        :amount_replicas
-    ]  # generate with preserve, these are replicas
-    clients_hosts = hostnames[amount_replicas:]  # get with preserve
+    usable = [h for h in hostnames if h not in BANNED_NODES]
+    if len(usable) < amount_replicas:
+        raise RuntimeError(f"only {len(usable)} usable machines after removing "
+                           f"banned nodes, need {amount_replicas}")
+    replica_hosts = usable[:amount_replicas]
+    clients_hosts = replica_hosts[:client_num]  # co-located with replicas 1..client_num
 
     replica_ips = [socket.gethostbyname(h) for h in replica_hosts]
     clients_ips = [socket.gethostbyname(h) for h in clients_hosts]
@@ -144,34 +192,46 @@ def run(
     with open(CONF_FILENAME, "w") as f:
         f.write(to_write)
 
+    client_batch = 1
     if target_tps is not None:
-        per_client_tps = set_input_rate_config(template_config_path, target_tps, client_num)
+        per_client_tps, client_batch = set_input_rate_config(
+            template_config_path, target_tps, client_num)
         print(
             f"target_tps={target_tps} client_num={client_num} per_client_tps={per_client_tps}"
+            f" client_batch={client_batch}"
         )
 
     sub_env = dict(os.environ, USE_BAZEL_VERSION="5.0.0")
     if faults > 0:
         sub_env["FAULTS"] = str(faults)
         print(f"FAULTS={faults}: silencing last {faults} replica(s)")
-    if block_size is not None and block_size > 0:
-        sub_env["FAIRDAG_BLOCK_SIZE"] = str(block_size)
-        print(f"FAIRDAG_BLOCK_SIZE={block_size}")
+    # Tusk fills a block with FAIRDAG_BLOCK_SIZE client requests and has no
+    # timeout, so with batched requests (BOF) a block of 100 requests would
+    # take 100x the load to fill.  Keep blocks at ~block_size transactions
+    # (default 100, as for every system) by sizing them in requests.
+    block_txns = block_size if block_size is not None and block_size > 0 else 100
+    if block_size is not None and block_size > 0 or client_batch > 1:
+        block_reqs = max(1, round(block_txns / client_batch))
+        sub_env["FAIRDAG_BLOCK_SIZE"] = str(block_reqs)
+        print(f"FAIRDAG_BLOCK_SIZE={block_reqs} requests (~{block_reqs * client_batch} tx)")
 
-    # this saves to results.log
+    # Logs of an earlier run must not stand in for a replica that failed.
+    for f in glob.glob("result_*_log"):
+        os.remove(f)
+
+    # this copies replica/client i's log to result_i_log
     subprocess.call(["sh", benchmark_file, CONF_FILENAME], env=sub_env)
 
-    # search for avg_throughput
-    with open("results.log", "r") as f:
-        text = f.read()
-        found_throughput = findall(r"average throughput: (\d+.?\d*)", text)
-        throughput = float(found_throughput[0].replace(",", ""))
-        found_latency = findall(r"average latency: (\d+.?\d*)", text)
-        latency = float(found_latency[0].replace(",", ""))
-        found_c_throughput = findall(r"average consensus throughput: (\d+.?\d*)", text)
-        cthroughput = float(found_c_throughput[0].replace(",", ""))
-        found_c_latency = findall(r"average consensus latency: (\d+.?\d*)", text)
-        clatency = float(found_c_latency[0].replace(",", ""))
+    # Execution throughput and latency computed as for Pearl: from the
+    # replicas' executed_batch lines (client arrival at the replica -> commit
+    # in the final order), not from calculate_result.py's monitor windows.
+    # The consensus columns mirror them.
+    m = baseline_metrics.compute(
+        [f"result_{i}_log" for i in range(1, amount_replicas + 1)])
+    print(f"baseline_metrics: {m}")
+    throughput = m["execution_tps"]
+    latency = m["execution_latency_ms"] / 1000
+    cthroughput, clatency = throughput, latency
 
     os.makedirs("results", exist_ok=True)
     with open(os.path.join("results", results_file), "a") as f:
@@ -184,10 +244,6 @@ def run(
         f.write(f"Consensus throughput: {round(cthroughput, 2)}\n")
         f.write(f"Consensus latency: {round(clatency * 1000, 2)}\n")
 
-    try:
-        preserve_manager.kill_reservation("last")
-    except Exception:
-        pass
     return {
         "throughput": throughput,
         "latency_ms": latency * 1000,

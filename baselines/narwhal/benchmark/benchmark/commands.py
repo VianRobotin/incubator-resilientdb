@@ -73,7 +73,8 @@ class CommandMaker:
     def run_hotstuff_replicas(
         n_replicas,
         is_pompe_variant: bool = False,
-        num_faults: int = 0
+        num_faults: int = 0,
+        log_dir=None
     ):
 
         assert isinstance(n_replicas, int) and n_replicas > 0
@@ -83,7 +84,7 @@ class CommandMaker:
             if not is_pompe_variant:
                 cmd = f"./examples/hotstuff-app --conf ./hotstuff-sec{i}.conf --num-faults {num_faults}"
             else:
-                benchmark_log_dir = join(dirname(dirname(__file__)), "logs")
+                benchmark_log_dir = log_dir or join(dirname(dirname(__file__)), "logs")
                 cmd = f"./examples/pompe-app ./conf-gen/hotstuff.conf {benchmark_log_dir}/server{i}.log --conf ./conf-gen/hotstuff-sec{i}.conf"
             cmds.append(cmd)
         return cmds
@@ -99,7 +100,8 @@ class CommandMaker:
         sb_prob=0.9,
         sb_skew_factor=0.1,
         iter_count=-1,
-        flavor: str = "hotstuff"
+        flavor: str = "hotstuff",
+        log_dir=None
     ):
     
         if flavor not in [
@@ -119,7 +121,7 @@ class CommandMaker:
             )
         elif flavor == "pompe":
 
-            benchmark_log_dir = join(dirname(dirname(__file__)), "logs")
+            benchmark_log_dir = log_dir or join(dirname(dirname(__file__)), "logs")
 
             cmd = (
                 f"./examples/pompe-client "

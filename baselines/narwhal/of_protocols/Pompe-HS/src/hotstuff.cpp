@@ -29,6 +29,7 @@ using salticidae::static_pointer_cast;
 
 namespace hotstuff {
 
+
 const opcode_t MsgPropose::opcode;
 MsgPropose::MsgPropose(const Proposal &proposal) { serialized << proposal; }
 void MsgPropose::postponed_parse(HotStuffCore *hsc) {
@@ -449,7 +450,13 @@ void HotStuffBase::check_stable_point_index(uint256_t commit_set_hash, uint64_t 
     // a dummy implementation that only checks the time interval of the batch and the number of commands in the batch
 
     if (stable_point_idx < stable_idx) {
-        std::sort(commit_set.begin() + stable_point_idx, commit_set.end(), commit_set_cmp);
+        // stable_idx is an index into the *leader's* commit set; ours can be
+        // shorter (ordering-2 requests reach replicas at different times), and
+        // sorting from begin() + stable_point_idx past end() was undefined
+        // behaviour that corrupted the heap (Pompe deadlocked when it hit a
+        // block the proposer had just hashed).  Clamp the sort start.
+        size_t from = std::min<size_t>(stable_point_idx, commit_set.size());
+        std::sort(commit_set.begin() + from, commit_set.end(), commit_set_cmp);
         stable_point_idx = stable_idx;
     }
 
@@ -495,7 +502,14 @@ void HotStuffBase::server_consensus_reponse_cmd_handler(MsgConsensusRespCmd &&ms
 }
 
 
+
 void HotStuffBase::do_broadcast_proposal(const Proposal &prop) {
+    // Receivers hash the block as sent; a mismatch with the hash the proposer
+    // voted for stalls consensus (seen with the commit_set race, 2026-10-29).
+    if (salticidae::get_hash(*prop.blk) != prop.blk->get_hash())
+        HOTSTUFF_LOG_PROTO("proposal hash mismatch: block %.10s serializes to %.10s",
+                 get_hex(prop.blk->get_hash()).c_str(),
+                 get_hex(salticidae::get_hash(*prop.blk)).c_str());
     pn.multicast_msg(MsgPropose(prop), peers);
 }
 

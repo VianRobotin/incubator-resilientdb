@@ -38,6 +38,7 @@
 #include "hotstuff/client.h"
 #include "hotstuff/hotstuff.h"
 #include "hotstuff/liveness.h"
+#include "hotstuff/exec_metrics.h"
 
 #include "small_bank.h"
 
@@ -94,6 +95,8 @@ class HotStuffApp: public HotStuff {
     std::thread req_thread;
     std::thread resp_thread;
     resp_queue_t resp_queue;
+    // Pearl-compatible execution metrics (client arrival -> execution).
+    ExecMetrics<uint256_t> exec_metrics;
     salticidae::BoxObj<salticidae::ThreadCall> resp_tcall;
     salticidae::BoxObj<salticidae::ThreadCall> req_tcall;
 
@@ -389,6 +392,7 @@ void HotStuffApp::client_request_cmd_handler(MsgReqCmd &&msg, const conn_t &conn
     const NetAddr addr = conn->get_addr();
     auto cmd = parse_cmd_with_payload(msg.serialized);
     const auto &cmd_hash = cmd->get_hash(); 
+    exec_metrics.Arrived(cmd_hash);
 
     std::string data = "";
     for(int i=0; i<cmd->get_payload_size(); i++){
@@ -417,6 +421,7 @@ void HotStuffApp::client_request_cmd_handler(MsgReqCmd &&msg, const conn_t &conn
 
          /* Execute the transaction before sending response to the client */
         small_bank_manager->execute_transaction(cmd->get_payload());
+        exec_metrics.Executed(fin.cmd_hash);
 
 
         // std::string data = "";

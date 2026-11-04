@@ -14,8 +14,20 @@ from benchmark.utils import Print, BenchError, PathMaker
 from benchmark.preserve import *
 
 from types import SimpleNamespace
+import glob
+import importlib.util
 
-BANNED_NODES = ["node009", "node010", "node018", "node021", "node034", "node056"]
+# Pearl-consistent metrics (scripts/deploy/performance/baseline_metrics.py in
+# the Pearl repo), loaded by path.
+_spec = importlib.util.spec_from_file_location(
+    "baseline_metrics",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "../../../../scripts/deploy/performance/baseline_metrics.py"))
+baseline_metrics = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(baseline_metrics)
+
+BANNED_NODES = ["node009", "node010", "node018", "node021", "node034", "node056", "node067"]  # node067: broken /local (I/O error, 2026-10-31)
+RESERVATION_WAIT_S = 1800  # seconds to wait for a reservation to be fully assigned
 
 class OFBench:
     BASE_PORT = 4000
@@ -39,6 +51,11 @@ class OFBench:
         self._hostnames = None
 
         self.clients_hostnames = [None]
+        self.reservation_id = None
+        # Remote processes log to node-local disk; logs are copied back into
+        # logs/ after the run, before the reservation is released.
+        self.local_log_dir = f"/local/{username}/narwhal_logs"
+        self._remote_logs = []  # (hostname, basename)
 
     def __getattr__(self, attr):
         return getattr(self.bench_parameters, attr)
@@ -58,12 +75,42 @@ class OFBench:
             )
         else:
             assert hostname is not None, "Hostname must be provided in remote mode"
-            full_cmd = f"source /etc/profile; cd {PathMaker.hotstuff_code_path(flavor=self.flavor)}; ulimit -s unlimited; {command} > {abs_log_path} 2>&1 &"
+            name = os.path.basename(log_file)
+            self._remote_logs.append((hostname, name))
+            full_cmd = f"source /etc/profile; cd {PathMaker.hotstuff_code_path(flavor=self.flavor)}; ulimit -s unlimited; {command} > {self.local_log_dir}/{name} 2>&1 &"
             ssh_cmd = f"ssh {hostname} '{full_cmd}'"
             print(f"[remote-run] {ssh_cmd}")
             subprocess.Popen(ssh_cmd, shell=True)
 
-    def _kill_nodes(self):
+    def _ssh(self, host, cmd):
+        subprocess.run(
+            f"ssh -o BatchMode=yes -o StrictHostKeyChecking=no {host} \"{cmd}\"",
+            shell=True, stderr=subprocess.DEVNULL)
+
+    def _reset_local_logs(self, hosts):
+        for host in sorted(set(hosts)):
+            self._ssh(host, f"rm -rf {self.local_log_dir}; mkdir -p {self.local_log_dir}")
+
+    def _gather_logs(self):
+        """Copy every remote process's node-local logs (stdout plus Pompe's
+        client order/exec logs) into logs/, where the parsers read them."""
+        logs_dir = os.path.abspath(PathMaker.logs_path())
+        for host in sorted({h for h, _ in self._remote_logs}):
+            subprocess.run(
+                f"scp -q -o BatchMode=yes -o StrictHostKeyChecking=no "
+                f"'{host}:{self.local_log_dir}/*' {logs_dir}/",
+                shell=True, stderr=subprocess.DEVNULL)
+
+    def _release(self):
+        # Release only our own reservation: "LAST" could be another sweep's.
+        if self.preserve_manager is not None and self.reservation_id is not None:
+            try:
+                self.preserve_manager.kill_reservation(str(self.reservation_id))
+            except Exception as e:
+                Print.warn(f"Could not release reservation {self.reservation_id}: {e}")
+            self.reservation_id = None
+
+    def _kill_nodes(self, release=True):
 
         is_pompe_flavor = self.flavor == "pompe"
         app_name = "hotstuff"
@@ -75,7 +122,8 @@ class OFBench:
         try:
             if not self.local:
                 
-                hosts = self._get_hostnames()
+                # Only hosts of our own reservation (none before it exists).
+                hosts = self._hostnames or []
 
                 for client_host in self.clients_hostnames:
                     if client_host is not None:
@@ -97,7 +145,8 @@ class OFBench:
                         stderr=subprocess.DEVNULL,
                     )
 
-                self.preserve_manager.kill_reservation("LAST")
+                if release:
+                    self._release()
 
             else:
                 
@@ -174,10 +223,10 @@ class OFBench:
                 Print.info(f"  silenced replica {i} on {host}")
 
     def _preserve_machines(self, nodes):
-        # One machine per replica + 1 machine per 4 clients (like DAS)
+        # One machine per replica; clients are co-located with replicas
+        # (paper §8.1).
         self._amount_for_nodes = self.nodes[0]
-        self._num_client_machines = ceil(self.num_clients / 4)
-        self._num_machines = self._amount_for_nodes + self._num_client_machines
+        self._num_machines = self._amount_for_nodes
 
         # Reserve extra to absorb both BANNED_NODES landing in the reservation
         # and partial fulfillment from the scheduler.
@@ -190,7 +239,10 @@ class OFBench:
         # Wait until the reservation is Running with all machines assigned.
         # Without this, _get_hostnames() can return a partial list and downstream
         # code IndexErrors when packing clients onto missing machines.
-        deadline = _now() + 60  # seconds
+        # Wait up to 30 min: with several sweeps sharing DAS5, a pending
+        # reservation gets nodes when another sweep's run ends; giving up after
+        # 60 s recorded points that never ran as 0 tx/s.
+        deadline = _now() + RESERVATION_WAIT_S
         last_state = None
         last_assigned = -1
         while _now() < deadline:
@@ -213,7 +265,7 @@ class OFBench:
         except Exception:
             self._hostnames = []
         Print.warn(
-            f"Reservation {self.reservation_id} not fully assigned after 60s "
+            f"Reservation {self.reservation_id} not fully assigned after {RESERVATION_WAIT_S}s "
             f"(state={last_state}, assigned={last_assigned}/{request_count})"
         )
 
@@ -319,16 +371,24 @@ class OFBench:
             elif "Avg cycle size: " in line:
                 avg_scc = float(line.split(": ")[1].strip())
 
+        # Throughput and latency as for Pearl: from the replicas'
+        # executed_batch lines (client arrival at the replica -> execution),
+        # over [start + 15 s, start + 60 s].  process.py's client-side count
+        # and latency above are only printed for reference.
+        m = baseline_metrics.compute(
+            sorted(glob.glob(os.path.join(results_dir, "hotstuff-replica-*.log"))))
+        tps = m["execution_tps"]
+        average_latency = m["execution_latency_ms"]
+
         print("\n============ Summary ============")
-        print(f"TPS: {count / self.duration}")
-        print(f"Average latency: {average_latency} ms")
+        print(f"TPS: {tps}  (client-side count / duration: {count / self.duration})")
+        print(f"Average latency: {average_latency} ms  (replicas used: {m['replicas']})")
         print(f"Avg cycle size: {avg_scc:.4f}")
         print("=================================\n")
 
         # Compute adversarial reordering metric
         reorder_str = self._compute_adversarial_reordering()
 
-        tps = count / self.duration
         rate = self.bench_parameters.rate[0]
         _avg_scc = avg_scc
         return SimpleNamespace(
@@ -470,11 +530,11 @@ class OFBench:
                 shuffle(all_hostnames)
                 all_hostnames = all_hostnames[:self._num_machines]
                 replica_IPs = all_hostnames[:self._amount_for_nodes]
-                client_machines = all_hostnames[self._amount_for_nodes:]
-                # Pack up to 4 clients per machine (like DAS)
+                # Client i runs on replica i's machine.
                 self.clients_hostnames = [
-                    client_machines[i // 4] for i in range(num_clients)
+                    replica_IPs[i % len(replica_IPs)] for i in range(num_clients)
                 ]
+                self._reset_local_logs(replica_IPs)
 
             Print.info(f"Generating {flavor} configuration files...")
             if(
@@ -519,7 +579,8 @@ class OFBench:
                 is_pompe_variant=(
                     flavor == "pompe"
                 ),
-                num_faults=num_faults
+                num_faults=num_faults,
+                log_dir=None if self.local else self.local_log_dir
             )
             for i, cmd in enumerate(replica_cmds):
                 log_file = PathMaker.hotstuff_log_file(f"replica-{i}")
@@ -540,6 +601,7 @@ class OFBench:
             for i, hostname in enumerate(self.clients_hostnames):
                 client_cmd = CommandMaker.run_hotstuff_client(
                     idx=i,
+                    log_dir=None if self.local else self.local_log_dir,
                     max_async=rate_share,
                     tx_size=self.tx_size,
                     fairness=self.node_parameters.json['gamma'],
@@ -560,7 +622,10 @@ class OFBench:
             Print.info(f"Running benchmark ({self.duration} sec)...")
             sleep(self.duration)
 
-            self._kill_nodes()
+            self._kill_nodes(release=False)
+            if not self.local:
+                self._gather_logs()
+                self._release()
 
             sleep(2 * self.nodes[0])
 

@@ -108,6 +108,13 @@ int FairDAGConsensus::ProcessCustomConsensus(std::unique_ptr<Request> request) {
 }
 
 int FairDAGConsensus::ProcessNewTransaction(std::unique_ptr<Request> request) {
+  // A client request is a batch of clientBatchNum transactions, fair-ordered
+  // as one unit (as in upstream FairDAG); count each transaction in it.
+  uint32_t ntx = 1;
+  BatchUserRequest batch;
+  if (batch.ParseFromString(request->data()) && batch.user_requests_size() > 0)
+    ntx = batch.user_requests_size();
+  exec_metrics_.Arrived(request->hash(), ntx);
   std::unique_ptr<Transaction> txn = std::make_unique<Transaction>();
   txn->set_data(request->data());
   txn->set_hash(request->hash());
@@ -121,6 +128,7 @@ int FairDAGConsensus::CommitMsg(const google::protobuf::Message& msg) {
 }
 
 int FairDAGConsensus::CommitMsgInternal(const Transaction& txn) {
+  exec_metrics_.Executed(txn.hash());
   //LOG(ERROR)<<"commit txn:"<<txn.id()<<" proxy id:"<<txn.proxy_id()<<" queuing delay:"<<txn.queuing_time();
   std::unique_ptr<Request> request = std::make_unique<Request>();
   request->set_create_time(txn.create_time());

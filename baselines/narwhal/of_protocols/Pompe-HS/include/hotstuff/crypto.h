@@ -191,7 +191,9 @@ class PubKeySecp256k1: public PubKey {
                                     secp256k1_default_sign_ctx);
 
     void serialize(DataStream &s) const override {
-        static uint8_t output[_olen];
+        // Per-call buffer: a static one is shared by every thread, and a
+        // concurrent serialize could overwrite it before put_data copies it.
+        uint8_t output[_olen];
         size_t olen = _olen;
         (void)secp256k1_ec_pubkey_serialize(
                 ctx->ctx, (unsigned char *)output,
@@ -286,7 +288,7 @@ class SigSecp256k1: public Serializable {
     }
 
     void serialize(DataStream &s) const override {
-        static uint8_t output[64];
+        uint8_t output[64];  // per-call, see PubKeySecp256k1::serialize
         (void)secp256k1_ecdsa_signature_serialize_compact(
             ctx->ctx, (unsigned char *)output,
             &data);

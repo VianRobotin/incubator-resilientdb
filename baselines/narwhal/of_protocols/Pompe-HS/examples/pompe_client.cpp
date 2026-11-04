@@ -68,11 +68,12 @@ struct Request {
     salticidae::ElapsedTime et_exec;
     //    std::vector<std::string> timestamps;
     std::vector<uint64_t> timestamps;
-    Request(const command_t &cmd): cmd(cmd), confirmed(0), ordering_rtt1(0), ordering_rtt2(0), ordering_rtt3(0) { et.start(); et_exec.start(); }
+    uint32_t ntx;  // transactions in this command
+    Request(const command_t &cmd, uint32_t ntx): cmd(cmd), confirmed(0), ordering_rtt1(0), ordering_rtt2(0), ordering_rtt3(0), ntx(ntx) { et.start(); et_exec.start(); }
 };
 
 int count_order, count_exec;
-int BATCH_SIZE, STABLE_PERIOD;
+int BATCH_SIZE, STABLE_PERIOD;  // BATCH_SIZE: max transactions per command
 int count_backoff, total_backoff;
 struct timespec last_exec_resp_ts;
 using Net = salticidae::MsgNetwork<opcode_t>;
@@ -89,22 +90,21 @@ void connect_all() {
         conns.insert(std::make_pair(i, mn.connect_sync(replicas[i])));
 }
 
-bool try_send(bool check = true) {
-
-    (void)check;
-
+// Send one command carrying `ntx` transactions (ntx * tx size bytes), once to
+// every replica.  This used to send BATCH_SIZE identical copies, which the
+// replicas counted up to before processing, and count each command as
+// BATCH_SIZE transactions, so the offered load was BATCH_SIZE times the rate.
+bool try_send(uint32_t ntx) {
     if (!max_iter_num)
         return false;
 
     auto cmd = new CommandDummy(cid, cnt++);
-    MsgOrdering1ReqCmd msg(*cmd, target_bytes_amount);
+    MsgOrdering1ReqCmd msg(*cmd, ntx * target_bytes_amount, ntx);
 
-    for (int i = 0; i < BATCH_SIZE; i++) {
-        for (auto &p: conns) mn.send_msg(msg, p.second);
-    }
-    
+    for (auto &p: conns) mn.send_msg(msg, p.second);
+
     waiting.insert(std::make_pair(
-        cmd->get_hash(), Request(cmd)));
+        cmd->get_hash(), Request(cmd, ntx)));
     if (max_iter_num > 0)
         max_iter_num--;
     return true;
@@ -167,7 +167,7 @@ void client_ordering2_resp_cmd_handler(MsgOrdering2RespCmd &&msg, const Net::con
     gettimeofday(&tv, nullptr);
     //elapsed.push_back(std::make_pair(tv, et.elapsed_sec));
     count_order++;
-    for (int i = 0; i < BATCH_SIZE; i++)
+    for (uint32_t i = 0; i < it->second.ntx; i++)
         elapsed.push_back(std::make_pair(tv, et.elapsed_sec));
 
     // for debug
@@ -220,7 +220,7 @@ void client_ordering_exec_resp_handler(MsgConsensusRespClientCmd &&msg, const Ne
     gettimeofday(&tv, nullptr);
     //elapsed_exec.push_back(std::make_pair(tv, et_exec.elapsed_sec));
     count_exec++;
-    for (int i = 0; i < BATCH_SIZE; i++)
+    for (uint32_t i = 0; i < it->second.ntx; i++)
         elapsed_exec.push_back(std::make_pair(tv, et_exec.elapsed_sec));
 
     // for debug
@@ -244,6 +244,10 @@ int main(int argc, char **argv) {
     //Config config("hotstuff.conf");
 
     auto opt_blk_size = Config::OptValInt::create(1);
+    // Transactions per command.  Pompe fair-orders a command as one unit, so 1
+    // gives per-transaction ordering, as Pearl does; block-size only sets
+    // the replicas' block size (commands per block).
+    auto opt_client_batch = Config::OptValInt::create(1);
     auto opt_stable_period = Config::OptValInt::create(50);
     auto opt_idx = Config::OptValInt::create(0);
     auto opt_replicas = Config::OptValStrVec::create();
@@ -265,6 +269,7 @@ int main(int argc, char **argv) {
     mn.start();
 
     config.add_opt("block-size", opt_blk_size, Config::SET_VAL);
+    config.add_opt("client-batch", opt_client_batch, Config::SET_VAL);
     config.add_opt("stable-period", opt_stable_period, Config::SET_VAL);
     config.add_opt("idx", opt_idx, Config::SET_VAL);
     config.add_opt("cid", opt_cid, Config::SET_VAL);
@@ -274,7 +279,7 @@ int main(int argc, char **argv) {
     config.add_opt("max-cli-msg", opt_max_cli_msg, Config::SET_VAL, 'S', "the maximum client message size");
     config.parse(argc, argv);
 
-    BATCH_SIZE = opt_blk_size->get();
+    BATCH_SIZE = opt_client_batch->get();
     STABLE_PERIOD = opt_stable_period->get() * 1000;
     auto idx = opt_idx->get();
     max_iter_num = opt_max_iter_num->get();
@@ -313,13 +318,17 @@ int main(int argc, char **argv) {
     HOTSTUFF_LOG_INFO("nfaulty = %zu", nfaulty);
     connect_all();
     
-    const uint64_t PRECISION = 1;
+    const uint64_t PRECISION = 20;  // 20 bursts per second, like Themis (was 1)
     const double BURST_DURATION_SEC = 1.0 / PRECISION;
     const double BURST_DURATION_MS  = BURST_DURATION_SEC * 1000.0;
-    const uint64_t burst = static_cast<uint64_t>(max_async_num) / PRECISION;
+    const uint64_t rate = static_cast<uint64_t>(max_async_num);
+    // Burst k sends floor((k+1)*rate/P) - floor(k*rate/P) transactions, so the
+    // remainder of rate/P carries over and the client sends exactly `rate`
+    // tx/s (a fixed rate/P burst would drop up to P-1 tx/s).
+    uint64_t burst_idx = 0;
 
     HOTSTUFF_LOG_INFO("Transactions rate: %zu tx/s (max-async)", max_async_num);
-    if (burst == 0) {
+    if (rate == 0) {
         HOTSTUFF_LOG_WARN("burst == 0 (max-async == 0): no transactions will be sent");
     }
     HOTSTUFF_LOG_INFO("Start sending transactions");
@@ -334,14 +343,17 @@ int main(int argc, char **argv) {
         salticidae::ElapsedTime loop_et;
         loop_et.start();
 
+        const uint64_t burst = (burst_idx + 1) * rate / PRECISION -
+                               burst_idx * rate / PRECISION;
+        burst_idx++;
+
+        // This burst's transactions, in commands of at most BATCH_SIZE.
         uint64_t sent_in_burst = 0;
-        for (uint64_t x = 0; x < burst && max_iter_num; x++) {
-            // if (x == (cnt - starting_cnt) % burst) {
-            //     HOTSTUFF_LOG_INFO("Sending sample transaction #%u", cnt);
-            // }
-            if (!try_send())
+        while (sent_in_burst < burst && max_iter_num) {
+            uint32_t ntx = std::min<uint64_t>(burst - sent_in_burst, BATCH_SIZE);
+            if (!try_send(ntx))
                 break;
-            sent_in_burst++;
+            sent_in_burst += ntx;
         }
 
         loop_et.stop();

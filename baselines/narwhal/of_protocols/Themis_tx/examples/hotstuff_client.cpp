@@ -244,10 +244,14 @@ int main(int argc, char **argv) {
     const uint64_t PRECISION = 20;
     const double BURST_DURATION_SEC = 1.0 / PRECISION;
     const double BURST_DURATION_MS  = BURST_DURATION_SEC * 1000.0;
-    const uint64_t burst = static_cast<uint64_t>(max_async_num) / PRECISION;
+    const uint64_t rate = static_cast<uint64_t>(max_async_num);
+    // Burst k sends floor((k+1)*rate/P) - floor(k*rate/P) transactions, so the
+    // remainder of rate/P carries over and the client sends exactly `rate`
+    // tx/s (a fixed rate/P burst would drop up to P-1 tx/s).
+    uint64_t burst_idx = 0;
 
     HOTSTUFF_LOG_INFO("Transactions rate: %zu tx/s (max-async)", max_async_num);
-    if (burst == 0) {
+    if (rate == 0) {
         HOTSTUFF_LOG_WARN("burst == 0 (max-async == 0): no transactions will be sent");
     }
     HOTSTUFF_LOG_INFO("Start sending transactions");
@@ -261,6 +265,10 @@ int main(int argc, char **argv) {
 
         salticidae::ElapsedTime loop_et;
         loop_et.start();
+
+        const uint64_t burst = (burst_idx + 1) * rate / PRECISION -
+                               burst_idx * rate / PRECISION;
+        burst_idx++;
 
         uint64_t sent_in_burst = 0;
         for (uint64_t x = 0; x < burst && max_iter_num; x++) {

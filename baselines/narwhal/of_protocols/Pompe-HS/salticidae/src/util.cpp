@@ -144,7 +144,8 @@ const std::string get_current_datetime() {
     char fmt[64], buf[64];
     struct timeval tv;
     gettimeofday(&tv, nullptr);
-    struct tm *tmp = localtime(&tv.tv_sec);
+    struct tm tm_buf;  // localtime() shares a static buffer across threads
+    struct tm *tmp = localtime_r(&tv.tv_sec, &tm_buf);
     strftime(fmt, sizeof fmt, "%Y-%m-%d %H:%M:%S.%%06u", tmp);
     snprintf(buf, sizeof buf, fmt, tv.tv_usec);
     return std::string(buf);

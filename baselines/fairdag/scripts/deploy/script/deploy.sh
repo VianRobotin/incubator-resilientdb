@@ -38,6 +38,12 @@ mkdir -p ${output_path}
 deploy_iplist=${iplist[@]}
 
 user="${BASELINES_USER:-vrobotin}"
+# Each process (replica or co-located client) runs in its own node-local
+# directory, so nothing is written to the NFS home and co-located processes
+# don't share log or ordering files.
+run_base=/local/${user}/fairdag
+# One entry per host (clients share their replica's host).
+uniq_iplist=$(printf "%s\n" ${iplist[@]} | sort -u)
 
 
 
@@ -76,7 +82,7 @@ fi
 # commands functions
 function run_cmd(){
   count=1
-  for ip in ${deploy_iplist[@]};
+  for ip in ${uniq_iplist[@]};
   do
      ssh -i ${key} -n -o BatchMode=yes -o StrictHostKeyChecking=no ${user}@${ip} "source /etc/profile; $1" &
     ((count++))
@@ -93,19 +99,20 @@ function run_one_cmd(){
 }
 
 run_cmd "killall -9 ${server_bin} >/dev/null 2>&1"
-run_cmd "rm -rf ${server_bin} ${server_bin}*.log server.config cert wal_log >/dev/null 2>&1"
+run_cmd "rm -rf ${run_base}; mkdir -p ${run_base}"
 #run_cmd "rm -rf ${server_bin}; rm -rf server.config;" 
 
 sleep 1
 
-# upload config files and binary
+# copy config files and binary from NFS into each process's local directory
 echo "upload configs"
+idx=1
 count=0
 for ip in ${deploy_iplist[@]};
 do
-  scp -i ${key} -r ${bin_path} ${output_path}/server.config ${output_path}/cert ${user}@${ip}:/home/${user}/  > /dev/null 2>&1 &
-  #scp -i ${key} -r ${bin_path} ${output_path}/server.config ${user}@${ip}:/home/${user}/  > null 2>&1 &
+  run_one_cmd "mkdir -p ${run_base}/${idx} && cp ${bin_path} ${output_path}/server.config ${run_base}/${idx}/ && cp -r ${output_path}/cert ${run_base}/${idx}/" &
   ((count++))
+  ((idx++))
 done
 
 while [ $count -gt 0 ]; do
@@ -121,8 +128,11 @@ for ip in ${deploy_iplist[@]};
 do
   private_key="cert/node_"${idx}".key.pri"
   cert="cert/cert_"${idx}".cert"
-  run_one_cmd "FAIRDAG_BLOCK_SIZE=${FAIRDAG_BLOCK_SIZE:-} nohup ./${server_bin} server.config ${private_key} ${cert}  > ${server_bin}_${idx}.log 2>&1 &" &
-  run_one_cmd "{
+  # cd first, then background only the server with all fds redirected: a
+  # backgrounded "cd && nohup ..." list keeps ssh's stdout open, so ssh (and
+  # the wait below) would not return until the server exits.
+  run_one_cmd "cd ${run_base}/${idx} || exit 1; FAIRDAG_BLOCK_SIZE=${FAIRDAG_BLOCK_SIZE:-} nohup ./${server_bin} server.config ${private_key} ${cert} > ${server_bin}_${idx}.log 2>&1 < /dev/null &" &
+  run_one_cmd "cd ${run_base}/${idx} && {
     echo \"startup check $(date)\";
     ls -l ./${server_bin} server.config ${private_key} ${cert} 2>&1;
     pgrep -f ${server_bin} >/dev/null 2>&1 || echo \"${server_bin} not running\";
@@ -143,7 +153,7 @@ idx=1
 count=0
 for ip in ${deploy_iplist[@]};
 do
-  scp -i ${key} ${user}@${ip}:/home/${user}/${server_bin}_startup_${idx}.log ${startup_dir}/startup_${idx}.log > /dev/null 2>&1 &
+  scp -i ${key} ${user}@${ip}:${run_base}/${idx}/${server_bin}_startup_${idx}.log ${startup_dir}/startup_${idx}.log > /dev/null 2>&1 &
   ((count++))
   ((idx++))
 done
@@ -158,13 +168,20 @@ idx=1
 for ip in ${deploy_iplist[@]};
 do
   resp=""
-  while [ "$resp" = "" ]
+  # Give up after 120 s: a process that cannot start (e.g. a node with a
+  # broken /local disk) used to hang the sweep here forever.
+  waited=0
+  while [ "$resp" = "" ] && [ $waited -lt 120 ]
   do
-    resp=`ssh -i ${key} -n -o BatchMode=yes -o StrictHostKeyChecking=no ${user}@${ip} "grep \"receive public size:${#iplist[@]}\" ${server_bin}_${idx}.log"`
+    resp=`ssh -i ${key} -n -o BatchMode=yes -o StrictHostKeyChecking=no ${user}@${ip} "grep \"receive public size:${#iplist[@]}\" ${run_base}/${idx}/${server_bin}_${idx}.log"`
     if [ "$resp" = "" ]; then
       sleep 1
+      waited=$((waited+1))
     fi
   done
+  if [ "$resp" = "" ]; then
+    echo "WARNING: process ${idx} on ${ip} not ready after 120 s; continuing without it"
+  fi
   ((idx++))
 done
 
@@ -186,8 +203,10 @@ if [[ -n "${FAULTS}" ]] && [[ "${FAULTS}" -gt 0 ]]; then
   echo "FAULTS=${FAULTS}: killing replicas $((_live_replicas+1))..${_num_replicas} (silent-crash)"
   for ((i=_live_replicas; i<_num_replicas; i++)); do
     silent_ip=${_orig[$i]}
+    # Kill only replica i+1 (matched by its key file): its co-located
+    # client keeps running.
     ssh -i ${key} -n -o BatchMode=yes -o StrictHostKeyChecking=no \
-        ${user}@${silent_ip} "killall -9 ${server_bin} 2>/dev/null || true" &
+        ${user}@${silent_ip} "pkill -9 -f 'cert/node_$((i+1))\.key\.pri' 2>/dev/null || true" &
   done
   wait
   sleep 1

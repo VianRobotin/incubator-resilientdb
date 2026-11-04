@@ -21,6 +21,7 @@
 #include <cassert>
 #include <set>
 #include <unordered_map>
+#include <mutex>
 
 #include "hotstuff/promise.hpp"
 #include "hotstuff/type.h"
@@ -58,6 +59,8 @@ class HotStuffCore {
     /** whether this replica acts as a Byzantine node (reverses local orders) */
     bool is_byzantine_ = false;
     /** map from command hash to numeric tx_uid for logging */
+    // Written on the client-network thread, read on the HotStuff thread.
+    mutable std::mutex txuid_mu_;
     std::unordered_map<uint256_t, uint64_t> hash_to_txuid_;
 
     block_t get_delivered_blk(const uint256_t &blk_hash);
@@ -199,9 +202,11 @@ class HotStuffCore {
 
     /* tx_uid registration for adversarial reordering metric */
     void register_tx_uid(const uint256_t &hash, uint64_t txuid) {
+        std::lock_guard<std::mutex> lk(txuid_mu_);
         hash_to_txuid_[hash] = txuid;
     }
     uint64_t get_tx_uid(const uint256_t &hash) const {
+        std::lock_guard<std::mutex> lk(txuid_mu_);
         auto it = hash_to_txuid_.find(hash);
         return it != hash_to_txuid_.end() ? it->second : 0;
     }

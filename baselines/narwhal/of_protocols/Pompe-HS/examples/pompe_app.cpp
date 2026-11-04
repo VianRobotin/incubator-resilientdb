@@ -36,6 +36,7 @@
 #include "hotstuff/client.h"
 #include "hotstuff/hotstuff.h"
 #include "hotstuff/liveness.h"
+#include "hotstuff/exec_metrics.h"
 
 using salticidae::MsgNetwork;
 using salticidae::ClientNetwork;
@@ -82,7 +83,8 @@ class HotStuffApp: public HotStuff {
     uint64_t exec_last_batch_clock; // stable point
     uint32_t clnt_blk_size;
     bool consensus_ready;
-    std::unordered_map<const uint256_t, int> batch_received;
+    // Pearl-compatible execution metrics (client arrival -> execution).
+    ExecMetrics<uint256_t> exec_metrics;
     std::vector<NetAddr> ledger_replicas;
     std::unordered_map<ReplicaID, LedgerNet::conn_t> ledger_conns;
 
@@ -121,10 +123,13 @@ class HotStuffApp: public HotStuff {
     consensus_resp_queue_t consensus_queue;
     salticidae::BoxObj<salticidae::ThreadCall> resp_tcall;
     salticidae::BoxObj<salticidae::ThreadCall> req_tcall;
+    // Runs work on the HotStuff thread (ec): commit_set is only touched there.
+    salticidae::BoxObj<salticidae::ThreadCall> ec_tcall;
 
     void client_request_cmd_handler(MsgReqCmd &&, const conn_t &);
     void client_ordering1_request_cmd_handler(MsgOrdering1ReqCmd &&, const conn_t &);
     void client_ordering2_request_cmd_handler(MsgOrdering2ReqCmd &&, const conn_t &);
+    void on_ordering2(const uint256_t &cmd_hash, uint64_t timestamp, const NetAddr &addr);
     void client_ordering_exec_reply_handler(MsgRespCmd &&, const conn_t &);
     
 
@@ -327,7 +332,7 @@ int main(int argc, char **argv) {
         .max_recv_buff_size(8192)
         .max_send_buff_size(8192);
     clinet_config
-        .max_msg_size(8192)
+        .max_msg_size(1 << 20)  // client batches: ntx * tx size bytes
         .max_msg_queue_size(6553600)
         .burst_size(opt_cliburst->get())
         .nworker(opt_clinworker->get());
@@ -405,14 +410,20 @@ HotStuffApp::HotStuffApp(uint32_t blk_size,
     clisten_addr(clisten_addr)
     {
     /* prepare the thread used for sending back confirmations */
+    // Replies are sent with send_msg_deferred: the lookup of the client's
+    // connection (ClientNetwork::addr2conn) then runs on the client network's
+    // own thread.  send_msg from these resp_ec handlers raced with connection
+    // setup/teardown on that map (ThreadSanitizer) and could write through a
+    // freed connection, corrupting the heap.
     resp_tcall = new salticidae::ThreadCall(resp_ec);
     req_tcall = new salticidae::ThreadCall(req_ec);
+    ec_tcall = new salticidae::ThreadCall(ec);
     resp_queue.reg_handler(resp_ec, [this](resp_queue_t &q) {
         std::pair<Finality, NetAddr> p;
         while (q.try_dequeue(p))
         {
             try {
-                cn.send_msg(MsgRespCmd(std::move(p.first)), p.second);
+                cn.send_msg_deferred(MsgRespCmd(std::move(p.first)), p.second);
             } catch (std::exception &err) {
                 HOTSTUFF_LOG_WARN("unable to send MsgRespCmd to the client: %s", err.what());
             }
@@ -426,7 +437,7 @@ HotStuffApp::HotStuffApp(uint32_t blk_size,
         while (q.try_dequeue(p))
         {
             try {
-                cn.send_msg(MsgOrdering1RespCmd(p.first.cmd_hash, p.first.timestamp, p.first.timestamp_us, p.first.sig), p.second);
+                cn.send_msg_deferred(MsgOrdering1RespCmd(p.first.cmd_hash, p.first.timestamp, p.first.timestamp_us, p.first.sig), p.second);
             } catch (std::exception &err) {
                 HOTSTUFF_LOG_WARN("unable to send MsgOrdering1RespCmd to the client: %s", err.what());
             }
@@ -440,7 +451,7 @@ HotStuffApp::HotStuffApp(uint32_t blk_size,
         while (q.try_dequeue(p))
         {
             try {
-                cn.send_msg(MsgOrdering2RespCmd(p.first.cmd_hash, p.first.timestamp, p.first.sig), p.second);
+                cn.send_msg_deferred(MsgOrdering2RespCmd(p.first.cmd_hash, p.first.timestamp, p.first.sig), p.second);
             } catch (std::exception &err) {
                 HOTSTUFF_LOG_WARN("unable to send MsgOrdering2RespCmd to the client: %s", err.what());
             }
@@ -454,7 +465,7 @@ HotStuffApp::HotStuffApp(uint32_t blk_size,
             while (q.try_dequeue(p))
                 {
                     try {
-                        cn.send_msg(MsgConsensusRespClientCmd(p.first), p.second);
+                        cn.send_msg_deferred(MsgConsensusRespClientCmd(p.first), p.second);
                     } catch (std::exception &err) {
                         HOTSTUFF_LOG_WARN("unable to send MsgConsensusRespClientCmd to the client: %s", err.what());
                     }
@@ -490,18 +501,16 @@ void HotStuffApp::client_ordering1_request_cmd_handler(MsgOrdering1ReqCmd &&msg,
     const NetAddr addr = conn->get_addr();
     auto cmd = parse_cmd(msg.serialized);
     const auto &cmd_hash = cmd->get_hash();
+    // The client sends each command once, followed by its transaction count
+    // (it used to send clnt_blk_size copies, counted here before processing).
+    uint32_t ntx = 1;
+    if (msg.serialized.size() >= sizeof(ntx))
+        msg.serialized >> ntx;
 
-    if (batch_received.count(cmd_hash)) {
-        // already in batch
-        batch_received[cmd_hash]++;
-    } else {
-        // new in batch
-        batch_received[cmd_hash] = 1;
-    }
+    // Only server#1 executes (see exec_consensus), so it alone measures.
+    if (idx == 1)
+        exec_metrics.Arrived(cmd_hash, ntx);
 
-    if (batch_received[cmd_hash] < clnt_blk_size)
-        return;
-    
     exec_ordering1(cmd_hash, [this, addr](Ordering1Finality fin) {
         ordering1_queue.enqueue(std::make_pair(fin, addr));
     });
@@ -514,6 +523,22 @@ void HotStuffApp::client_ordering2_request_cmd_handler(MsgOrdering2ReqCmd &&msg,
     uint64_t timestamp;
     msg.serialized >> cmd_hash >> timestamp;
 
+    //HOTSTUFF_LOG_DEBUG("processing %s", std::string(*cmd).c_str());
+    exec_ordering2(cmd_hash, [this, addr](Ordering2Finality fin) {
+            ordering2_queue.enqueue(std::make_pair(fin, addr));
+    });
+
+
+    // This runs on the client network's thread (req_ec), but commit_set is
+    // read and sorted on the HotStuff thread (ec): mutating it here raced with
+    // those sorts and corrupted the heap (proposals whose hash differed from
+    // the proposer's, then a stalled consensus).  Do the rest on ec.
+    ec_tcall->async_call([this, cmd_hash, timestamp, addr](salticidae::ThreadCall::Handle &) {
+        on_ordering2(cmd_hash, timestamp, addr);
+    });
+}
+
+void HotStuffApp::on_ordering2(const uint256_t &cmd_hash, uint64_t timestamp, const NetAddr &addr) {
     if (timestamp < stable_point) {
         // TODO: implement this code if assert actually happens
         HOTSTUFF_LOG_ERROR("network anomaly detected -- please consider increase the stable-point config parameter");
@@ -522,11 +547,6 @@ void HotStuffApp::client_ordering2_request_cmd_handler(MsgOrdering2ReqCmd &&msg,
 
     // add to local commit set
     commit_set.push_back(std::make_pair(std::make_pair(cmd_hash, timestamp), addr));
-
-    //HOTSTUFF_LOG_DEBUG("processing %s", std::string(*cmd).c_str());
-    exec_ordering2(cmd_hash, [this, addr](Ordering2Finality fin) {
-            ordering2_queue.enqueue(std::make_pair(fin, addr));
-    });
 
     // only a single leader starts the consensus phase
     // a dummy implementation that server#1 to be the leader
@@ -548,6 +568,7 @@ void HotStuffApp::client_ordering2_request_cmd_handler(MsgOrdering2ReqCmd &&msg,
         // stable_period milliseconds have passed on timer
         exec_last_batch_clock = curr_clock_us;
         exec_consensus(curr_clock_us, [this](uint256_t cmd_hash, NetAddr addr) {
+                exec_metrics.Executed(cmd_hash);
                 consensus_queue.enqueue(std::make_pair(cmd_hash, addr));
         });
     }

@@ -32,9 +32,10 @@ struct LinkedNode
     uint256_t cmd_hash;
     LinkedNode* next;
     LinkedNode* prev;
+    uint64_t seq;  // insertion order = list order (nodes are only appended)
 
     public:
-    LinkedNode(uint256_t cmd_hash) : cmd_hash(cmd_hash), next(nullptr), prev(nullptr) {}
+    LinkedNode(uint256_t cmd_hash, uint64_t seq = 0) : cmd_hash(cmd_hash), next(nullptr), prev(nullptr), seq(seq) {}
 };
 
 class OrderedList{
@@ -58,6 +59,7 @@ class OrderedList{
     std::unordered_map<uint256_t, LinkedNode*> linked_cache;
     LinkedNode* head;
     LinkedNode* tail;
+    uint64_t next_seq = 1;
 
     public:
     OrderedList();

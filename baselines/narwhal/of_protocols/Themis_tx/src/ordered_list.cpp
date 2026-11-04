@@ -18,6 +18,7 @@
  */
 
 #include "hotstuff/ordered_list.h"
+#include <algorithm>
 
 #define LOG_INFO HOTSTUFF_LOG_INFO
 #define LOG_DEBUG HOTSTUFF_LOG_DEBUG
@@ -70,7 +71,7 @@ namespace hotstuff {
         if(linked_cache.count(cmd_hash)>0){
             return;
         }
-        LinkedNode* node_to_add = new LinkedNode(cmd_hash);
+        LinkedNode* node_to_add = new LinkedNode(cmd_hash, next_seq++);
         LinkedNode* last_node = tail->prev;
         last_node->next = node_to_add;
         node_to_add->prev = last_node;
@@ -116,19 +117,35 @@ namespace hotstuff {
         return cmds;
     }
 
+    // Pairs (a, b) of listed commands, a before b, with a missing edge in
+    // either direction, in list order.  This used to test every pair of
+    // listed commands (O(L^2) lookups, and missing[] inserted an empty set
+    // for each); the list is every command seen but not yet executed, so
+    // once a backlog formed each local order took 100+ ms on the HotStuff
+    // thread and throughput collapsed.  Same result from the missing edges
+    // of listed commands: O(L + edges).
     std::vector<std::pair<uint256_t,uint256_t>> OrderedList::get_curr_missing_edges(std::unordered_map<uint256_t, std::unordered_set<uint256_t>>& missing){
-        std::vector<std::pair<uint256_t,uint256_t>> curr_missing;
+        std::vector<std::pair<std::pair<uint64_t,uint64_t>, std::pair<uint256_t,uint256_t>>> found;
         for(LinkedNode* ptr1 = head->next; ptr1!=tail; ptr1 = ptr1->next){
-            auto from_v = ptr1->cmd_hash;
-            // HOTSTUFF_LOG_DEBUG("[[get_curr_missing_edges]] from_v = %.10s", from_v.to_hex());
-            for(LinkedNode* ptr2 = ptr1->next; ptr2!=tail; ptr2 = ptr2->next){
-                auto to_v = ptr2->cmd_hash;
-                // HOTSTUFF_LOG_DEBUG("[[get_curr_missing_edges]] to_v = %.10s", from_v.to_hex());
-                if(missing[from_v].count(to_v)>0 || missing[to_v].count(from_v)>0) {
-                    curr_missing.push_back(std::make_pair(from_v, to_v));
-                    // HOTSTUFF_LOG_DEBUG("[[get_curr_missing_edges]] current missing = (%.10s, %.10s)", from_v, to_v.to_hex());
-                }
+            auto m = missing.find(ptr1->cmd_hash);
+            if(m == missing.end()) continue;
+            for(auto const &to_v: m->second){
+                auto it = linked_cache.find(to_v);
+                if(it == linked_cache.end() || it->second == ptr1) continue;
+                LinkedNode *a = ptr1, *b = it->second;
+                if(a->seq > b->seq) std::swap(a, b);
+                found.push_back(std::make_pair(std::make_pair(a->seq, b->seq),
+                                               std::make_pair(a->cmd_hash, b->cmd_hash)));
             }
+        }
+        std::sort(found.begin(), found.end(),
+                  [](const decltype(found)::value_type &x, const decltype(found)::value_type &y) {
+                      return x.first < y.first;
+                  });
+        std::vector<std::pair<uint256_t,uint256_t>> curr_missing;
+        for(size_t i = 0; i < found.size(); i++){
+            if(i > 0 && found[i].first == found[i-1].first) continue;  // both directions missing
+            curr_missing.push_back(found[i].second);
         }
         return curr_missing;
     }

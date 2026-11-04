@@ -107,6 +107,7 @@ int TuskConsensus::ProcessCustomConsensus(std::unique_ptr<Request> request) {
 }
 
 int TuskConsensus::ProcessNewTransaction(std::unique_ptr<Request> request) {
+  exec_metrics_.Arrived(request->hash());
   std::unique_ptr<Transaction> txn = std::make_unique<Transaction>();
   txn->set_data(request->data());
   txn->set_hash(request->hash());
@@ -119,6 +120,7 @@ int TuskConsensus::CommitMsg(const google::protobuf::Message& msg) {
 }
 
 int TuskConsensus::CommitMsgInternal(const Transaction& txn) {
+  exec_metrics_.Executed(txn.hash());
   //LOG(ERROR)<<"commit txn:"<<txn.id()<<" proxy id:"<<txn.proxy_id();
   std::unique_ptr<Request> request = std::make_unique<Request>();
   request->set_queuing_time(txn.queuing_time());

@@ -281,7 +281,10 @@ def of_batch(ctx, debug=True, local=False, username="vrobotin",
         rs = runs_int
         rt = rate_int
         gamma = 1.0
-        lo_size = int(rt / 8)
+        # The swept batch is the protocols' block size: lo_size becomes
+        # --block-size (Themis: transactions per block; Pompe: transactions
+        # per client command).  It was rt/8, so the sweep changed nothing.
+        lo_size = blk
         batch_bytes = blk * tx_size_int
 
         bench_params = {
@@ -293,7 +296,7 @@ def of_batch(ctx, debug=True, local=False, username="vrobotin",
             'rate': rt,
             'tx_size': tx_size_int,
             'duration': 60,
-            'num_clients': 7,
+            'num_clients': nds,  # one per replica, co-located
         }
         node_params = {
             'header_size': 512,
@@ -405,7 +408,7 @@ def of_faulty(ctx, debug=True, local=False, username="vrobotin",
             'rate': rt,
             'tx_size': 128,
             'duration': 60,
-            'num_clients': 7,
+            'num_clients': nodes,  # one per replica, co-located
         }
         node_params = {
             'header_size': 512,
@@ -629,7 +632,7 @@ def of_rate(ctx, debug=True, local=False, username="vrobotin",
         'rate': rate_int,
         'tx_size': 128,
         'duration': 60,
-        'num_clients': 7,
+        'num_clients': nodes,  # one per replica, co-located
     }
     node_params = {
         'header_size': 512,

@@ -3,7 +3,10 @@ package(default_visibility = ["//platform/consensus/ordering:__subpackages__"])
 cc_library(
     name = "consensus",
     srcs = ["consensus.cpp"],
-    hdrs = ["consensus.h"],
+    hdrs = [
+        "consensus.h",
+        "exec_metrics.h",
+    ],
     deps = [
         ":performance_manager",
         ":response_manager",

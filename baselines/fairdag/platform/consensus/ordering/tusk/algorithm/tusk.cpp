@@ -135,20 +135,13 @@ void Tusk::AsyncCommit() {
     int new_round = previous_round;
     for (int r = previous_round + 2; r <= round; r += 2) {
       int leader = GetLeader(r);
-      const Proposal * req = nullptr;
-      while(!IsStop()){
-        req = proposal_manager_->GetRequest(r, leader);
-        // req:"<<(req==nullptr);
-        if (req == nullptr) {
-          //LOG(ERROR)<<" get leader:"<<leader<<" round:"<<r<<" not exit";
-          //usleep(1000);
-          std::unique_lock<std::mutex> lk(mutex_);
-          vote_cv_.wait_for(lk, std::chrono::microseconds(100),
-              [&] { return true; });
-
-          continue;
-        }
-        break;
+      // Skip a leader whose vertex is missing (e.g. a crashed replica), as
+      // FairDAG's Tusk does (fairdag/algorithm/tusk.cpp): waiting for it
+      // stalled every commit after the first round a silent replica led.
+      // new_round is not advanced, so a later commit revisits this round.
+      const Proposal * req = proposal_manager_->GetRequest(r, leader);
+      if (req == nullptr) {
+        continue;
       }
       //LOG(ERROR)<<" get leader:"<<leader<<" round:"<<r<<" delay:"<<(GetCurrentTime() - req->header().create_time());
       int reference_num = proposal_manager_->GetReferenceNum(*req);

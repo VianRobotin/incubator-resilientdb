@@ -9,14 +9,8 @@
 server_name=`echo "$server" | awk -F':' '{print $NF}'`
 server_bin=${server_name}
 user="${BASELINES_USER:-vrobotin}"
-home_path="/home/${user}"
-
-for ip in ${iplist[@]};
-do
-`ssh -i ${key} -n -o BatchMode=yes -o StrictHostKeyChecking=no ${user}@${ip} "rm -rf local_ordering.txt; rm -rf final_ordering.txt"` & 
-done
-
-echo "deleting ordering txt files done."
+# deploy.sh runs each process in its own node-local directory (fresh per run)
+run_base=/local/${user}/fairdag
 
 
 bazel run //benchmark/protocols/pbft:kv_service_tools 
@@ -47,10 +41,10 @@ echo "getting results"
 for ip in ${iplist[@]};
 do
   i=`expr $i + 1`
-  echo "scp -i ${key} ${user}@${ip}:${home_path}/${server_bin}.log ./${ip}_log"
-  `scp -i ${key} ${user}@${ip}:${home_path}/${server_bin}_${i}.log result_${i}_log` &
-  `scp -i ${key} ${user}@${ip}:${home_path}/local_ordering.txt local_ordering_${i}` &
-  `scp -i ${key} ${user}@${ip}:${home_path}/final_ordering.txt final_ordering_${i}` &
+  echo "scp -i ${key} ${user}@${ip}:${run_base}/${i}/${server_bin}_${i}.log result_${i}_log"
+  `scp -i ${key} ${user}@${ip}:${run_base}/${i}/${server_bin}_${i}.log result_${i}_log` &
+  `scp -i ${key} ${user}@${ip}:${run_base}/${i}/local_ordering.txt local_ordering_${i}` &
+  `scp -i ${key} ${user}@${ip}:${run_base}/${i}/final_ordering.txt final_ordering_${i}` &
 done
 
 wait

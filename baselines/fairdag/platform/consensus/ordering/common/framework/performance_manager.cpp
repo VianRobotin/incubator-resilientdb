@@ -204,7 +204,6 @@ int PerformanceManager::BatchProposeMsg() {
         static_cast<double>(target_tps) / sender_threads;
     send_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>(1.0 / per_thread_tps));
-    next_send_time = std::chrono::steady_clock::now();
   }
   LOG(WARNING) << "batch wait time(us):" << config_.ClientBatchWaitTimeUS()
                << " batch num:" << config_.ClientBatchNum()
@@ -212,6 +211,10 @@ int PerformanceManager::BatchProposeMsg() {
                << " target tps:" << target_tps;
   std::vector<std::unique_ptr<QueueItem>> batch_req;
   eval_ready_future_.get();
+  // Start the rate clock only once the benchmark is triggered: started before
+  // the wait, the client owed (and sent at once) every request of the wait,
+  // tens of seconds' worth, which drained into the measurement window.
+  next_send_time = std::chrono::steady_clock::now();
   bool start = false;
   while (!stop_) {
     if (send_num_ > config_.GetMaxProcessTxn()) {

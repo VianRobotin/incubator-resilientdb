@@ -70,12 +70,14 @@ struct MsgOrdering1ReqCmd {
     static const opcode_t opcode = 0x9;
     DataStream serialized;
     command_t cmd;
-    MsgOrdering1ReqCmd(const Command &cmd, size_t target_bytes = 0) { 
-        if (target_bytes == 0) {
-            serialized << cmd;
-            return;
-        }
+    // `ntx` > 0: the command is a client batch of ntx transactions; the count
+    // follows the command so replicas can count transactions, not commands.
+    MsgOrdering1ReqCmd(const Command &cmd, size_t target_bytes = 0, uint32_t ntx = 0) { 
         serialized << cmd;
+        if (ntx > 0)
+            serialized << ntx;
+        if (target_bytes == 0)
+            return;
         auto cur = serialized.size();
         if (cur > target_bytes)
             throw std::runtime_error("MsgReqCmd: command too large to pad to target size");

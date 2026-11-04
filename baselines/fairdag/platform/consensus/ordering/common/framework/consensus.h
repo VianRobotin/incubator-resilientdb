@@ -28,6 +28,7 @@
 #include "executor/common/transaction_manager.h"
 #include "platform/consensus/execution/transaction_executor.h"
 #include "platform/consensus/ordering/common/algorithm/protocol_base.h"
+#include "platform/consensus/ordering/common/framework/exec_metrics.h"
 #include "platform/consensus/ordering/common/framework/performance_manager.h"
 #include "platform/consensus/ordering/common/framework/response_manager.h"
 #include "platform/networkstrate/consensus_manager.h"
@@ -76,6 +77,9 @@ class Consensus : public ConsensusManager {
   Stats* global_stats_;
 
   LockFreeQueue<BatchUserResponse> resp_queue_;
+  // Pearl-compatible execution metrics: client arrival -> commit in the
+  // final order, keyed by transaction hash.
+  ExecMetrics<std::string> exec_metrics_;
   std::vector<std::thread> send_thread_;
   bool is_stop_;
 };
