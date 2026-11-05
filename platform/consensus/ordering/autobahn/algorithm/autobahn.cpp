@@ -361,8 +361,11 @@ void AutoBahn::Route(std::vector<Incoming> items) {
 // under a key derived from the enclaves' committee key: identical at every
 // replica, so correct replicas admit the same transactions and a transaction
 // one sheds is not still disseminated by the others, and unpredictable to
-// clients, who cannot craft transactions that are never shed.  Echoes and
-// fetched bodies are never shed.
+// clients that do not collude with a faulty replica (the key is given to the
+// host).  Echoes and fetched bodies are never shed, since shedding them would
+// also drop correct replicas' ordering evidence; a faulty replica can
+// therefore disseminate any transaction by echoing it, so admission control
+// protects the links against client overload only.
 bool AutoBahn::ReceiveTransaction(std::string data) {
   Incoming in;
   in.id = TxnId::From(SignatureVerifier::CalculateHash(data));
@@ -734,7 +737,8 @@ void AutoBahn::AdmissionLoop() {
 // smallest recent R, so correct replicas agree on it and f faulty replicas
 // cannot starve admission.  The admitted fraction is that rate over the
 // client arrival rate, which all replicas observe alike (clients broadcast),
-// so correct replicas admit the same transactions.
+// so correct replicas admit the same transactions (up to differences in
+// their arrival-rate estimates).
 void AutoBahn::AdjustAdmission() {
   const double link = static_cast<double>(params_.link_bytes_per_sec);
   const double tick = kAdmissionPeriodUs / 1e6;
