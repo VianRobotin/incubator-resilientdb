@@ -69,9 +69,24 @@ const BofHoldBack::Entry* BofHoldBack::FirstPending(int lane) {
   auto& q = lane_[lane];
   while (!q.empty() && state_[q.front().txn] == kExecuted) q.pop_front();
   for (const Entry& e : q) {
-    if (state_[e.txn] == kPending) return &e;
+    if (state_[e.txn] == kPending || state_[e.txn] == kHeld) return &e;
   }
   return nullptr;
+}
+
+int BofHoldBack::CountPreceding(const std::vector<Pos>& attest,
+                                std::unordered_map<uint32_t, int>* before) {
+  before->clear();
+  int lanes = 0;
+  for (int r = 1; r <= n_; ++r) {
+    if (discarded_[r] || attest[r].first < 0) continue;
+    ++lanes;
+    for (const Entry& e : lane_[r]) {
+      if (!(e.pos < attest[r])) break;
+      if (state_[e.txn] != kExecuted) ++(*before)[e.txn];
+    }
+  }
+  return lanes;
 }
 
 std::vector<BofEligibleTxn> BofHoldBack::Release(std::vector<BofEligibleTxn> eligible) {
@@ -83,10 +98,11 @@ std::vector<BofEligibleTxn> BofHoldBack::Release(std::vector<BofEligibleTxn> eli
     txn[i] = Intern(candidates[i].id);
     state_[txn[i]] = kCandidate;
   }
-  // A candidate is held back if some pending, non-candidate transaction
-  // precedes it in at least theta of the non-discarded lanes that committed
-  // it (its attestations).  Held candidates become pending again and may in
-  // turn hold back others: iterate to a fixpoint.
+  // Fast path: hold a candidate back if some pending (not eligible) or held
+  // transaction blocks it, i.e. precedes it in at least theta counted lanes,
+  // and iterate to a fixpoint.  Every candidate it keeps has only eligible
+  // blockers, all of them kept too, so its closure D(t) is eligible: the
+  // fast path releases a subset of what the closure rule releases.
   std::vector<bool> held(candidates.size(), false);
   std::vector<const Entry*> first(n_ + 1);
   std::unordered_map<uint32_t, int> before;
@@ -107,7 +123,8 @@ std::vector<BofEligibleTxn> BofHoldBack::Release(std::vector<BofEligibleTxn> eli
         if (first[r] == nullptr || attest[r].first < 0) continue;
         for (const Entry& e : lane_[r]) {
           if (!(e.pos < attest[r])) break;
-          if (state_[e.txn] == kPending && ++before[e.txn] >= theta_) {
+          if ((state_[e.txn] == kPending || state_[e.txn] == kHeld) &&
+              ++before[e.txn] >= theta_) {
             blocked = true;
             break;
           }
@@ -115,13 +132,61 @@ std::vector<BofEligibleTxn> BofHoldBack::Release(std::vector<BofEligibleTxn> eli
       }
       if (!blocked) continue;
       held[i] = true;
-      state_[txn[i]] = kPending;
+      state_[txn[i]] = kHeld;
       changed = true;
     }
   }
+
+  // Closure rule for the candidates the fast path held.  D(t) is computed on
+  // the state before this step for every t, so the released set does not
+  // depend on the order of the candidates.  Expansion stops at a candidate
+  // the fast path kept: its blockers are all eligible and kept.
+  std::unordered_map<uint32_t, size_t> held_index;
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    if (held[i]) held_index.emplace(txn[i], i);
+  }
+  std::vector<bool> release(candidates.size(), false);
+  std::unordered_map<uint32_t, int> ahead, blockers;
+  std::vector<size_t> closure, queue;
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    if (!held[i] || release[i]) continue;
+    // ahead[v]: counted lanes in which v precedes t; t is ahead of v iff the
+    // other lanes_t - ahead[v] counted lanes that committed t reach theta.
+    const int lanes_t = CountPreceding(candidates[i].attest, &ahead);
+    auto t_ahead_of = [&](uint32_t v) {
+      auto it = ahead.find(v);
+      return lanes_t - (it == ahead.end() ? 0 : it->second) >= theta_;
+    };
+    closure.assign(1, i);
+    queue.assign(1, i);
+    std::unordered_set<size_t> in_closure{i};
+    bool eligible = true;
+    while (eligible && !queue.empty()) {
+      size_t u = queue.back();
+      queue.pop_back();
+      if (u != i) CountPreceding(candidates[u].attest, &blockers);
+      for (const auto& [v, k] : u == i ? ahead : blockers) {
+        if (k < theta_ || t_ahead_of(v)) continue;
+        if (state_[v] == kPending) {
+          eligible = false;  // a member of D(t) is not eligible yet
+          break;
+        }
+        if (state_[v] != kHeld) continue;  // kept by the fast path
+        size_t c = held_index.at(v);
+        if (in_closure.insert(c).second) {
+          closure.push_back(c);
+          queue.push_back(c);
+        }
+      }
+    }
+    if (!eligible) continue;
+    for (size_t c : closure) release[c] = true;
+  }
+
   std::vector<BofEligibleTxn> released;
   for (size_t i = 0; i < candidates.size(); ++i) {
-    if (held[i]) {
+    if (held[i] && !release[i]) {
+      state_[txn[i]] = kPending;
       held_.push_back(std::move(candidates[i]));
     } else {
       state_[txn[i]] = kExecuted;

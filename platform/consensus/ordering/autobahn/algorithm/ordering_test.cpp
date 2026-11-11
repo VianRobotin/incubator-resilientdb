@@ -177,7 +177,7 @@ TEST(BofOrdererTest, CoverageNeedsFPlusOneLanes) {
 }
 
 
-// RV4 (Sec. 7.1, hold-back rule).  n = 3, f = 1, gamma = 1, theta = 2.
+// Release rule (Sec. 7.1).  n = 3, f = 1, gamma = 1, theta = 2.
 // Lanes 1 and 2 are correct and received a before b; lane 3 is faulty and
 // placed only b.  b is covered first (lanes 1 and 3) and becomes eligible
 // while a is not (lane 2 has not covered it yet).  b must not execute
@@ -205,6 +205,195 @@ TEST(BofOrdererTest, PredecessorInFewerThanThetaLanesDoesNotHold) {
                          BofCar(n, 3, 1, {"x", "b"}, 0, {0, 0, 0})},
                         {});
   ASSERT_EQ(res.batches, (Batches{{"b"}}));
+}
+
+// Liveness under continuous load (Sec. 7.1, closure D(t)).  n = 3, f = 1,
+// gamma = 1, theta = 2, lane orders
+//   1: 2,1,0, 5,4,3, 8,7,6, ...
+//   2: 0, 3,2,1, 6,5,4, 9,8,7, ...
+//   3: 1,0, 4,3,2, 7,6,5, 10,9,8, ...
+// so x+1 precedes x in two lanes.  Each lane commits 9 more transactions
+// per step in a Car whose frontier covers the previous Car only, so the
+// newest transactions are committed but not yet eligible, and the blockers
+// of every eligible transaction chain up to them: releasing a transaction
+// only once all its blockers are released would never release anything.
+TEST(BofOrdererTest, ClosureReleasesUnderEndlessBlockerChain) {
+  const int n = 3;
+  auto lane_order = [](int lane, int count) {
+    const int offset[] = {0, 2, 0, 1};  // block b of lane r: 3b+offset, descending
+    std::vector<int> order;
+    for (int b = 0; static_cast<int>(order.size()) < count; ++b) {
+      for (int k = 0; k < 3; ++k) {
+        int x = 3 * b + offset[lane] - k;
+        if (x >= 0) order.push_back(x);
+      }
+    }
+    order.resize(count);
+    return order;
+  };
+  auto id = [](int x) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "t%03d", x);
+    return std::string(buf);
+  };
+  BofOrderer bof(n, 1, 1.0);
+  std::set<std::string> executed;
+  for (int step = 1; step <= 6; ++step) {
+    std::vector<BofCommittedCar> cars;
+    for (int r = 1; r <= n; ++r) {
+      std::vector<int> order = lane_order(r, 9 * step);
+      std::vector<std::string> items;
+      for (int k = 9 * (step - 1); k < 9 * step; ++k) items.push_back(id(order[k]));
+      cars.push_back(BofCar(n, r, step, items, step - 1, {step, step, step}));
+    }
+    std::set<std::string> released;
+    for (const auto& batch : bof.Commit(cars, {}).batches) {
+      for (const auto& t : batch) {
+        EXPECT_TRUE(released.insert(t).second) << t;
+        EXPECT_TRUE(executed.insert(t).second) << t << " executed twice";
+      }
+    }
+    // Each step executes everything committed two steps before it except
+    // the newest transaction, whose closure holds a pending one (e.g. at
+    // step 2, t009 blocks t008 in lanes 2 and 3).  t007 is released with
+    // t008 out of its closure: t007 is ahead of t009 in lanes 1 and 3.
+    std::set<std::string> expected;
+    for (int x = 0; x < 9 * (step - 1) - 1; ++x) expected.insert(id(x));
+    EXPECT_EQ(executed, expected) << "step " << step;
+  }
+}
+
+// The release rule of Sec. 7.1 transcribed literally: D(t) for every
+// eligible t, over the committed lanes and the state before the step.
+std::set<std::string> ReferenceRelease(
+    const std::vector<std::vector<std::string>>& lanes,  // committed, per lane
+    const std::vector<bool>& discarded,
+    const std::map<std::string, std::vector<std::pair<int64_t, int32_t>>>& eligible,
+    const std::set<std::string>& executed, int n, int theta) {
+  // Position of v in lane r as (Car index 0, position) = attest format.
+  auto pos = [&](int r, const std::string& v) -> int64_t {
+    auto it = std::find(lanes[r].begin(), lanes[r].end(), v);
+    return it == lanes[r].end() ? -1 : it - lanes[r].begin();
+  };
+  auto before = [&](const std::string& v, const std::vector<std::pair<int64_t, int32_t>>& at,
+                    int r) {
+    int64_t p = pos(r, v);
+    return p >= 0 && p < at[r].second;
+  };
+  std::set<std::string> unexecuted;
+  for (int r = 1; r <= n; ++r) {
+    for (const auto& v : lanes[r]) {
+      if (!executed.count(v)) unexecuted.insert(v);
+    }
+  }
+  std::set<std::string> released;
+  for (const auto& [t, at_t] : eligible) {
+    auto ahead = [&](const std::string& v) {
+      int k = 0;
+      for (int r = 1; r <= n; ++r) {
+        if (!discarded[r] && at_t[r].first >= 0 && !before(v, at_t, r)) ++k;
+      }
+      return k >= theta;
+    };
+    std::set<std::string> closure{t};
+    std::vector<std::string> work{t};
+    bool ok = true;
+    while (!work.empty()) {
+      std::string u = work.back();
+      work.pop_back();
+      if (!eligible.count(u)) {
+        ok = false;
+        continue;
+      }
+      const auto& at_u = eligible.at(u);
+      for (const auto& v : unexecuted) {
+        int k = 0;
+        for (int r = 1; r <= n; ++r) {
+          if (!discarded[r] && at_u[r].first >= 0 && before(v, at_u, r)) ++k;
+        }
+        if (k >= theta && !ahead(v) && closure.insert(v).second) work.push_back(v);
+      }
+    }
+    if (ok) released.insert(closure.begin(), closure.end());
+  }
+  return released;
+}
+
+// BofHoldBack (fast path + closure) against the literal rule, on random
+// lanes with local reorderings, omissions, random eligibility and claims.
+TEST(BofOrdererTest, ReleaseMatchesReference) {
+  std::mt19937 rng(7);
+  for (int trial = 0; trial < 300; ++trial) {
+    const int n = trial % 2 ? 5 : 3, f = (n - 1) / 2, theta = n - f;
+    const int m = 60;
+    std::vector<std::vector<std::string>> order(n + 1);
+    for (int r = 1; r <= n; ++r) {
+      for (int x = 0; x < m; ++x) {
+        if (rng() % 12 == 0) continue;  // lane never places x
+        order[r].push_back("t" + std::to_string(100 + x));
+      }
+      for (size_t k = 0; k + 1 < order[r].size(); ++k) {
+        if (rng() % 3 == 0) std::swap(order[r][k], order[r][k + 1]);
+      }
+    }
+    BofHoldBack hold(n, theta);
+    std::vector<std::vector<std::string>> lanes(n + 1);
+    std::vector<bool> discarded(n + 1, false);
+    std::set<std::string> executed, eligible_ever;
+    std::map<std::string, std::vector<std::pair<int64_t, int32_t>>> held;
+    for (int step = 1; step <= 12; ++step) {
+      // Every step re-commits a lane as Car 0, its old items as heartbeats,
+      // so that attestations are (0, position in lane) across steps.
+      std::vector<BofCommittedCar> cars;
+      for (int r = 1; r <= n; ++r) {
+        size_t from = lanes[r].size(), to = std::min(order[r].size(), from + rng() % 8);
+        BofCommittedCar car;
+        car.lane = r;
+        car.index = 0;
+        car.items.assign(from, "");
+        car.heartbeat.assign(from, true);
+        for (size_t k = from; k < to; ++k) {
+          car.items.push_back(order[r][k]);
+          car.heartbeat.push_back(false);
+          lanes[r].push_back(order[r][k]);
+        }
+        cars.push_back(std::move(car));
+      }
+      std::vector<int> claims;
+      if (step == 6 && trial % 3 == 0) claims.push_back(1 + rng() % n);
+      for (int j : claims) discarded[j] = true;
+      hold.OnCommitted(cars, claims);
+      // Random newly eligible transactions among those committed by >= 1 lane.
+      std::vector<BofEligibleTxn> fresh;
+      std::map<std::string, std::vector<std::pair<int64_t, int32_t>>> eligible = held;
+      for (int x = 0; x < m; ++x) {
+        std::string t = "t" + std::to_string(100 + x);
+        if (eligible_ever.count(t) || rng() % 3) continue;
+        BofEligibleTxn e{t, std::vector<std::pair<int64_t, int32_t>>(n + 1, {-1, -1})};
+        bool any = false;
+        for (int r = 1; r <= n; ++r) {
+          auto it = std::find(lanes[r].begin(), lanes[r].end(), t);
+          if (discarded[r] || it == lanes[r].end()) continue;
+          e.attest[r] = {0, static_cast<int32_t>(it - lanes[r].begin())};
+          any = true;
+        }
+        if (!any) continue;
+        eligible_ever.insert(t);
+        eligible[t] = e.attest;
+        fresh.push_back(std::move(e));
+      }
+      std::set<std::string> want =
+          ReferenceRelease(lanes, discarded, eligible, executed, n, theta);
+      std::set<std::string> got;
+      for (const auto& e : hold.Release(std::move(fresh))) got.insert(e.id);
+      ASSERT_EQ(got, want) << "trial " << trial << " step " << step;
+      held.clear();
+      for (const auto& [t, at] : eligible) {
+        if (!got.count(t)) held[t] = at;
+      }
+      executed.insert(got.begin(), got.end());
+    }
+  }
 }
 
 // The straightforward Alg. 3 (adjacency lists, recursive-free Tarjan), kept

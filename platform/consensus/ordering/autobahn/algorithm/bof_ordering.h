@@ -70,13 +70,18 @@ struct BofCommitResult {
 // else t_b -> t_a iff the complementary count reaches theta.  SCCs become
 // batches, emitted in a topological order of the condensation with ties
 // broken by the smallest digest of each SCC.
-// Hold-back rule across execution steps (Sec. 7.1): an eligible t executes
-// only once every transaction that precedes t in at least theta of the
-// non-discarded lanes that committed t is eligible too (or executed).  Every
-// transaction with a mandated edge to t satisfies this (each correct lane
-// that committed t holds it earlier), so it is ordered in the same step as
-// t or before it; theta > f guarantees that such predecessors are held by a
-// correct lane and eventually become eligible.
+// Release across execution steps (Sec. 7.1): a lane is counted if no
+// committed claim names it; v blocks an eligible u if v precedes u in at
+// least theta counted lanes; t is ahead of v if at least theta counted lanes
+// committed t with v not before it.  The closure D(t) of an eligible t is
+// the smallest set that contains t and, for every eligible u in D(t), each
+// unexecuted blocker v of u that t is not ahead of.  Once every transaction
+// of D(t) is eligible, its unexecuted ones are released, and the step orders
+// the released transactions.  A blocker left out of D(t) lies on a cycle
+// with the member it blocks (Lemma 6), i.e. in the same batch, which
+// Definition 2 lets the protocol output over several steps.  Stopping at
+// the transactions t is ahead of bounds D(t) under continuous load, where
+// requiring every blocker to be released in turn could chain forever.
 //
 // It only affects execution order, so it runs on the execution thread,
 // apart from settlement (which arms the delinquency timers).  Feed it every
@@ -93,15 +98,22 @@ class BofHoldBack {
 
  private:
   using Pos = std::pair<int64_t, int32_t>;
-  enum State : uint8_t { kPending, kCandidate, kExecuted };
+  // kCandidate: eligible this step; kHeld: eligible but held back by the
+  // fast path of Release (then decided by its closure).
+  enum State : uint8_t { kPending, kCandidate, kHeld, kExecuted };
   struct Entry {
     Pos pos;
     uint32_t txn;
   };
   uint32_t Intern(const std::string& id);
-  // First pending, non-candidate entry of a lane (dropping executed ones
-  // from the front); nullptr if none.
+  // First pending or held entry of a lane (dropping executed ones from the
+  // front); nullptr if none.
   const Entry* FirstPending(int lane);
+  // For every unexecuted transaction, the number of counted lanes in which
+  // it precedes the attestations `attest`; returns the number of counted
+  // lanes that hold one.
+  int CountPreceding(const std::vector<Pos>& attest,
+                     std::unordered_map<uint32_t, int>* before);
 
   int n_, theta_;
   std::vector<bool> discarded_;
@@ -128,7 +140,7 @@ class BofOrderer {
   static std::vector<std::vector<std::string>> Order(
       std::vector<BofEligibleTxn> txns, int n, int theta);
 
-  // Settle(), the hold-back rule and Order() (tests).
+  // Settle(), the release rule and Order() (tests).
   BofCommitResult Commit(const std::vector<BofCommittedCar>& cars,
                          const std::vector<int>& claimed_lanes);
 

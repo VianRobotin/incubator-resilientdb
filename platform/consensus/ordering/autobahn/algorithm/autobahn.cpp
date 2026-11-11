@@ -2199,19 +2199,20 @@ void AutoBahn::Execute(CommittedBlock& block) {
     order = ol_->Commit(cars);
     pending = ol_->PendingSize();
   } else {
-    // Hold-back rule (Sec. 7.1), then Alg. 3 on what it releases.
+    // Release rule (Sec. 7.1, closure D(t)), then Alg. 3 on what it releases.
+    int64_t start = Now();
     bof_hold_->OnCommitted(block.bof_cars, block.claims);
     std::vector<BofEligibleTxn> released = bof_hold_->Release(std::move(block.bof_eligible));
     const size_t releasing = released.size();
-    int64_t start = Now();
+    int64_t release_took = Now() - start;
     auto batches = BofOrderer::Order(std::move(released), n_, bof_theta_);
     int64_t took = Now() - start;
     static int64_t last_report = 0;
     if (took > params_.delta_us && Now() - last_report > 1000000) {
       last_report = Now();
-      LOG(ERROR) << "bof: ordering " << releasing << " transactions took " << took
-                 << "us (" << batches.size() << " batches, " << bof_hold_->HeldSize()
-                 << " held back)";
+      LOG(ERROR) << "bof: releasing and ordering " << releasing << " transactions took "
+                 << took << "us (release " << release_took << "us, " << batches.size()
+                 << " batches, " << bof_hold_->HeldSize() << " held back)";
     }
     for (auto& batch : batches) {
       for (auto& id : batch) order.push_back(std::move(id));
