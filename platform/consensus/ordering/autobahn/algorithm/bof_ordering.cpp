@@ -3,7 +3,9 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <queue>
 
 namespace resdb {
@@ -38,7 +40,12 @@ BofCommitResult BofOrderer::Commit(const std::vector<BofCommittedCar>& cars,
 }
 
 BofHoldBack::BofHoldBack(int n, int theta)
-    : n_(n), theta_(theta), discarded_(n + 1, false), lane_(n + 1) {}
+    : n_(n),
+      theta_(theta),
+      discarded_(n + 1, false),
+      lane_(n + 1),
+      compacted_(n + 1, 0),
+      blocking_(n + 1) {}
 
 uint32_t BofHoldBack::Intern(const std::string& id) {
   auto it = index_.emplace(id, static_cast<uint32_t>(state_.size()));
@@ -60,7 +67,11 @@ void BofHoldBack::OnCommitted(const std::vector<BofCommittedCar>& cars,
       uint32_t t = Intern(car.items[p]);
       if (state_[t] == kExecuted) continue;
       // Lanes commit in order, so positions arrive increasing.
-      lane_[r].push_back(Entry{Pos{car.index, static_cast<int32_t>(p)}, t});
+      const Pos pos{car.index, static_cast<int32_t>(p)};
+      lane_[r].push_back(Entry{pos, t});
+      auto& where = where_[t];
+      if (where.empty()) where.assign(n_ + 1, Pos{-1, -1});
+      where[r] = pos;
     }
   }
 }
@@ -74,22 +85,28 @@ const BofHoldBack::Entry* BofHoldBack::FirstPending(int lane) {
   return nullptr;
 }
 
-int BofHoldBack::CountPreceding(const std::vector<Pos>& attest,
-                                std::unordered_map<uint32_t, int>* before) {
-  before->clear();
-  int lanes = 0;
+void BofHoldBack::Blockers(const std::vector<Pos>& attest, std::vector<uint32_t>* out) {
+  if (count_.size() < state_.size()) count_.resize(state_.size(), 0);
+  touched_.clear();
   for (int r = 1; r <= n_; ++r) {
     if (discarded_[r] || attest[r].first < 0) continue;
-    ++lanes;
-    for (const Entry& e : lane_[r]) {
+    for (const Entry& e : blocking_[r]) {
       if (!(e.pos < attest[r])) break;
-      if (state_[e.txn] != kExecuted) ++(*before)[e.txn];
+      ++stats_.closure_scanned;
+      if (count_[e.txn]++ == 0) touched_.push_back(e.txn);
+      if (count_[e.txn] == theta_) out->push_back(e.txn);
     }
   }
-  return lanes;
+  for (uint32_t t : touched_) count_[t] = 0;
 }
 
 std::vector<BofEligibleTxn> BofHoldBack::Release(std::vector<BofEligibleTxn> eligible) {
+  using Clock = std::chrono::steady_clock;
+  auto us_since = [](Clock::time_point t) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t).count();
+  };
+  stats_ = ReleaseStats();
+  auto phase = Clock::now();
   std::vector<BofEligibleTxn> candidates = std::move(held_);
   held_.clear();
   for (auto& e : eligible) candidates.push_back(std::move(e));
@@ -105,9 +122,10 @@ std::vector<BofEligibleTxn> BofHoldBack::Release(std::vector<BofEligibleTxn> eli
   // fast path releases a subset of what the closure rule releases.
   std::vector<bool> held(candidates.size(), false);
   std::vector<const Entry*> first(n_ + 1);
-  std::unordered_map<uint32_t, int> before;
+  if (count_.size() < state_.size()) count_.resize(state_.size(), 0);
   for (bool changed = true; changed;) {
     changed = false;
+    ++stats_.fast_rounds;
     for (int r = 1; r <= n_; ++r) first[r] = discarded_[r] ? nullptr : FirstPending(r);
     for (size_t i = 0; i < candidates.size(); ++i) {
       if (held[i]) continue;
@@ -117,19 +135,22 @@ std::vector<BofEligibleTxn> BofHoldBack::Release(std::vector<BofEligibleTxn> eli
         if (first[r] != nullptr && attest[r].first >= 0 && first[r]->pos < attest[r]) ++lanes;
       }
       if (lanes < theta_) continue;  // the common case
-      before.clear();
+      touched_.clear();
       bool blocked = false;
       for (int r = 1; r <= n_ && !blocked; ++r) {
         if (first[r] == nullptr || attest[r].first < 0) continue;
         for (const Entry& e : lane_[r]) {
           if (!(e.pos < attest[r])) break;
-          if ((state_[e.txn] == kPending || state_[e.txn] == kHeld) &&
-              ++before[e.txn] >= theta_) {
+          ++stats_.fast_scanned;
+          if (state_[e.txn] != kPending && state_[e.txn] != kHeld) continue;
+          if (count_[e.txn]++ == 0) touched_.push_back(e.txn);
+          if (count_[e.txn] >= theta_) {
             blocked = true;
             break;
           }
         }
       }
+      for (uint32_t t : touched_) count_[t] = 0;
       if (!blocked) continue;
       held[i] = true;
       state_[txn[i]] = kHeld;
@@ -137,50 +158,105 @@ std::vector<BofEligibleTxn> BofHoldBack::Release(std::vector<BofEligibleTxn> eli
     }
   }
 
+  stats_.candidates = candidates.size();
+  stats_.fast_held = std::count(held.begin(), held.end(), true);
+  stats_.fast_us = us_since(phase);
+  phase = Clock::now();
   // Closure rule for the candidates the fast path held.  D(t) is computed on
   // the state before this step for every t, so the released set does not
   // depend on the order of the candidates.  Expansion stops at a candidate
-  // the fast path kept: its blockers are all eligible and kept.
-  std::unordered_map<uint32_t, size_t> held_index;
-  for (size_t i = 0; i < candidates.size(); ++i) {
-    if (held[i]) held_index.emplace(txn[i], i);
+  // the fast path kept: its blockers are all eligible and kept, so it adds
+  // nothing to a closure but itself, which is released anyway.
+  // The pending and held entries of each counted lane, the only ones that
+  // can block a closure (states do not change until the step is decided).
+  for (int r = 1; r <= n_; ++r) {
+    blocking_[r].clear();
+    if (discarded_[r]) continue;
+    for (const Entry& e : lane_[r]) {
+      if (state_[e.txn] == kPending || state_[e.txn] == kHeld) blocking_[r].push_back(e);
+    }
   }
   std::vector<bool> release(candidates.size(), false);
-  std::unordered_map<uint32_t, int> ahead, blockers;
-  std::vector<size_t> closure, queue;
+  // The held candidates, numbered 0..h-1.  For each, its held blockers as a
+  // bit row over them and its pending blockers as a list, computed once.
+  std::vector<size_t> held_list;
   for (size_t i = 0; i < candidates.size(); ++i) {
-    if (!held[i] || release[i]) continue;
-    // ahead[v]: counted lanes in which v precedes t; t is ahead of v iff the
-    // other lanes_t - ahead[v] counted lanes that committed t reach theta.
-    const int lanes_t = CountPreceding(candidates[i].attest, &ahead);
-    auto t_ahead_of = [&](uint32_t v) {
-      auto it = ahead.find(v);
-      return lanes_t - (it == ahead.end() ? 0 : it->second) >= theta_;
+    if (held[i]) held_list.push_back(i);
+  }
+  const size_t h = held_list.size();
+  const size_t words = (h + 63) / 64;
+  std::unordered_map<uint32_t, uint32_t> held_number;
+  for (size_t k = 0; k < h; ++k) held_number.emplace(txn[held_list[k]], k);
+  std::vector<uint64_t> rows(h * words, 0);
+  std::vector<std::vector<const std::vector<Pos>*>> pending_of(h);
+  std::unordered_map<const std::vector<Pos>*, uint32_t> pending_number;
+  std::vector<uint32_t> found;
+  for (size_t k = 0; k < h; ++k) {
+    found.clear();
+    Blockers(candidates[held_list[k]].attest, &found);
+    ++stats_.blockers_calls;
+    for (uint32_t v : found) {
+      if (state_[v] == kHeld) {
+        const uint32_t x = held_number.at(v);
+        rows[k * words + x / 64] |= 1ULL << (x % 64);
+      } else {
+        const std::vector<Pos>* w = &where_.at(v);
+        pending_number.emplace(w, static_cast<uint32_t>(pending_number.size()));
+        pending_of[k].push_back(w);
+      }
+    }
+  }
+  // Every held candidate t is a root: D(t) is explored breadth-first over
+  // the rows, testing once per root whether t is ahead of a transaction.  A
+  // pending blocker that t is not ahead of makes D(t) ineligible; the
+  // released set is the union of the eligible closures.
+  std::vector<uint64_t> tested(words);
+  std::vector<uint32_t> pending_tested(pending_number.size(), UINT32_MAX);
+  std::vector<uint32_t> queue;
+  for (size_t root = 0; root < h; ++root) {
+    ++stats_.roots;
+    const auto& at_t = candidates[held_list[root]].attest;
+    auto ahead = [&](const std::vector<Pos>& where) {
+      ++stats_.ahead_calls;
+      int lanes = 0;
+      for (int r = 1; r <= n_; ++r) {
+        if (discarded_[r] || at_t[r].first < 0) continue;
+        if (!(where[r].first >= 0 && where[r] < at_t[r])) ++lanes;
+      }
+      return lanes >= theta_;
     };
-    closure.assign(1, i);
-    queue.assign(1, i);
-    std::unordered_set<size_t> in_closure{i};
+    std::fill(tested.begin(), tested.end(), 0);
+    tested[root / 64] |= 1ULL << (root % 64);
+    queue.assign(1, static_cast<uint32_t>(root));
     bool eligible = true;
-    while (eligible && !queue.empty()) {
-      size_t u = queue.back();
-      queue.pop_back();
-      if (u != i) CountPreceding(candidates[u].attest, &blockers);
-      for (const auto& [v, k] : u == i ? ahead : blockers) {
-        if (k < theta_ || t_ahead_of(v)) continue;
-        if (state_[v] == kPending) {
+    for (size_t q = 0; eligible && q < queue.size(); ++q) {
+      const uint32_t u = queue[q];
+      ++stats_.visits;
+      for (const std::vector<Pos>* w : pending_of[u]) {
+        uint32_t& seen = pending_tested[pending_number.at(w)];
+        if (seen == root) continue;
+        seen = static_cast<uint32_t>(root);
+        if (!ahead(*w)) {
           eligible = false;  // a member of D(t) is not eligible yet
           break;
         }
-        if (state_[v] != kHeld) continue;  // kept by the fast path
-        size_t c = held_index.at(v);
-        if (in_closure.insert(c).second) {
-          closure.push_back(c);
-          queue.push_back(c);
+      }
+      if (!eligible) break;
+      const uint64_t* row = &rows[u * words];
+      for (size_t k = 0; k < words; ++k) {
+        for (uint64_t bits = row[k] & ~tested[k]; bits != 0; bits &= bits - 1) {
+          const uint32_t x = static_cast<uint32_t>(k * 64 + __builtin_ctzll(bits));
+          tested[k] |= 1ULL << (x % 64);
+          if (ahead(where_.at(txn[held_list[x]]))) continue;
+          queue.push_back(x);  // a member of D(t)
         }
       }
     }
-    if (!eligible) continue;
-    for (size_t c : closure) release[c] = true;
+    if (!eligible) {
+      ++stats_.failed_roots;
+      continue;
+    }
+    for (uint32_t x : queue) release[held_list[x]] = true;
   }
 
   std::vector<BofEligibleTxn> released;
@@ -190,10 +266,47 @@ std::vector<BofEligibleTxn> BofHoldBack::Release(std::vector<BofEligibleTxn> eli
       held_.push_back(std::move(candidates[i]));
     } else {
       state_[txn[i]] = kExecuted;
+      where_.erase(txn[i]);
+      // The edge rule counts the lanes counted when the pair is released.
+      for (int r = 1; r <= n_; ++r) {
+        if (discarded_[r]) candidates[i].attest[r] = Pos{-1, -1};
+      }
       released.push_back(std::move(candidates[i]));
     }
   }
+  stats_.closure_us = us_since(phase);
+  phase = Clock::now();
+  Compact();
+  stats_.compact_us = us_since(phase);
+  stats_.queued = QueuedSize();
   return released;
+}
+
+std::string BofHoldBack::ReleaseStats::ToString() const {
+  return "candidates " + std::to_string(candidates) + ", fast path " +
+         std::to_string(fast_us) + "us (" + std::to_string(fast_rounds) + " rounds, " +
+         std::to_string(fast_scanned) + " scanned, " + std::to_string(fast_held) +
+         " held), closure " + std::to_string(closure_us) + "us (" +
+         std::to_string(blockers_calls) + " blocker sets, " +
+         std::to_string(closure_scanned) + " scanned, " + std::to_string(roots) + " roots, " +
+         std::to_string(failed_roots) + " failed, " + std::to_string(visits) + " visits, " +
+         std::to_string(ahead_calls) + " ahead tests), compaction " +
+         std::to_string(compact_us) + "us, " + std::to_string(queued) + " queued";
+}
+
+void BofHoldBack::Compact() {
+  // Executed entries are dropped lazily from the front of a lane only, so a
+  // single long-pending entry would keep every later one; scans then pay for
+  // the whole history.  Rebuild a lane once it has doubled since its last
+  // compaction, which keeps the cost amortized constant per entry.
+  for (int r = 1; r <= n_; ++r) {
+    auto& q = lane_[r];
+    if (q.size() < 2 * compacted_[r] + 1024) continue;
+    q.erase(std::remove_if(q.begin(), q.end(),
+                           [&](const Entry& e) { return state_[e.txn] == kExecuted; }),
+            q.end());
+    compacted_[r] = q.size();
+  }
 }
 
 BofSettleResult BofOrderer::Settle(const std::vector<BofCommittedCar>& cars,

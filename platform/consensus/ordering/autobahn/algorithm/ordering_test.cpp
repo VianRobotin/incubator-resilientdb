@@ -253,14 +253,62 @@ TEST(BofOrdererTest, ClosureReleasesUnderEndlessBlockerChain) {
         EXPECT_TRUE(executed.insert(t).second) << t << " executed twice";
       }
     }
-    // Each step executes everything committed two steps before it except
-    // the newest transaction, whose closure holds a pending one (e.g. at
-    // step 2, t009 blocks t008 in lanes 2 and 3).  t007 is released with
-    // t008 out of its closure: t007 is ahead of t009 in lanes 1 and 3.
+    // Each step executes everything committed two steps before it.  At
+    // step 2, D(t008) holds the pending t009 (it blocks t008 in lanes 2 and
+    // 3), but D(t007) = {..., t007, t008} stops at t009, which t007 is ahead
+    // of (lanes 1 and 3), so t008 is released with t007.
     std::set<std::string> expected;
-    for (int x = 0; x < 9 * (step - 1) - 1; ++x) expected.insert(id(x));
+    for (int x = 0; x < 9 * (step - 1); ++x) expected.insert(id(x));
     EXPECT_EQ(executed, expected) << "step " << step;
   }
+}
+
+// A transaction that only lane 1 commits never becomes eligible and stays at
+// the front of lane 1's queue.  The lane queues must still drop the executed
+// transactions behind it, or every scan pays for the whole history (the
+// closure phase then took seconds per block at 40k tx/s).  Each step also
+// holds 100 transactions back for one step, so the closure phase runs.
+TEST(BofOrdererTest, ReleaseQueuesStayBounded) {
+  const int n = 3, theta = 2, per_step = 100, steps = 200;
+  BofHoldBack hold(n, theta);
+  auto car = [&](int lane, int64_t index, const std::vector<std::string>& items) {
+    BofCommittedCar c;
+    c.lane = lane;
+    c.index = index;
+    c.items = items;
+    c.heartbeat.assign(items.size(), false);
+    return c;
+  };
+  hold.OnCommitted({car(1, 1, {"stuck"})}, {});
+  size_t executed = 0;
+  std::vector<BofEligibleTxn> late;  // y of the previous step
+  for (int s = 1; s <= steps; ++s) {
+    // Lanes 1 and 2 commit y_s before the step's transactions, lane 3 after:
+    // y_s blocks them all, and is eligible one step later.
+    std::vector<std::string> body, first, last;
+    for (int k = 0; k < per_step; ++k) body.push_back("a" + std::to_string(s) + "_" + std::to_string(k));
+    std::string y = "y" + std::to_string(s);
+    first.push_back(y);
+    first.insert(first.end(), body.begin(), body.end());
+    last = body;
+    last.push_back(y);
+    hold.OnCommitted({car(1, s + 1, first), car(2, s, first), car(3, s, last)}, {});
+    std::vector<BofEligibleTxn> eligible = std::move(late);
+    late.clear();
+    for (int k = 0; k <= per_step; ++k) {
+      BofEligibleTxn e{k < per_step ? body[k] : y,
+                       std::vector<std::pair<int64_t, int32_t>>(n + 1)};
+      int p1 = k < per_step ? k + 1 : 0, p3 = k < per_step ? k : per_step;
+      e.attest[1] = {s + 1, p1};
+      e.attest[2] = {s, p1};
+      e.attest[3] = {s, p3};
+      (k < per_step ? eligible : late).push_back(std::move(e));
+    }
+    executed += hold.Release(std::move(eligible)).size();
+    // Compaction lets a lane reach 1024 + twice its live entries.
+    ASSERT_LT(hold.QueuedSize(), 60u * per_step) << "step " << s;
+  }
+  EXPECT_EQ(executed, static_cast<size_t>((steps - 1) * (per_step + 1)));
 }
 
 // The release rule of Sec. 7.1 transcribed literally: D(t) for every
@@ -321,10 +369,12 @@ std::set<std::string> ReferenceRelease(
 
 // BofHoldBack (fast path + closure) against the literal rule, on random
 // lanes with local reorderings, omissions, random eligibility and claims.
+// The released set is the union of every eligible closure, including those
+// of roots that another closure already releases.
 TEST(BofOrdererTest, ReleaseMatchesReference) {
   std::mt19937 rng(7);
-  for (int trial = 0; trial < 300; ++trial) {
-    const int n = trial % 2 ? 5 : 3, f = (n - 1) / 2, theta = n - f;
+  for (int trial = 0; trial < 900; ++trial) {
+    const int n = 3 + 2 * (trial % 3), f = (n - 1) / 2, theta = n - f;
     const int m = 60;
     std::vector<std::vector<std::string>> order(n + 1);
     for (int r = 1; r <= n; ++r) {
@@ -332,8 +382,9 @@ TEST(BofOrdererTest, ReleaseMatchesReference) {
         if (rng() % 12 == 0) continue;  // lane never places x
         order[r].push_back("t" + std::to_string(100 + x));
       }
-      for (size_t k = 0; k + 1 < order[r].size(); ++k) {
-        if (rng() % 3 == 0) std::swap(order[r][k], order[r][k + 1]);
+      for (size_t k = 0; k + 1 < order[r].size(); ++k) {  // local reorderings
+        size_t w = 1 + rng() % 4;
+        if (rng() % 3 == 0 && k + w < order[r].size()) std::swap(order[r][k], order[r][k + w]);
       }
     }
     BofHoldBack hold(n, theta);

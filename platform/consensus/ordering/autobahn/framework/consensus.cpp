@@ -195,6 +195,12 @@ int Consensus::ProcessCustomConsensus(std::unique_ptr<Request> request) {
     case MessageType::SyncHS_Status:
       if (auto m = Parse<Status>(*request)) autobahn_->ReceiveStatus(std::move(m));
       break;
+    case MessageType::Poa_Forward:
+      if (auto m = Parse<PoaForward>(*request)) autobahn_->ReceivePoaForward(std::move(m));
+      break;
+    case MessageType::Lane_Suspect:
+      if (auto m = Parse<Suspect>(*request)) autobahn_->ReceiveSuspect(std::move(m));
+      break;
     default:
       LOG(ERROR) << "unknown Pearl message type " << request->user_type();
       return -1;

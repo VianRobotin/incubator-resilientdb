@@ -408,17 +408,27 @@ _VIEW_EVENTS = (("view_entries", "entering view"), ("blames", "blaming leader"),
                 ("rejects", "rejecting block"), ("abstains", "abstaining on block"))
 
 
-def scan_run(log_dir: Path, live_replicas: int) -> dict:
+_GLOG_TIME_RE = re.compile(r"^[EIWF](\d{8} \d{2}:\d{2}:\d{2}\.\d{6}) ")
+
+
+def _glog_time(line: str) -> Optional[datetime.datetime]:
+    m = _GLOG_TIME_RE.match(line)
+    return datetime.datetime.strptime(m.group(1), "%Y%m%d %H:%M:%S.%f") if m else None
+
+
+def scan_run(log_dir: Path, live_ids, teardown: Optional[datetime.datetime] = None) -> dict:
     """Count, over the live replicas' logs: missing logs, glog F lines,
     crash messages, exits other than our SIGKILL (137, or no exit line),
     view-change events, the worst protocol-thread stall, and the slots at
     which replicas' order digests disagree.  ok iff nothing but the stall
-    is nonzero."""
+    is nonzero.  View-change events logged after `teardown` (the final
+    kill, which reaches the hosts up to a few hundred ms apart, so a replica
+    may outlive the leader by more than the blame budget) are not counted."""
     s = {k: 0 for k in ("missing_logs", "fatal_lines", "crash_lines", "bad_exits",
                         "max_stall_ms", "digest_disagree_slots")}
     s.update({k: 0 for k, _ in _VIEW_EVENTS})
     digests: dict = {}
-    for i in range(1, live_replicas + 1):
+    for i in live_ids:
         text = read_log(log_dir / f"server_{i}.log")
         if text is None:
             s["missing_logs"] += 1
@@ -428,7 +438,12 @@ def scan_run(log_dir: Path, live_replicas: int) -> dict:
         statuses = _STATUS_RE.findall(text)
         s["bad_exits"] += sum(1 for st in statuses if st != "137") + (0 if statuses else 1)
         for key, needle in _VIEW_EVENTS:
-            s[key] += text.count(needle)
+            for line in text.splitlines():
+                if needle not in line:
+                    continue
+                when = _glog_time(line)
+                if teardown is None or when is None or when < teardown:
+                    s[key] += 1
         for us in _STALL_RE.findall(text):
             s["max_stall_ms"] = max(s["max_stall_ms"], int(us) // 1000)
         for slot, digest in _DIGEST_RE.findall(text):
@@ -540,6 +555,14 @@ def _run_once(
         raise ValueError(
             f"silent_faults={silent_faults} must be in [0, {num_replicas})")
     live_replicas = num_replicas - silent_faults
+    # PEARL_CRASH="<replica>@<seconds>" kills that replica that long after the
+    # clients start (e.g. "1@15": the first leader); it then counts as faulty.
+    crash_id, crash_at = 0, 0
+    if os.environ.get("PEARL_CRASH"):
+        crash_id, crash_at = (int(x) for x in os.environ["PEARL_CRASH"].split("@"))
+        if not 1 <= crash_id <= live_replicas or not 0 < crash_at < runtime:
+            raise ValueError(f"bad PEARL_CRASH={os.environ['PEARL_CRASH']}")
+    live_ids = [i for i in range(1, live_replicas + 1) if i != crash_id]
     fault_tag = f"_f{silent_faults}" if silent_faults else ""
     run_id = (f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
               f"_n{num_replicas}{fault_tag}_{mode}_r{target_tps}")
@@ -569,6 +592,7 @@ def _run_once(
     local_dir = None
     log_dir = None
     recorded = False
+    teardown = None  # when the final kill started
     try:
         # Wait for machines
         hostnames = []
@@ -735,7 +759,15 @@ def _run_once(
             p.wait()
 
         print(f"Running for {runtime}s...")
-        time.sleep(runtime)
+        if crash_id:
+            time.sleep(crash_at)
+            print(f"Crashing replica {crash_id} at {crash_at}s")
+            ssh_cmd(replica_hosts[crash_id - 1],
+                    f"kill -9 $(cat {local_dir}/server_{crash_id}.pid) 2>/dev/null || true").wait()
+            live = [(i, host) for i, host in live if i != crash_id]
+            time.sleep(runtime - crash_at)
+        else:
+            time.sleep(runtime)
 
         dead = dead_replicas(live, local_dir)
         if dead:
@@ -743,6 +775,7 @@ def _run_once(
             raise ReplicaDied(f"replicas {dead} died during the run")
 
         print("Killing nodes...")
+        teardown = datetime.datetime.now()
         kill_nodes(replica_hosts + client_hosts, local_dir, log_dir)
 
         print("Parsing logs...")
@@ -756,7 +789,7 @@ def _run_once(
         any_exec_fallback = False
         stalled: list = []
 
-        for i in range(1, live_replicas + 1):
+        for i in live_ids:
             lf = log_dir / f"server_{i}.log"
             commit_meas, exec_meas, commit_total, exec_total, commit_fb, exec_fb = parse_log_file(
                 lf, experiment_start, warmup, runtime)
@@ -828,7 +861,7 @@ def _run_once(
         # hide crashes), then compress its logs.
         if log_dir is not None and log_dir.is_dir():
             try:
-                s = scan_run(log_dir, live_replicas)
+                s = scan_run(log_dir, live_ids, teardown)
                 scan_csv = RESULTS_DIR / "scan.csv"
                 init_csv(scan_csv, _SCAN_HEADER)
                 append_csv(scan_csv, ",".join(

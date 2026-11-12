@@ -67,12 +67,12 @@ struct TxnId {
 //  Consensus (Sec. 5.3, Alg. 2): Sync HotStuff with a stable leader.  A block
 //  carries the certificate of its parent, a tip cut (one certified tip per
 //  lane) and, in BOF, delinquency claims.  Voters check (i) a valid and
-//  fresh tip cut, (ii) in OL, that their collection window closed for every
-//  newly referenced transaction, (iii) in BOF, that their delinquency timer
-//  expired for every claim; they then forward the proposal, broadcast their
-//  vote and commit after 2 Delta without equivocation.  Leaders are replaced
-//  through Sync HotStuff's blame / view-change rules, with the (3p+4)Delta
-//  blame budget.
+//  fresh tip cut (freshness counts the PoAs a voter sent to the leader,
+//  which it does for the certified tips a proposal omits), and (ii) in BOF,
+//  that their delinquency timer expired for every claim; timers are armed
+//  by relayed Suspect messages.  They then forward the proposal, broadcast
+//  their vote and commit after 2 Delta without equivocation.  Leaders are
+//  replaced through Sync HotStuff's unchanged blame / view-change rules.
 //
 //  Execution (Sec. 6-7): committed blocks are handed, in order, to the OL or
 //  BOF orderer, which derives the execution order from committed Cars alone.
@@ -93,7 +93,7 @@ class AutoBahn : public common::ProtocolBase {
     double bof_gamma = 1.0;
     int64_t delta_us = 50000;      // Delta
     int64_t heartbeat_us = 50000;  // idle period before a heartbeat
-    int blame_p = 1;               // p of the (3p+4)Delta blame budget
+    int blame_p = 1;               // p of the (2p+4)Delta blame budget
     int dissemination_threads = 4;
     int64_t link_bytes_per_sec = 125000000;  // admission control
     std::string enclave_path;
@@ -132,6 +132,8 @@ class AutoBahn : public common::ProtocolBase {
   void ReceiveBlame(std::unique_ptr<Blame> blame);
   void ReceiveQuitView(std::unique_ptr<QuitView> quit);
   void ReceiveStatus(std::unique_ptr<Status> status);
+  void ReceivePoaForward(std::unique_ptr<PoaForward> forward);
+  void ReceiveSuspect(std::unique_ptr<Suspect> suspect);
 
  private:
   // ---- Dissemination shards ----
@@ -199,10 +201,10 @@ class AutoBahn : public common::ProtocolBase {
     int64_t buffer_since = 0;
     int64_t acked = 0;
     int64_t committed = 0;
-    // Highest certified Car known, and when each certification was learned
-    // (for the freshness check).
+    // Highest certified Car known, and the certified tips of this lane sent
+    // to the current leader, with the send times (for the freshness check).
     Poa certified;
-    std::deque<std::pair<int64_t, int64_t>> certified_at;  // (index, time)
+    std::deque<std::pair<int64_t, int64_t>> forwarded;  // (index, time)
   };
 
   struct BlockState {
@@ -266,7 +268,6 @@ class AutoBahn : public common::ProtocolBase {
   void ShardCloseWindows(Shard& shard);
   void FlushEchoes(Shard& shard, bool force);
   std::vector<TxnId> MissingBodies(const std::vector<TxnId>& ids);
-  bool WindowsClosed(const std::vector<TxnId>& ids);
   void RequestBodies(const std::vector<TxnId>& ids, int target);
   std::vector<TxnId> CarTxnIds(const Car& car) const;
 
@@ -305,6 +306,9 @@ class AutoBahn : public common::ProtocolBase {
   void RequestBlock(const std::string& hash);
   void HandleProposal(const ConsensusBlock& b);
   bool ValidTipCut(const BlockState& st);
+  bool IgnoresDelinquentLane(const BlockState& st);
+  void ForwardOmittedTips(const ConsensusBlock& b);
+  void HandlePoaForward(const PoaForward& forward);
   bool VoteWaitsOver(const BlockState& st);
   void ProcessPendingVotes();
   void CastVote(BlockState& st);
@@ -321,8 +325,9 @@ class AutoBahn : public common::ProtocolBase {
   // BOF settlement at commit and delinquency timers (Sec. 7.1).
   void SettleBof(const std::vector<int>& claims, CommittedBlock* out);
   void SettleLoop();
-  void ArmDelinquencyTimers(const std::vector<std::pair<int, int64_t>>& armed,
-                            int64_t committed_at);
+  void WatchLanes(const std::vector<Suspect>& watch, int64_t committed_at);
+  void HandleSuspect(const Suspect& suspect, bool relay);
+  void BroadcastPoa(int lane);
   void CheckDelinquencyTimers();
 
   // Execution layer.
@@ -428,9 +433,19 @@ class AutoBahn : public common::ProtocolBase {
   std::string last_proposed_;
   int64_t last_propose_time_ = 0;
   bool leader_ready_ = false;
-  // BOF delinquency timers: (lane, position) -> arm time.
+  // BOF suspicion (Sec. 7.1), keyed by <j, c>: positions fixed by a
+  // committed block, with the time a Suspect message is due and the
+  // announcement it carries; the Suspect messages already handled; the
+  // delinquency timers not cancelled, with their arm time; and the expired
+  // ones, with their expiry time.
+  struct LaneWatch {
+    int64_t due = 0;
+    Announcement announcement;
+  };
+  std::map<std::pair<int, int64_t>, LaneWatch> suspect_watch_;
+  std::set<std::pair<int, int64_t>> suspect_seen_;
   std::map<std::pair<int, int64_t>, int64_t> delinquency_armed_;
-  std::set<std::pair<int, int64_t>> delinquency_expired_;
+  std::map<std::pair<int, int64_t>, int64_t> delinquency_expired_;
   std::map<int, int64_t> claim_targets_;
   // Block fetches for missed blocks: hash -> last request time.
   std::map<std::string, int64_t> block_requests_;
@@ -441,6 +456,10 @@ class AutoBahn : public common::ProtocolBase {
 
   // BOF settlement state (settlement thread).
   std::unique_ptr<BofOrderer> bof_orderer_;
+  // Per lane j: for each Car position c above j's committed prefix, an
+  // enclave-signed announcement of c taken from a committed Car's frontier
+  // (what a Suspect message for <j, c> carries).
+  std::vector<std::map<int64_t, Announcement>> announcements_;
   std::thread settle_thread_;
   std::mutex settle_mutex_;
   std::condition_variable settle_cv_;

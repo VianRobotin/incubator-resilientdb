@@ -121,6 +121,25 @@ message Claim {
   int64 position = 2;
 }
 
+// Certified tips (with their PoA): sent to the leader by a voter whose
+// certified tips a proposal omitted (freshness, Sec. 5.3), or broadcast by
+// a replica that holds the Car a Suspect message asks for (Sec. 7.1).
+message PoaForward {
+  int32 sender_id = 1;
+  repeated Tip tips = 2;
+}
+
+// Suspect <j, c> (BOF, Sec. 7.1): the sender committed the block that fixed
+// c = c_hat_j(t) and received no certified Car of lane j at c or beyond
+// within D.  `announcement` is lane j's enclave-signed placement announcement
+// of Car c, which proves that j's enclave opened it.
+message Suspect {
+  int32 lane = 1;
+  int64 position = 2;
+  Announcement announcement = 3;
+  int32 sender_id = 4;
+}
+
 message Vote {
   int64 view = 1;
   int64 height = 2;
@@ -216,4 +235,6 @@ enum MessageType {
   Body_Reply = 11;
   Block_Query = 12;
   Block_Reply = 13;
+  Poa_Forward = 14;
+  Lane_Suspect = 15;
 }

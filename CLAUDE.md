@@ -61,8 +61,10 @@ The code follows the Pearl paper, Sec. 5-7.
   BOF: (w_r, M_r)) plus the PoA of the lane's latest certified Car.
 - **Consensus (Alg. 2):** Sync HotStuff, stable leader per view.  Blocks are a
   tip cut + parent certificate (+ BOF delinquency claims), signed by
-  TEE.SignBlock.  Votes wait for (ii) OL collection windows / (iii) BOF
-  delinquency timers; commit after 2Delta; blame budget (3p+4)Delta.
+  TEE.SignBlock.  Freshness counts the PoAs a voter forwarded to the leader
+  (Poa_Forward, for tips a proposal omits); BOF votes wait for the
+  delinquency timers of the block's claims, armed by relayed Lane_Suspect
+  messages; commit after 2Delta; Sync HotStuff's (2p+4)Delta blame budget.
 - **Execution:** `algorithm/ol_ordering.*` (K(t), tau, K(t) < tau) and
   `algorithm/bof_ordering.*` (settlement, theta = ceil(gamma(n-f)) edge rule,
   SCC batches) derive the order from committed Cars only.

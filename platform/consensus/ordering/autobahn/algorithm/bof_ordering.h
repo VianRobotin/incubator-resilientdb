@@ -95,6 +95,21 @@ class BofHoldBack {
   // execute now (the others are kept and reconsidered with later blocks).
   std::vector<BofEligibleTxn> Release(std::vector<BofEligibleTxn> eligible);
   size_t HeldSize() const { return held_.size(); }
+  // Cost breakdown of the last Release (diagnostics).
+  struct ReleaseStats {
+    size_t candidates = 0, fast_held = 0, blockers_calls = 0, queued = 0;
+    int64_t fast_us = 0, closure_us = 0, compact_us = 0, fast_rounds = 0;
+    int64_t fast_scanned = 0, closure_scanned = 0;
+    int64_t roots = 0, failed_roots = 0, visits = 0, ahead_calls = 0;
+    std::string ToString() const;
+  };
+  const ReleaseStats& LastStats() const { return stats_; }
+  // Entries kept in the lane queues (executed ones included until dropped).
+  size_t QueuedSize() const {
+    size_t total = 0;
+    for (const auto& q : lane_) total += q.size();
+    return total;
+  }
 
  private:
   using Pos = std::pair<int64_t, int32_t>;
@@ -109,20 +124,32 @@ class BofHoldBack {
   // First pending or held entry of a lane (dropping executed ones from the
   // front); nullptr if none.
   const Entry* FirstPending(int lane);
-  // For every unexecuted transaction, the number of counted lanes in which
-  // it precedes the attestations `attest`; returns the number of counted
-  // lanes that hold one.
-  int CountPreceding(const std::vector<Pos>& attest,
-                     std::unordered_map<uint32_t, int>* before);
+  // Appends to `out` every pending or held transaction that precedes the
+  // attestations `attest` in at least theta counted lanes: the blockers that
+  // can keep a closure from release (the candidates the fast path keeps are
+  // released, and their own blockers with them).  Scans `blocking_`.
+  void Blockers(const std::vector<Pos>& attest, std::vector<uint32_t>* out);
+  // Drops executed entries from lanes that have grown enough since the last
+  // compaction.
+  void Compact();
 
   int n_, theta_;
   std::vector<bool> discarded_;
   // Per non-discarded lane: its committed transactions in lane order;
   // executed ones are skipped lazily.
   std::vector<std::deque<Entry>> lane_;
+  std::vector<size_t> compacted_;  // per lane: size after the last compaction
   std::unordered_map<std::string, uint32_t> index_;
   std::vector<State> state_;
+  // Per unexecuted transaction: its committed position in each lane.
+  std::unordered_map<uint32_t, std::vector<Pos>> where_;
+  // Per-transaction counters for the scans (all zero between scans).
+  std::vector<int> count_;
+  std::vector<uint32_t> touched_;
+  // Per lane, during Release: its pending and held entries, in lane order.
+  std::vector<std::vector<Entry>> blocking_;
   std::vector<BofEligibleTxn> held_;
+  ReleaseStats stats_;
 };
 
 class BofOrderer {

@@ -92,6 +92,7 @@ AutoBahn::AutoBahn(int id, int f, int total_num, int block_size,
     bof_orderer_ = std::make_unique<BofOrderer>(n_, f_, params_.bof_gamma);
     bof_theta_ = bof_orderer_->Theta();
     bof_hold_ = std::make_unique<BofHoldBack>(n_, bof_theta_);
+    announcements_.resize(n_ + 1);
   } else {
     ol_ = std::make_unique<OlOrderer>(n_, f_);
   }
@@ -633,31 +634,6 @@ std::vector<TxnId> AutoBahn::MissingBodies(const std::vector<TxnId>& ids) {
   return missing;
 }
 
-// Check (ii): this replica's own collection window closed for every given
-// transaction, i.e. it received each at least 2 Delta ago.
-bool AutoBahn::WindowsClosed(const std::vector<TxnId>& ids) {
-  const int64_t now = Now();
-  std::vector<std::vector<const TxnId*>> parts(shards_.size());
-  for (const TxnId& id : ids) {
-    uint64_t v;
-    std::memcpy(&v, id.b.data() + 8, sizeof(v));
-    parts[v % shards_.size()].push_back(&id);
-  }
-  for (size_t k = 0; k < parts.size(); ++k) {
-    if (parts[k].empty()) continue;
-    Shard& s = *shards_[k];
-    std::lock_guard<std::mutex> lk(s.mu);
-    for (const TxnId* id : parts[k]) {
-      if (!s.seen.contains(*id)) return false;
-      auto it = s.open.find(*id);
-      if (it != s.open.end() && now < it->second.first_seen + 2 * params_.delta_us) {
-        return false;
-      }
-    }
-  }
-  return true;
-}
-
 // Fetch transaction bodies referenced by a Car: from its lane's owner
 // (target > 0) or from every replica (target == 0).
 void AutoBahn::RequestBodies(const std::vector<TxnId>& ids, int target) {
@@ -917,10 +893,6 @@ void AutoBahn::SealCar() {
   car.set_admit(static_cast<int32_t>(own_rate_.load()));
   if (own_poa_.index() > 0) {
     *car.mutable_poa() = own_poa_;
-    Lane& own = lanes_[id_];
-    if (own.certified_at.empty() || own.certified_at.back().first < own_poa_.index()) {
-      own.certified_at.emplace_back(own_poa_.index(), Now());
-    }
   }
   last_car_hash_ = sealed.hash;
   last_seal_ = Now();
@@ -1136,12 +1108,6 @@ void AutoBahn::LearnCertified(int lane_id, const Poa& poa) {
   Lane& lane = lanes_[lane_id];
   if (poa.index() <= lane.certified.index()) return;
   lane.certified = poa;
-  int64_t now = Now();
-  lane.certified_at.emplace_back(poa.index(), now);
-  while (lane.certified_at.size() > 1 &&
-         lane.certified_at[1].second <= now - 4 * params_.delta_us) {
-    lane.certified_at.pop_front();
-  }
 }
 
 void AutoBahn::ReceiveCarAck(std::unique_ptr<CarAck> ack) {
@@ -1478,12 +1444,10 @@ void AutoBahn::HandleProposal(const ConsensusBlock& b) {
 
 // Check (i): every tip is certified (verified on receipt), no lane regresses
 // below its last committed position, and every tip is fresh: at least the
-// highest certified tip of its lane the voter held Delta before the proposal
-// was made (Sec. 5.3: "a correct leader proposing at time t has received
-// every certified tip that a correct replica held at t - Delta").  The
-// proposal time is the leader's claim, so the voter uses the bound it
-// implies under synchrony: receipt <= t + Delta, i.e. tips held since
-// receipt - 2 Delta.
+// highest certified tip of its lane that the voter sent to the leader more
+// than 2 Delta before it received the proposal (Sec. 5.3).  Such a PoA
+// reached the leader within Delta, before it sent a proposal that took at
+// most Delta to arrive, so a correct leader is never rejected.
 bool AutoBahn::ValidTipCut(const BlockState& st) {
   const ConsensusBlock& b = st.block;
   for (int j = 1; j <= n_; ++j) {
@@ -1496,55 +1460,107 @@ bool AutoBahn::ValidTipCut(const BlockState& st) {
                  << TipIndex(b.parent_hash(), j) << ")";
       return false;
     }
-    int64_t held = 0, held_since = 0;
-    for (const auto& c : lanes_[j].certified_at) {
-      if (c.second <= st.receive_time - 2 * params_.delta_us) {
-        held = c.first;
-        held_since = c.second;
+    int64_t sent = 0, sent_at = 0;
+    for (const auto& c : lanes_[j].forwarded) {
+      if (c.second < st.receive_time - 2 * params_.delta_us && c.first > sent) {
+        sent = c.first;
+        sent_at = c.second;
       }
     }
-    if (tip < held) {
+    if (tip < sent) {
       LOG(ERROR) << "tip cut of block " << b.height() << " (proposed "
                  << (st.receive_time - b.propose_time()) << "us before receipt)"
                  << ": lane " << j << " tip " << tip << " is staler than "
-                 << held << ", held for " << (st.receive_time - held_since) << "us";
+                 << sent << ", sent to the leader " << (st.receive_time - sent_at)
+                 << "us before";
       return false;
     }
   }
-  return true;
+  return !IgnoresDelinquentLane(st);
 }
 
-// Checks (ii) and (iii); both delay the vote rather than reject the block.
-bool AutoBahn::VoteWaitsOver(const BlockState& st) {
+// BOF (Sec. 5.3, lane delinquency): a voter abstains from a block that
+// carries neither the claim <j, c> nor a tip of lane j at c or beyond if it
+// armed its delinquency timer for <j, c> more than D + 4 Delta before it
+// received the block, so that a leader cannot ignore a delinquent lane.  A
+// claim on lane j in an uncommitted ancestor counts as carried: the leader
+// proposes a claim once, and the blocks that follow it in the pipeline
+// cannot repeat it before it commits.
+bool AutoBahn::IgnoresDelinquentLane(const BlockState& st) {
+  if (!bof_ || delinquency_armed_.empty()) return false;
   const ConsensusBlock& b = st.block;
-  if (!bof_) {
-    // (ii) OL: the collection window closed for every transaction newly
-    // referenced by the tip cut.
-    for (const Tip& t : b.tips()) {
-      for (int64_t idx = TipIndex(b.parent_hash(), t.lane()) + 1; idx <= t.index();
-           ++idx) {
-        if (idx <= lanes_[t.lane()].committed) continue;
-        const Car* car = FindCar(t.lane(), idx);
-        if (car == nullptr) {
-          RequestCar(t.lane(), idx);
-          return false;
-        }
-        std::vector<TxnId> ids = CarTxnIds(*car);
-        if (WindowsClosed(ids)) continue;
-        // A transaction never received (the Car was fetched): get it.
-        int64_t& asked = body_requests_[{t.lane(), idx}];
-        if (Now() - asked >= 2 * params_.delta_us) {
-          std::vector<TxnId> missing = MissingBodies(ids);
-          if (!missing.empty()) RequestBodies(missing, 0);
-          asked = Now();
-        }
-        return false;
-      }
-    }
+  const int64_t limit = st.receive_time - 10 * params_.delta_us;  // D + 4 Delta
+  std::set<int> claimed;
+  for (const ConsensusBlock* a = &b; a != nullptr;) {
+    for (const Claim& c : a->claims()) claimed.insert(c.lane());
+    if (a->parent_hash().empty() || a->parent_hash() == committed_hash_) break;
+    auto it = blocks_.find(a->parent_hash());
+    a = it == blocks_.end() ? nullptr : &it->second.block;
+  }
+  for (const auto& armed : delinquency_armed_) {
+    const int j = armed.first.first;
+    const int64_t c = armed.first.second;
+    if (armed.second >= limit || discarded_lanes_.count(j) || claimed.count(j)) continue;
+    const Tip* t = TipOf(b, j);
+    if (t != nullptr && t->index() >= c) continue;
+    LOG(ERROR) << "block " << b.height() << " ignores delinquent lane " << j
+               << " at " << c << " (timer armed "
+               << (st.receive_time - armed.second) << "us before receipt)";
     return true;
   }
-  // (iii) BOF: the voter's own delinquency timer expired for every claim.
-  for (const Claim& c : b.claims()) {
+  return false;
+}
+
+// A voter whose certified tips a valid proposal omitted sends their PoAs to
+// the leader (Alg. 2, ForwardOmittedTips): a faulty lane owner may reveal a
+// certified tip to some replicas only.  Each tip is sent once per view.
+void AutoBahn::ForwardOmittedTips(const ConsensusBlock& b) {
+  PoaForward fwd;
+  fwd.set_sender_id(id_);
+  const int64_t now = Now();
+  for (int j = 1; j <= n_; ++j) {
+    Lane& lane = lanes_[j];
+    const Poa& cert = lane.certified;
+    const Tip* t = TipOf(b, j);
+    if (cert.index() <= (t == nullptr ? 0 : t->index())) continue;
+    if (!lane.forwarded.empty() && lane.forwarded.back().first >= cert.index()) continue;
+    Tip* tip = fwd.add_tips();
+    tip->set_lane(j);
+    tip->set_index(cert.index());
+    tip->set_car_hash(cert.car_hash());
+    *tip->mutable_poa() = cert;
+    lane.forwarded.emplace_back(cert.index(), now);
+    // Only the highest tip sent more than 2 Delta ago matters.
+    while (lane.forwarded.size() > 1 &&
+           lane.forwarded[1].second < now - 4 * params_.delta_us) {
+      lane.forwarded.pop_front();
+    }
+  }
+  if (fwd.tips_size() > 0) SendMessage(MessageType::Poa_Forward, fwd, LeaderOf(b.view()));
+}
+
+void AutoBahn::ReceivePoaForward(std::unique_ptr<PoaForward> forward) {
+  if (forward->sender_id() == id_) return;
+  auto fwd = std::make_shared<PoaForward>();
+  for (Tip& t : *forward->mutable_tips()) {
+    if (t.lane() < 1 || t.lane() > n_ || t.poa().index() != t.index() ||
+        t.poa().car_hash() != t.car_hash() || !VerifyPoa(t.lane(), t.poa())) {
+      continue;
+    }
+    *fwd->add_tips() = std::move(t);
+  }
+  if (fwd->tips_size() > 0) Post([this, fwd] { HandlePoaForward(*fwd); });
+}
+
+void AutoBahn::HandlePoaForward(const PoaForward& forward) {
+  for (const Tip& t : forward.tips()) LearnCertified(t.lane(), t.poa());
+}
+
+// Check (ii), BOF only: the voter's own delinquency timer expired for every
+// claim the block carries.  It delays the vote rather than reject the block.
+bool AutoBahn::VoteWaitsOver(const BlockState& st) {
+  if (!bof_) return true;
+  for (const Claim& c : st.block.claims()) {
     if (!delinquency_expired_.count({c.lane(), c.position()})) return false;
   }
   return true;
@@ -1580,6 +1596,8 @@ void AutoBahn::ProcessPendingVotes() {
       if (st.rejected) {
         LOG(ERROR) << "abstaining on block " << b.height() << " of view "
                    << b.view() << ": invalid or stale tip cut";
+      } else if (b.proposer() != id_) {
+        ForwardOmittedTips(b);
       }
     }
     if (st.rejected) {
@@ -1879,7 +1897,14 @@ void AutoBahn::MaybePropose() {
     for (const auto& target : claim_targets_) {
       int j = target.first;
       if (discarded_lanes_.count(j) || claimed_lanes_.count(j)) continue;
-      if (!delinquency_expired_.count({j, target.second})) continue;
+      // 2 Delta after its own timer expired, if it still holds no certified
+      // Car of lane j at the position (it references that Car otherwise).
+      auto expired = delinquency_expired_.find({j, target.second});
+      if (expired == delinquency_expired_.end() ||
+          now - expired->second < 2 * params_.delta_us ||
+          lanes_[j].certified.index() >= target.second) {
+        continue;
+      }
       Claim* c = b.add_claims();
       c->set_lane(j);
       c->set_position(target.second);
@@ -1907,8 +1932,8 @@ void AutoBahn::MaybePropose() {
   HandleProposal(b);
 }
 
-// Blame (Sync HotStuff, budget widened to (3p+4)Delta): a replica blames the
-// leader if fewer than p proposals triggered its vote within the budget.
+// Blame (Sync HotStuff, its (2p+4)Delta budget): a replica blames the leader
+// if fewer than p proposals triggered its vote within the budget.
 void AutoBahn::CheckBlame() {
   int64_t now = Now();
   if (!consensus_started_ && all_heard_at_ > 0 &&
@@ -1917,7 +1942,7 @@ void AutoBahn::CheckBlame() {
     view_start_ = now;
   }
   if (!in_view_ || blamed_ || !consensus_started_) return;
-  const int64_t budget = (3 * params_.blame_p + 4) * params_.delta_us;
+  const int64_t budget = (2 * params_.blame_p + 4) * params_.delta_us;
   while (!vote_times_.empty() && vote_times_.front() < now - budget) {
     vote_times_.pop_front();
   }
@@ -2019,6 +2044,7 @@ void AutoBahn::EnterNextView() {
   voted_height_ = 0;
   last_proposed_.clear();
   claimed_lanes_.clear();
+  for (Lane& lane : lanes_) lane.forwarded.clear();
   commit_timers_.clear();
   pending_votes_.clear();
   LOG(ERROR) << "entering view " << view_ << " (leader " << LeaderOf(view_) << ")";
@@ -2072,17 +2098,46 @@ void AutoBahn::SettleBof(const std::vector<int>& claims, CommittedBlock* out) {
     c.heartbeat.assign(car.bof_heartbeat().begin(), car.bof_heartbeat().end());
     c.m.assign(n_ + 1, BofCommittedCar::Announcement());
     for (int j = 1; j <= n_ && j <= car.m_size(); ++j) {
-      c.m[j].present = car.m(j - 1).present();
-      c.m[j].car = car.m(j - 1).car();
+      const Announcement& a = car.m(j - 1);
+      c.m[j].present = a.present();
+      c.m[j].car = a.car();
+      if (a.present() && a.car() > bof_orderer_->CommittedIndex(j)) {
+        announcements_[j].emplace(a.car(), a);
+      }
     }
     cars.push_back(std::move(c));
   }
   BofSettleResult res = bof_orderer_->Settle(cars, claims);
-  auto armed = std::make_shared<std::vector<std::pair<int, int64_t>>>(std::move(res.armed));
+  // Each <j, c> fixed by this block for a lane not yet settled is watched:
+  // a Suspect message carrying the announcement that set c is due D after
+  // commit if no certified Car of lane j at c arrives by then.  c is the
+  // largest announcement of j among Cars committed so far, hence stored.
+  auto watch = std::make_shared<std::vector<Suspect>>();
+  for (const auto& a : res.armed) {
+    auto it = announcements_[a.first].find(a.second);
+    if (it == announcements_[a.first].end()) {
+      LOG(ERROR) << "bof: no announcement of lane " << a.first << " for Car " << a.second;
+      continue;
+    }
+    Suspect sus;
+    sus.set_lane(a.first);
+    sus.set_position(a.second);
+    *sus.mutable_announcement() = it->second;
+    sus.set_sender_id(id_);
+    watch->push_back(std::move(sus));
+  }
+  for (int j = 1; j <= n_; ++j) {
+    auto& ann = announcements_[j];
+    if (bof_orderer_->Discarded(j)) {
+      ann.clear();
+    } else {
+      ann.erase(ann.begin(), ann.upper_bound(bof_orderer_->CommittedIndex(j)));
+    }
+  }
   auto targets = std::make_shared<std::map<int, int64_t>>(bof_orderer_->ClaimTargets());
   const int64_t committed_at = out->commit_time;
-  Post([this, armed, targets, committed_at] {
-    ArmDelinquencyTimers(*armed, committed_at);
+  Post([this, watch, targets, committed_at] {
+    WatchLanes(*watch, committed_at);
     claim_targets_ = *targets;
   });
   int64_t lag = Now() - committed_at;
@@ -2096,29 +2151,118 @@ void AutoBahn::SettleBof(const std::vector<int>& claims, CommittedBlock* out) {
   out->bof_cars = std::move(cars);
 }
 
-// The timer starts when the block commits (the paper's rule, so the timers
-// of correct replicas expire within Delta of one another), however late
+// Suspicion and delinquency timers (Sec. 7.1).  The wait for a certified Car
+// of lane j at c starts when the block that fixes c commits, however late
 // settlement learns of it.
-void AutoBahn::ArmDelinquencyTimers(
-    const std::vector<std::pair<int, int64_t>>& armed, int64_t committed_at) {
-  for (const auto& a : armed) delinquency_armed_.emplace(a, committed_at);
+void AutoBahn::WatchLanes(const std::vector<Suspect>& watch, int64_t committed_at) {
+  const int64_t d = 5 * params_.delta_us;  // D = 2X + 3 Delta
+  for (const Suspect& sus : watch) {
+    auto key = std::make_pair(sus.lane(), sus.position());
+    if (suspect_seen_.count(key)) continue;  // already suspected
+    suspect_watch_.emplace(key, LaneWatch{committed_at + d, sus.announcement()});
+  }
+}
+
+void AutoBahn::ReceiveSuspect(std::unique_ptr<Suspect> suspect) {
+  const int j = suspect->lane();
+  if (suspect->sender_id() == id_ || j < 1 || j > n_ || !bof_) return;
+  const Announcement& a = suspect->announcement();
+  if (!a.present() || a.car() != suspect->position()) return;
+  // Only the first copy is verified and handled; relays repeat it.
+  std::string key = "sus";
+  PutI64(&key, j);
+  PutI64(&key, suspect->position());
+  if (CheckVerified(key)) return;
+  if (!tee_->VerifyBatch({{TeeHost::BofPlacementMsg(j, a.txn_hash(), a.car()),
+                           a.tee_tag()}})[0]) {
+    return;
+  }
+  MarkVerified(key);
+  auto sus = std::make_shared<Suspect>(std::move(*suspect));
+  Post([this, sus] { HandleSuspect(*sus, /*relay=*/true); });
+}
+
+// A replica that receives a valid Suspect message for the first time relays
+// it, and arms its delinquency timer unless it already holds a certified Car
+// of the lane at the position, whose PoA it broadcasts instead.
+void AutoBahn::HandleSuspect(const Suspect& suspect, bool relay) {
+  const int j = suspect.lane();
+  const int64_t c = suspect.position();
+  if (discarded_lanes_.count(j) || lanes_[j].committed >= c) return;
+  if (!suspect_seen_.insert({j, c}).second) return;
+  if (relay) {
+    Suspect fwd = suspect;
+    fwd.set_sender_id(id_);
+    Broadcast(MessageType::Lane_Suspect, fwd);
+  }
+  if (lanes_[j].certified.index() >= c) {
+    BroadcastPoa(j);
+    return;
+  }
+  delinquency_armed_.emplace(std::make_pair(j, c), Now());
+}
+
+void AutoBahn::BroadcastPoa(int lane) {
+  const Poa& cert = lanes_[lane].certified;
+  PoaForward fwd;
+  fwd.set_sender_id(id_);
+  Tip* t = fwd.add_tips();
+  t->set_lane(lane);
+  t->set_index(cert.index());
+  t->set_car_hash(cert.car_hash());
+  *t->mutable_poa() = cert;
+  Broadcast(MessageType::Poa_Forward, fwd);
 }
 
 void AutoBahn::CheckDelinquencyTimers() {
   if (!bof_) return;
   const int64_t d = 5 * params_.delta_us;
-  int64_t now = Now();
-  for (auto it = delinquency_armed_.begin(); it != delinquency_armed_.end();) {
-    const int lane = it->first.first;
-    const int64_t position = it->first.second;
-    if (lanes_[lane].certified.index() >= position) {
-      it = delinquency_armed_.erase(it);  // the lane delivered: never expires
-    } else if (now - it->second >= d) {
-      delinquency_expired_.insert(it->first);
-      it = delinquency_armed_.erase(it);
+  const int64_t now = Now();
+  auto settled = [&](int j, int64_t c) {
+    return discarded_lanes_.count(j) > 0 || lanes_[j].committed >= c;
+  };
+  // No certified Car of lane j at c within D of the commit: suspect it.
+  for (auto it = suspect_watch_.begin(); it != suspect_watch_.end();) {
+    const int j = it->first.first;
+    const int64_t c = it->first.second;
+    if (settled(j, c) || lanes_[j].certified.index() >= c) {
+      it = suspect_watch_.erase(it);
+    } else if (now >= it->second.due) {
+      Suspect sus;
+      sus.set_lane(j);
+      sus.set_position(c);
+      *sus.mutable_announcement() = it->second.announcement;
+      sus.set_sender_id(id_);
+      LOG(ERROR) << "suspecting lane " << j << " at Car " << c;
+      Broadcast(MessageType::Lane_Suspect, sus);
+      HandleSuspect(sus, /*relay=*/false);
+      it = suspect_watch_.erase(it);
     } else {
       ++it;
     }
+  }
+  // A timer is cancelled (and the PoA broadcast) if a certified Car of lane
+  // j at c arrives before it expires; it otherwise expires after D.
+  for (auto it = delinquency_armed_.begin(); it != delinquency_armed_.end();) {
+    const int j = it->first.first;
+    const int64_t c = it->first.second;
+    if (settled(j, c)) {
+      delinquency_expired_.erase(it->first);
+      it = delinquency_armed_.erase(it);
+      continue;
+    }
+    if (!delinquency_expired_.count(it->first)) {
+      if (lanes_[j].certified.index() >= c) {
+        BroadcastPoa(j);
+        it = delinquency_armed_.erase(it);
+        continue;
+      }
+      if (now - it->second >= d) delinquency_expired_.emplace(it->first, now);
+    }
+    ++it;
+  }
+  for (auto it = suspect_seen_.begin(); it != suspect_seen_.end();) {
+    it = settled(it->first, it->second) ? suspect_seen_.erase(it) : std::next(it);
   }
 }
 
@@ -2212,7 +2356,8 @@ void AutoBahn::Execute(CommittedBlock& block) {
       last_report = Now();
       LOG(ERROR) << "bof: releasing and ordering " << releasing << " transactions took "
                  << took << "us (release " << release_took << "us, " << batches.size()
-                 << " batches, " << bof_hold_->HeldSize() << " held back)";
+                 << " batches, " << bof_hold_->HeldSize() << " held back; "
+                 << bof_hold_->LastStats().ToString() << ")";
     }
     for (auto& batch : batches) {
       for (auto& id : batch) order.push_back(std::move(id));
